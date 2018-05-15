@@ -1,6 +1,6 @@
 
 use pi_lib::ordmap::{OrdMap, Entry};
-use pi_lib::sbtree::{Tree};
+use pi_lib::asbtree::{Tree};
 use pi_lib::atom::{Atom};
 use pi_lib::guid::{Guid, GuidGen};
 use pi_lib::sinfo::StructInfo;
@@ -136,46 +136,35 @@ impl MemeryTxn {
 	//提交
 	pub fn commit1(&mut self) -> MemeryResult<()> {
 		let mut tab = self.tab.lock().unwrap();
-		let mut write = Vec::new();
-		let root_if_eq = tab.root.ptr_eq(&self.old);
-		//判断根节点是否相等
-		if root_if_eq == false {
-			match tab.prepare.get(&self.id) {
-				Some(rwlog) => {
+		match tab.prepare.remove(&self.id) {
+			Some(rwlog) => {
+				let root_if_eq = tab.root.ptr_eq(&self.old);
+				//判断根节点是否相等
+				if root_if_eq == false {
 					for (k, rw_v) in rwlog.iter() {
 						match rw_v {
 							Rwlogv::Read => (),
 							_ => {
-								write.push((k.clone(), rw_v.clone()));
+								match rw_v {
+									Rwlogv::Write(None) => {
+										tab.root.delete(&k, false);
+										()
+									},
+									Rwlogv::Write(Some(v)) => {
+										tab.root.upsert(k.clone(), v.clone(), false);
+										()
+									},
+									_ => (),
+								}
 								()
 							},
 						}
 					}
-				},
-				None => {
-					return Err(String::from("error prepare null"))
-					},
-			}
-			for (k, rw_v) in write {
-				match rw_v {
-					Rwlogv::Write(None) => {
-						tab.root.delete(&k, false);
-						()
-					},
-					Rwlogv::Write(Some(v)) => {
-						tab.root.upsert(k, v.clone(), false);
-						()
-					},
-					_ => (),
+				} else {
+					tab.root = self.root.clone();
 				}
-			}
-			//删除预提交
-			tab.prepare.remove(&self.id);
-		} else {
-			// tab.root.cxchg(&mut self.old, &mut self.root);
-			tab.root = self.root.clone();
-			//删除预提交
-			tab.prepare.remove(&self.id);
+			},
+			None => return Err(String::from("error prepare null"))
 		}
 		Ok(())
 	}
