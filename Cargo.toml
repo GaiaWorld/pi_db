@@ -26,7 +26,6 @@ pi_store = { path = "../pi_store"}
 hash = { path = "../pi_lib/hash" }
 num_cpus = "1.13.0"
 chrono = "0.4"
-cron = "0.8"
 async_file = { path = "../pi_lib/async_file" }
 
 [dev-dependencies]
