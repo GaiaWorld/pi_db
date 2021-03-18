@@ -280,7 +280,7 @@ impl MemeryTxn {
 		//遍历事务中的读写日志
 		for (key, rw_v) in self.rwlog.iter() {
 			//检查预提交是否冲突
-			match self.tab.0.lock().await.prepare.try_prepare(key, rw_v) {
+			match self.tab.0.lock().await.prepare.try_prepare(key, rw_v, self.id.clone()) {
 				Ok(_) => (),
 				Err(s) => return Err(s),
 			};
