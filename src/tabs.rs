@@ -152,48 +152,43 @@ impl Prepare{
 	}
 
     //检查预提交是否冲突（如果预提交表中存在该条目，且其类型为write， 同时，本次预提交类型也为write， 即预提交冲突）
-	pub fn try_prepare (&mut self, key: &Bin, log_type: &RwLog) -> Result<(), String> {
-		let mut err_msg = "".to_string();
+	pub fn try_prepare (&self, key: &Bin, log_type: &RwLog) -> Result<(), String> {
 		for o_rwlog in self.0.values() {
 			match o_rwlog.get(key) {
 				Some(RwLog::Read) => match log_type {
 					RwLog::Read => return Ok(()),
 					RwLog::Write(_) => {
 						debug!("expect read log type, found write log type");
-						err_msg = "prepare conflicted rw".to_string();
+						return Err(String::from("prepare conflicted rw"));
 					}
 					RwLog::Meta(_) => {
 						debug!("expect read log type, found meta log type");
-						err_msg = "unexpected meta log type1".to_string();
+						return Err(String::from("unexpected meta log type1"));
 					}
 				},
 				Some(RwLog::Write(_)) => match log_type {
 					RwLog::Read => {
 						debug!("previous read log exist, key = {:?}", key);
-						err_msg = "previous read log exist".to_string();
+						return Err(String::from("previous read log exist"));
 					}
 					RwLog::Write(_) => {
 						debug!("previous write log exist, key = {:?}", key);
-						err_msg = "previous write log exist".to_string();
+						return Err(String::from("previous write log exist"));
 					}
 					RwLog::Meta(_) => {
 						debug!("previous meta log exist, key = {:?}", key);
-						err_msg = "previous meta log exist".to_string();
+						return Err(String::from("previous meta log exist"));
 					}
 					
 				},
 				Some(RwLog::Meta(_)) => {
-					err_msg = "unexpected meta log type2".to_string();
+					return Err(String::from("unexpected meta log type2"));
 				}
 				None => return Ok(()),
 			}
 		}
 
-		if (&err_msg == "") {
-			Ok(())
-		} else {
-			Err(err_msg)
-		}
+		Ok(())
 	}
 }
 
