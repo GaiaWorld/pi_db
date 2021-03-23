@@ -152,7 +152,7 @@ impl Prepare{
 	}
 
     //检查预提交是否冲突（如果预提交表中存在该条目，且其类型为write， 同时，本次预提交类型也为write， 即预提交冲突）
-	pub fn try_prepare (&mut self, key: &Bin, log_type: &RwLog, id: Guid) -> Result<(), String> {
+	pub fn try_prepare (&mut self, key: &Bin, log_type: &RwLog) -> Result<(), String> {
 		let mut err_msg = "".to_string();
 		for o_rwlog in self.0.values() {
 			match o_rwlog.get(key) {
@@ -192,9 +192,7 @@ impl Prepare{
 		if (&err_msg == "") {
 			Ok(())
 		} else {
-			// 删除冲突的事务
-			self.0.remove(&id);
-			Err(err_msg + &id.time().to_string())
+			Err(err_msg)
 		}
 	}
 }

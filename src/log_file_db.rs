@@ -404,17 +404,18 @@ impl FileMemTxn {
 
 	//预提交
 	pub async fn prepare_inner(&mut self) -> DBResult {
+		let mut lock = self.tab.0.lock().await;
 		//遍历事务中的读写日志
 		for (key, rw_v) in self.rwlog.iter() {
-			//检查预提交是否冲突
-			match self.tab.0.lock().await.prepare.try_prepare(key, rw_v, self.id.clone()) {
+			//检查预提交是否冲突 
+			match lock.prepare.try_prepare(key, rw_v) {
 				Ok(_) => (),
 				Err(s) => return Err(s),
 			};
 			//检查Tab根节点是否改变
-			if self.tab.0.lock().await.root.ptr_eq(&self.old) == false {
+			if lock.root.ptr_eq(&self.old) == false {
 				let key = Bon::new(key.clone());
-				match self.tab.0.lock().await.root.get(&key) {
+				match lock.root.get(&key) {
 					Some(r1) => match self.old.get(&key) {
 						Some(r2) if (r1 as *const Bin) == (r2 as *const Bin) => (),
 						_ => return Err(String::from("prepare conflicted value diff"))
@@ -428,7 +429,7 @@ impl FileMemTxn {
 		}
 		let rwlog = mem::replace(&mut self.rwlog, XHashMap::with_capacity_and_hasher(0, Default::default()));
 		//写入预提交
-		self.tab.0.lock().await.prepare.insert(self.id.clone(), rwlog);
+		lock.prepare.insert(self.id.clone(), rwlog);
 
 		return Ok(())
 	}
