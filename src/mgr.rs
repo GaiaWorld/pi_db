@@ -121,47 +121,27 @@ impl Mgr {
 	*/
 	pub async fn transaction(&self, writable: bool, rt: Option<MultiTaskRuntime<()>>) -> Tr {
 		let id = self.guid.gen(0);
-		let ware_map = {
-			self.ware_map.lock().await.clone()
-		};
+        let mut map = XHashMap::default();
+        let mut tmp = vec![];
+        for Entry(k, v) in self.ware_map.lock().await.0.iter(None, false) {
+            tmp.push((k.clone(), v));
+        }
 
-		let mut map = XHashMap::with_capacity_and_hasher(ware_map.0.size() * 3 / 2, Default::default());
-		let mut tmp = vec![];
-		for Entry(k, v) in ware_map.0.iter(None, false) {
-			tmp.push((k.clone(), v));
-		}
+        for (k, v) in tmp {
+            map.insert(k, v.snapshot().await);
+        }
 
-		let rt = rt.as_ref().unwrap().clone();
-		let mut async_map = rt.map();
+        let rt = rt.as_ref().unwrap().clone();
 
-		for (k, v) in tmp {
-			async_map.join(AsyncRuntime::Multi(rt.clone()), async move {
-				let snap = v.snapshot().await;
-				Ok((k, snap))
-			});
-		}
-
-		match async_map.map(AsyncRuntime::Multi(rt.clone())).await {
-			Ok(res) => {
-				for r in res {
-					if r.is_ok() {
-						let pair = r.unwrap();
-						map.insert(pair.0, pair.1);
-					}
-				}
-			}
-			Err(e) => {}
-		}
-
-		Tr {
-			writable,
-			timeout: TIMEOUT,
-			id: id.clone(),
-			ware_log_map: map,
-			state: TxState::Ok,
-			rt: Some(rt),
-			..Default::default()
-		}
+        Tr {
+            writable,
+            timeout: TIMEOUT,
+            id: id.clone(),
+            ware_log_map: map,
+            state: TxState::Ok,
+            rt: Some(rt),
+            ..Default::default()
+        }
 	}
 
 	/**
