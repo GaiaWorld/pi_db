@@ -1,31 +1,41 @@
 /**
  * 表管理器，给每个具体的Ware用
  */
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc};
 use std::mem;
 use std::ops::{DerefMut, Deref};
 
-use fnv::{FnvHashMap, FnvHashSet};
-
+use hash::{XHashMap, XHashSet};
 use ordmap::ordmap::{OrdMap, ActionResult, Keys};
 use ordmap::asbtree::{Tree, new};
 use atom::Atom;
 use guid::Guid;
+use r#async::lock::mutex_lock::Mutex;
+use r#async::lock::rw_lock::RwLock;
 
-use db::{SResult, Tab, TabTxn, OpenTab, Bin, RwLog, TabMeta};
 
-// 表结构及修改日志
-pub struct TabLog<T: Clone + Tab> {
-	map: OrdMap<Tree<Atom, TabInfo<T>>>,
-	old_map: OrdMap<Tree<Atom, TabInfo<T>>>, // 用于判断mgr中tabs是否修改过
-	meta_names: FnvHashSet<Atom>, //元信息表的名字
-	alter_logs: FnvHashMap<(Atom, usize), Option<Arc<TabMeta>>>, // 记录每个被改过元信息的表
-	rename_logs: FnvHashMap<Atom, (Atom, usize)>, // 新名字->(源名字, 版本号)
+use crate::{db::{SResult, Bin, RwLog, TabMeta, BuildDbType, DBResult}, log_file_db::MemIter};
+use crate::memery_db::MemDB;
+use crate::memery_db::{ MTab, RefMemeryTxn };
+use crate::log_file_db::{LogFileTab, RefLogFileTxn};
+use crate::log_file_db::LogFileDB;
+
+pub enum TxnType {
+	MemTxn(Arc<RefMemeryTxn>),
+	LogFileTxn(Arc<RefLogFileTxn>)
 }
-impl<T: Clone + Tab> TabLog<T> {
+// 表结构及修改日志
+pub struct TabLog {
+	map: OrdMap<Tree<Atom, TabInfo>>,
+	old_map: OrdMap<Tree<Atom, TabInfo>>, // 用于判断mgr中tabs是否修改过
+	meta_names: XHashSet<Atom>, //元信息表的名字
+	alter_logs: XHashMap<(Atom, usize), Option<Arc<TabMeta>>>, // 记录每个被改过元信息的表
+	rename_logs: XHashMap<Atom, (Atom, usize)>, // 新名字->(源名字, 版本号)
+}
+impl TabLog {
 	// 列出全部的表
-	pub fn list(&self) -> TabIter<T> {
-		TabIter::new(self.map.clone(), self.map.keys(None, false))
+	pub fn list(&self) -> TabIter {
+		TabIter::new(Arc::new(RwLock::new(self.map.clone())), self.map.keys(None, false))
 	}
 	// 获取指定的表结构
 	pub fn get(&self, tab: &Atom) -> Option<Arc<TabMeta>> {
@@ -39,9 +49,9 @@ impl<T: Clone + Tab> TabLog<T> {
 		TabLog {
 			map: self.map.clone(),
 			old_map: self.old_map.clone(),
-			meta_names: mem::replace(&mut self.meta_names, FnvHashSet::with_capacity_and_hasher(0, Default::default())),
-			alter_logs: mem::replace(&mut self.alter_logs, FnvHashMap::with_capacity_and_hasher(0, Default::default())),
-			rename_logs: mem::replace(&mut self.rename_logs, FnvHashMap::with_capacity_and_hasher(0, Default::default())),
+			meta_names: mem::replace(&mut self.meta_names, XHashSet::with_capacity_and_hasher(0, Default::default())),
+			alter_logs: mem::replace(&mut self.alter_logs, XHashMap::with_capacity_and_hasher(0, Default::default())),
+			rename_logs: mem::replace(&mut self.rename_logs, XHashMap::with_capacity_and_hasher(0, Default::default())),
 		}
 	}
 	// 表的元信息
@@ -58,7 +68,7 @@ impl<T: Clone + Tab> TabLog<T> {
 			Some(v) => v.clone(),
 			_ => (tab_name.clone(), 0),
 		};
-		let mut f = |v: Option<&TabInfo<T>>| {
+		let mut f = |v: Option<&TabInfo>| {
 			match v {
 				Some(ti) => match &meta {
 					Some(si) => ActionResult::Upsert(TabInfo {
@@ -78,111 +88,142 @@ impl<T: Clone + Tab> TabLog<T> {
 		self.meta_names.insert(tab_name.clone());
 	}
 	// 创建表事务
-	pub fn build<W: OpenTab>(&self, ware: &W, tab_name: &Atom, id: &Guid, writable: bool, cb: Box<Fn(SResult<Arc<TabTxn>>)>) -> Option<SResult<Arc<TabTxn>>> {
+	pub async fn build(&self, ware: BuildDbType, tab_name: &Atom, id: &Guid, writable: bool) -> SResult<TxnType> {
 		match self.map.get(tab_name) {
 			Some(ref info) => {
 				let tab = {
-					let mut var = info.init.lock().unwrap();
+					let mut var = info.init.lock().await;
 					match var.wait {
 						Some(ref mut vec) => {// 表尚未build
-							if vec.len() == 0 {// 第一次调用
-								let init = info.init.clone();
-								match ware.open(tab_name, Box::new(move |tab| {
-									// 异步返回，解锁后设置结果，返回等待函数数组
-									let vec:Vec<Box<Fn(SResult<T>)>> = {
-										let mut var = init.lock().unwrap();
-										let v = mem::replace(var.wait.as_mut().unwrap(), Vec::new());
-										var.tab = tab.clone();
-										var.wait = None;
-										v
-									};
-									// 通知所有的等待函数数组
-									for f in vec.into_iter() {
-										(*f)(tab.clone())
+							if *vec {// 第一次调用
+								match ware {
+									BuildDbType::MemoryDB => {
+										match MemDB::open(tab_name).await {
+											Ok(t) => {
+												var.tab_type = TabType::MemTab(t);
+												var.wait = None;
+												var.tab_type.clone()
+											}
+											
+											Err(e) => return Err(e)
+										}
 									}
-								})) {
-									Some(r) => {// 同步返回，设置结果
-										var.tab = r;
-										var.wait = None;
-										var.tab.clone()
-									},
-									_ => { //异步的第1次调用，直接返回
-										vec.push(handle_fn(id.clone(), writable, cb));
-										return None
+									BuildDbType::LogFileDB => {
+										match LogFileDB::open(tab_name).await {
+											Ok(t) => {
+												var.tab_type = TabType::LogFileTab(t);
+												var.wait = None;
+												var.tab_type.clone()
+											}
+											Err(e) => return Err(e)
+										}
 									}
 								}
-							}else { // 异步的第n次调用，直接返回
-								vec.push(handle_fn(id.clone(), writable, cb));
-								return None
+							} else {
+								return Err("unreachable branch".to_string())
 							}
 						},
-						_ => var.tab.clone()
+						_ => {
+							var.tab_type.clone()
+						}
 					}
 				};
 				// 根据结果创建事务或返回错误
 				match tab {
-					Ok(tab) => Some(Ok(tab.transaction(&id, writable))),
-					Err(s) => Some(Err(s))
+					TabType::MemTab(t) => {
+						Ok(TxnType::MemTxn(Arc::new(t.transaction(&id, writable).await)))
+					}
+					TabType::LogFileTab(t) => {
+						Ok(TxnType::LogFileTxn(Arc::new(t.transaction(&id, writable).await)))
+					}
+					TabType::Unkonwn => Err(String::from("unknown tab type"))
 				}
 			},
-			_ => {Some(Err(String::from("TabNotFound: ") + (*tab_name).as_str()))}
+			_ => Err(String::from("TabNotFound: ") + (*tab_name).as_str())
 		}
 	}
 }
 
-pub struct Prepare(FnvHashMap<Guid, FnvHashMap<Bin, RwLog>>);
+pub struct Prepare(XHashMap<Guid, XHashMap<Bin, RwLog>>);
 
 impl Prepare{
-	pub fn new(map: FnvHashMap<Guid, FnvHashMap<Bin, RwLog>>) -> Prepare{
+	pub fn new(map: XHashMap<Guid, XHashMap<Bin, RwLog>>) -> Prepare{
 		Prepare(map)
 	}
 
     //检查预提交是否冲突（如果预提交表中存在该条目，且其类型为write， 同时，本次预提交类型也为write， 即预提交冲突）
-	pub fn try_prepare (&self, key: &Bin, log_type: &RwLog) -> Result<(), String> {
+	pub fn try_prepare (&mut self, key: &Bin, log_type: &RwLog) -> Result<(), String> {
+		let mut err_msg = "".to_string();
 		for o_rwlog in self.0.values() {
 			match o_rwlog.get(key) {
 				Some(RwLog::Read) => match log_type {
 					RwLog::Read => return Ok(()),
-					_ => return Err(String::from("parpare conflicted rw"))
+					RwLog::Write(_) => {
+						debug!("expect read log type, found write log type");
+						err_msg = "prepare conflicted rw".to_string();
+					}
+					RwLog::Meta(_) => {
+						debug!("expect read log type, found meta log type");
+						err_msg = "unexpected meta log type1".to_string();
+					}
 				},
+				Some(RwLog::Write(_)) => match log_type {
+					RwLog::Read => {
+						debug!("previous read log exist, key = {:?}", key);
+						err_msg = "previous read log exist".to_string();
+					}
+					RwLog::Write(_) => {
+						debug!("previous write log exist, key = {:?}", key);
+						err_msg = "previous write log exist".to_string();
+					}
+					RwLog::Meta(_) => {
+						debug!("previous meta log exist, key = {:?}", key);
+						err_msg = "previous meta log exist".to_string();
+					}
+					
+				},
+				Some(RwLog::Meta(_)) => {
+					err_msg = "unexpected meta log type2".to_string();
+				}
 				None => return Ok(()),
-				Some(_e) => {
-					return Err(String::from("parpare conflicted rw2"))
-				},
 			}
 		}
 
-		Ok(())
+		if (&err_msg == "") {
+			Ok(())
+		} else {
+			Err(err_msg)
+		}
 	}
 }
 
 impl Deref for Prepare {
-    type Target = FnvHashMap<Guid, FnvHashMap<Bin, RwLog>>;
+    type Target = XHashMap<Guid, XHashMap<Bin, RwLog>>;
 
-    fn deref(&self) -> &FnvHashMap<Guid, FnvHashMap<Bin, RwLog>> {
+    fn deref(&self) -> &XHashMap<Guid, XHashMap<Bin, RwLog>> {
         &self.0
     }
 }
 
 impl DerefMut for Prepare {
-    fn deref_mut(&mut self) -> &mut FnvHashMap<Guid, FnvHashMap<Bin, RwLog>> {
+    fn deref_mut(&mut self) -> &mut XHashMap<Guid, XHashMap<Bin, RwLog>> {
         &mut self.0
     }
 }
 
-pub struct TabIter<T: Clone + Tab>{
-	_root: OrdMap<Tree<Atom, TabInfo<T>>>,
+pub struct TabIter{
+	_root: Arc<RwLock<OrdMap<Tree<Atom, TabInfo>>>>,
 	point: usize,
 }
 
-impl<T: Clone + Tab> Drop for TabIter<T>{
+impl Drop for TabIter {
 	fn drop(&mut self) {
-        unsafe{Box::from_raw(self.point as *mut Keys<Tree<Atom, TabInfo<T>>>)};
+        unsafe{Box::from_raw(self.point as *mut Keys<Tree<Atom, TabInfo>>)};
     }
 }
 
-impl<'a, T: 'a + Clone + Tab> TabIter<T>{
-	pub fn new(root: OrdMap<Tree<Atom, TabInfo<T>>>, it: Keys<'a, Tree<Atom, TabInfo<T>>>) -> TabIter<T>{
+impl<'a> TabIter {
+	pub fn new(root: Arc<RwLock<OrdMap<Tree<Atom, TabInfo>>>>, it: Keys<'a, Tree<Atom, TabInfo>>) -> TabIter{
 		TabIter{
 			_root: root.clone(),
 			point: Box::into_raw(Box::new(it)) as usize
@@ -190,10 +231,10 @@ impl<'a, T: 'a + Clone + Tab> TabIter<T>{
 	}
 }
 
-impl<T: Clone + Tab> Iterator for TabIter<T>{
+impl Iterator for TabIter {
 	type Item = Atom;
 	fn next(&mut self) -> Option<Self::Item>{
-		let mut it = unsafe{Box::from_raw(self.point as *mut Keys<Tree<Atom, TabInfo<T>>>)};
+		let mut it = unsafe{Box::from_raw(self.point as *mut Keys<Tree<Atom, TabInfo>>)};
 		let r = match it.next() {
 			Some(k) => Some(k.clone()),
 			None => None,
@@ -205,104 +246,105 @@ impl<T: Clone + Tab> Iterator for TabIter<T>{
 
 
 // 表管理器
-pub struct Tabs<T: Clone + Tab> {
+pub struct Tabs {
 	//全部的表结构
-	map: OrdMap<Tree<Atom, TabInfo<T>>>,
+	map: Arc<RwLock<OrdMap<Tree<Atom, TabInfo>>>>,
 	// 预提交的元信息事务表
-	prepare: FnvHashMap<Guid, TabLog<T>>,
+	prepare: Arc<Mutex<XHashMap<Guid, TabLog>>>,
 }
 
-impl<T: Clone + Tab> Tabs<T> {
+impl Tabs {
 	pub fn new() -> Self {
 		Tabs {
-			map : OrdMap::new(new()),
-			prepare: FnvHashMap::with_capacity_and_hasher(0, Default::default()),
+			map : Arc::new(RwLock::new(OrdMap::new(new()))),
+			prepare: Arc::new(Mutex::new(XHashMap::with_capacity_and_hasher(0, Default::default()))),
 		}
 	}
 
 	pub fn clone_map(&self) -> Self{
 		Tabs {
 			map : self.map.clone(),
-			prepare: FnvHashMap::with_capacity_and_hasher(0, Default::default()),
+			prepare: Arc::new(Mutex::new(XHashMap::with_capacity_and_hasher(0, Default::default()))),
 		}
 	}
 
 	// 列出全部的表
-	pub fn list(&self) -> TabIter<T> {
-		TabIter::new(self.map.clone(), self.map.keys(None, false))
+	pub async fn list(&self) -> TabIter {
+		TabIter::new(self.map.clone(), self.map.read().await.keys(None, false))
 	}
 	// 获取指定的表结构
-	pub fn get(&self, tab: &Atom) -> Option<Arc<TabMeta>> {
-		match self.map.get(tab) {
+	pub async fn get(&self, tab: &Atom) -> Option<Arc<TabMeta>> {
+		match self.map.read().await.get(tab) {
 			Some(t) => Some(t.meta.clone()),
 			_ => None
 		}
 	}
 	// 获取当前表结构快照
-	pub fn snapshot(&self) -> TabLog<T> {
+	pub async fn snapshot(&self) -> TabLog {
+		let map = self.map.read().await.clone();
 		TabLog {
-			map: self.map.clone(),
-			old_map: self.map.clone(),
-			meta_names: FnvHashSet::with_capacity_and_hasher(0, Default::default()),
-			alter_logs: FnvHashMap::with_capacity_and_hasher(0, Default::default()),
-			rename_logs: FnvHashMap::with_capacity_and_hasher(0, Default::default()),
+			map: map.clone(),
+			old_map: map,
+			meta_names: XHashSet::with_capacity_and_hasher(0, Default::default()),
+			alter_logs: XHashMap::with_capacity_and_hasher(0, Default::default()),
+			rename_logs: XHashMap::with_capacity_and_hasher(0, Default::default()),
 		}
 	}
 	// 获取表的元信息
-	pub fn get_tab_meta(&self, tab: &Atom) -> Option<Arc<TabMeta>> {
-		match self.map.get(tab) {
+	pub async fn get_tab_meta(&self, tab: &Atom) -> Option<Arc<TabMeta>> {
+		match self.map.read().await.get(tab) {
 			Some(info) => Some(info.meta.clone()),
 			_ => None,
 		}
 	}
 	// 设置表的元信息
-	pub fn set_tab_meta(&mut self, tab: Atom, meta: Arc<TabMeta>) -> bool {
-		let r = self.map.insert(tab, TabInfo::new(meta));
+	pub async fn set_tab_meta(&mut self, tab: Atom, meta: Arc<TabMeta>) -> bool {
+		let r = self.map.write().await.insert(tab, TabInfo::new(meta));
 		r
 	}
 
 	// 预提交
-	pub fn prepare(&mut self, id: &Guid, log: &mut TabLog<T>) -> SResult<()> {
+	pub async fn prepare(&self, id: &Guid, log: &mut TabLog) -> DBResult {
 		// 先检查预提交的交易是否有冲突
-		for val in self.prepare.values() {
+		for val in self.prepare.lock().await.values() {
 			if !val.meta_names.is_disjoint(&log.meta_names) {
-				return Err(String::from("meta parpare conflicting"))
+				return Err(String::from("meta prepare conflicting"))
 			}
 		}
 		// 然后检查数据表是否被修改
-		if !self.map.ptr_eq(&log.old_map) {
+		if !self.map.read().await.ptr_eq(&log.old_map) {
 			// 如果被修改，则检查是否有冲突
 			// TODO 暂时没有考虑重命名的情况
 			for name in log.meta_names.iter() {
-				match self.map.get(name) {
+				match self.map.read().await.get(name) {
 					Some(r1) => match log.old_map.get(name) {
-						Some(r2) if (r1 as *const TabInfo<T>) == (r2 as *const TabInfo<T>) => (),
-						_ => return Err(String::from("meta parpare conflicted"))
+						Some(r2) if (r1 as *const TabInfo) == (r2 as *const TabInfo) => (),
+						_ => return Err(String::from("meta prepare conflicted"))
 					}
 					_ => match log.old_map.get(name) {
 						None => (),
-						_ => return Err(String::from("meta parpare conflicted"))
+						_ => return Err(String::from("meta prepare conflicted"))
 					}
 				}
 			}
 		}
-		self.prepare.insert(id.clone(), log.replace());
+		self.prepare.lock().await.insert(id.clone(), log.replace());
 		Ok(())
 	}
 	// 元信息的提交
-	pub fn commit(&mut self, id: &Guid) {
-		match self.prepare.remove(id) {
-			Some(log) => if self.map.ptr_eq(&log.old_map) {
+	pub async fn commit(&self, id: &Guid) {
+		match self.prepare.lock().await.remove(id) {
+			Some(log) => if self.map.read().await.ptr_eq(&log.old_map) {
 				// 检查数据表是否被修改， 如果没有修改，则可以直接替换根节点
-				self.map = log.map;
+				*self.map.write().await = log.map;
 			}else{
 				// 否则，重新执行一遍修改
 				for r in log.alter_logs {
 					if r.1.is_none() {
-						self.map.delete(&Atom::from((r.0).0.as_ref()), false);
+						self.map.write().await.delete(&Atom::from((r.0).0.as_ref()), false);
 					} else {
 						let tab_info = TabInfo::new(r.1.unwrap());
-						self.map.upsert(Atom::from((r.0).0.as_ref()), tab_info, false);
+						self.map.write().await.upsert(Atom::from((r.0).0.as_ref()), tab_info, false);
 					}
 				}
 			}
@@ -310,45 +352,38 @@ impl<T: Clone + Tab> Tabs<T> {
 		}
 	}
 	// 回滚
-	pub fn rollback(&mut self, id: &Guid) {
-		self.prepare.remove(id);
+	pub async fn rollback(&self, id: &Guid) {
+		self.prepare.lock().await.remove(id);
 	}
 
 }
 //================================ 内部结构和方法
 // 表信息
 #[derive(Clone)]
-pub struct TabInfo<T: Clone + Tab> {
+pub struct TabInfo {
 	meta:  Arc<TabMeta>,
-	init: Arc<Mutex<TabInit<T>>>,
+	init: Arc<Mutex<TabInit>>,
 }
-impl<T: Clone + Tab> TabInfo<T> {
+impl TabInfo {
 	fn new(meta: Arc<TabMeta>) -> Self {
 		TabInfo{
-			meta: meta,
+			meta,
 			init: Arc::new(Mutex::new(TabInit {
-				tab: Err(String::from("")),
-				wait:Some(Vec::new()),
+				tab_type: TabType::Unkonwn,
+				wait:Some(true),
 			})),
 		}
 	}
 }
 // 表初始化
-struct TabInit<T: Clone + Tab> {
-	tab: SResult<T>,
-	wait: Option<Vec<Box<Fn(SResult<T>)>>>, // 为None表示tab已经加载
+struct TabInit {
+	tab_type: TabType,
+	wait: Option<bool>, // 为None表示tab已经加载
 }
 
-//================================ 内部静态方法
-// 表构建函数的回调函数
-fn handle_fn<T: Tab>(id: Guid, writable: bool, cb: Box<Fn(SResult<Arc<TabTxn>>)>) -> Box<Fn(SResult<T>)> {
-	Box::new(move |r| {
-		match r {
-			Ok(tab) => {
-				// 创建事务
-				cb(Ok(tab.transaction(&id, writable)))
-			},
-			Err(s) => cb(Err(s))
-		}
-	})
+#[derive(Clone)]
+enum TabType {
+	Unkonwn,
+	MemTab(MTab),
+	LogFileTab(LogFileTab)
 }
