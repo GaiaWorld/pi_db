@@ -92,7 +92,6 @@ impl LogFileDB {
 		let start = std::time::Instant::now();
 		let mut count = 0;
 		for (k, v) in map.iter() {
-			println!("!!!!!!k: {:?}, v: {:?}", k, v);
 			let tab_name = Atom::decode(&mut ReadBuffer::new(k, 0)).unwrap();
 			let meta = TableMetaInfo::decode(&mut ReadBuffer::new(v.clone().to_vec().as_ref(), 0)).unwrap();
 			tabs.set_tab_meta(tab_name.clone(), Arc::new(meta.meta.clone())).await;
@@ -1008,8 +1007,12 @@ impl LogFileMetaTxn {
 							value.ref_count -= 1;
 							let mut wb2 = WriteBuffer::new();
 							value.encode(&mut wb2);
+							parent.encode(&mut wb);
 							store.write(wb.bytes, wb2.bytes).await;
 						}
+					} else {
+						tab_name.encode(&mut wb);
+						store.remove(wb.bytes).await;
 					}
 				}
 			}
