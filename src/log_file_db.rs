@@ -640,7 +640,7 @@ impl FileMemTxn {
 				let key = Bon::new(key.clone());
 				match lock.root.get(&key) {
 					Some(r1) => match self.old.get(&key) {
-						Some(r2) if (r1 as *const Bin) == (r2 as *const Bin) => (),
+						Some(r2) if (r1.as_ptr() as usize == r2.as_ptr() as usize) => (),
 						_ => return Err(String::from("prepare conflicted value diff"))
 					},
 					_ => match self.old.get(&key) {
