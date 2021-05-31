@@ -20,31 +20,41 @@ use crate::memery_db::{ MTab, RefMemeryTxn };
 use crate::log_file_db::{LogFileTab, RefLogFileTxn};
 use crate::log_file_db::LogFileDB;
 
+/*
+* 表事务类型
+*/
 pub enum TxnType {
-	MemTxn(Arc<RefMemeryTxn>),
-	LogFileTxn(Arc<RefLogFileTxn>)
+	MemTxn(Arc<RefMemeryTxn>),		//内存表事务
+	LogFileTxn(Arc<RefLogFileTxn>)	//日志文件表事务
 }
-// 表结构及修改日志
+
+/*
+* 元信息表的表修改日志，元信息表一定是日志文件类型的表
+*/
 pub struct TabLog {
-	map: OrdMap<Tree<Atom, TabInfo>>,
-	old_map: OrdMap<Tree<Atom, TabInfo>>, // 用于判断mgr中tabs是否修改过
-	meta_names: XHashSet<Atom>, //元信息表的名字
-	alter_logs: XHashMap<(Atom, usize), Option<Arc<TabMeta>>>, // 记录每个被改过元信息的表
-	rename_logs: XHashMap<Atom, (Atom, usize)>, // 新名字->(源名字, 版本号)
+	map: OrdMap<Tree<Atom, TabInfo>>,							//表名和表信息，在创建元信息表的事务的snapshot中初始化，对元信息表进行事务操作时，用于记录表元信息事务中对表元信息的修改
+	old_map: OrdMap<Tree<Atom, TabInfo>>, 						//表名和表信息，在创建元信息表的事务的snapshot中初始化，用于在表元信息事务的预提交和提交时的判断
+	meta_names: XHashSet<Atom>, 								//所有表(不是元信息表)的名称
+	alter_logs: XHashMap<(Atom, usize), Option<Arc<TabMeta>>>, 	//创建表的日志，记录了表(不是元信息表)的名称，版本号(暂时未使用)和表的元信息
+	rename_logs: XHashMap<Atom, (Atom, usize)>, 				//重命名表的日志，记录了源表的别名，源表的名称和版本号
 }
+
 impl TabLog {
-	// 列出全部的表
+	//获取所有表的表名迭代器
 	pub fn list(&self) -> TabIter {
 		TabIter::new(Arc::new(RwLock::new(self.map.clone())), self.map.keys(None, false))
 	}
-	// 获取指定的表结构
+
+	//获取指定表的元信息，没有导出到js层
+	//TODO get和tab_info只需要保留一个...
 	pub fn get(&self, tab: &Atom) -> Option<Arc<TabMeta>> {
 		match self.map.get(tab) {
 			Some(t) => Some(t.meta.clone()),
 			_ => None
 		}
 	}
-	// 表的元信息
+
+	//替换元信息表操作日志中的所有表名称、创建表的日志和重命名表的日志，以减少内存占用
 	fn replace(&mut self) -> Self {
 		TabLog {
 			map: self.map.clone(),
@@ -54,40 +64,52 @@ impl TabLog {
 			rename_logs: mem::replace(&mut self.rename_logs, XHashMap::with_capacity_and_hasher(0, Default::default())),
 		}
 	}
-	// 表的元信息
+
+	//获取指定表的元信息，导出到js层
+	//TODO get和tab_info只需要保留一个...
 	pub fn tab_info(&self, tab_name: &Atom) -> Option<Arc<TabMeta>> {
 		match self.map.get(tab_name) {
 			Some(info) => Some(info.meta.clone()),
 			_ => None,
 		}
 	}
-	// 新增 修改 删除 表
+
+	//创建、修改或删除指定表，包括表名和表的元信息(主键类型和值类型)，修改和删除操作只影响源名称对应的源表
 	pub fn alter(&mut self, tab_name: &Atom, meta: Option<Arc<TabMeta>>) {
-		// 先查找rename_logs，获取该表的源名字及版本，然后修改alter_logs
+		//先查找rename_logs，获取该表的源名称和版本，然后修改alter_logs
 		let (src_name, ver) = match self.rename_logs.get(tab_name) {
 			Some(v) => v.clone(),
 			_ => (tab_name.clone(), 0),
 		};
 		let mut f = |v: Option<&TabInfo>| {
 			match v {
+				//指定的表已存在
 				Some(ti) => match &meta {
+					//修改指定表的元信息
 					Some(si) => ActionResult::Upsert(TabInfo {
 						meta: si.clone(),
 						init: ti.init.clone(),
 					}),
-					_ => ActionResult::Delete
+					_ => {
+						//删除指定表
+						ActionResult::Delete
+					}
 				},
 				_ => match &meta {
-					Some(si) => ActionResult::Upsert(TabInfo::new(si.clone())),
+					Some(si) => {
+						//创建指定表的元信息
+						ActionResult::Upsert(TabInfo::new(si.clone()))
+					},
 					_ => ActionResult::Ignore
 				}
 			}
 		};
-		self.map.action(&src_name, &mut f);
-		self.alter_logs.entry((src_name, ver)).or_insert(meta.clone());
-		self.meta_names.insert(tab_name.clone());
+		self.map.action(&src_name, &mut f); //在Ordmap中执行操作
+		self.alter_logs.entry((src_name, ver)).or_insert(meta.clone()); //记录创建表的日志
+		self.meta_names.insert(tab_name.clone()); //插入创建、修改或删除表时的表名称，自动去重
 	}
-	// 创建表事务
+
+	//创建表事务，包括元信息表和其它表的表事务
 	pub async fn build(&self, ware: BuildDbType, tab_name: &Atom, id: &Guid, writable: bool) -> SResult<TxnType> {
 		match self.map.get(tab_name) {
 			Some(ref info) => {
@@ -144,14 +166,19 @@ impl TabLog {
 	}
 }
 
+/*
+* 预提交，Guid是事务id，Bin是主键(元信息表的主键是表名)的二进制，RwLog是事务的操作日志
+*/
 pub struct Prepare(XHashMap<Guid, XHashMap<Bin, RwLog>>);
 
 impl Prepare{
+	//创建一个预提交
 	pub fn new(map: XHashMap<Guid, XHashMap<Bin, RwLog>>) -> Prepare{
 		Prepare(map)
 	}
 
-    //检查预提交是否冲突（如果预提交表中存在该条目，且其类型为write， 同时，本次预提交类型也为write， 即预提交冲突）
+    //检查预提交是否冲突
+	//如果预提交的事务操作日志中存在对应的key，且其类型为Write，同时，本次预提交类型也为Write，则预提交冲突）
 	pub fn try_prepare (&self, key: &Bin, log_type: &RwLog) -> Result<(), String> {
 		for o_rwlog in self.0.values() {
 			match o_rwlog.get(key) {
@@ -206,9 +233,12 @@ impl DerefMut for Prepare {
     }
 }
 
+/*
+* 表名迭代器
+*/
 pub struct TabIter{
-	_root: Arc<RwLock<OrdMap<Tree<Atom, TabInfo>>>>,
-	point: usize,
+	_root: Arc<RwLock<OrdMap<Tree<Atom, TabInfo>>>>,	//所有表的表信息
+	point: usize,										//OrdMap<Tree<Atom, TabInfo>的Keys<Tree<Atom, TabInfo>>指针的数字
 }
 
 impl Drop for TabIter {
@@ -218,6 +248,7 @@ impl Drop for TabIter {
 }
 
 impl<'a> TabIter {
+	//构建一个表名迭代器
 	pub fn new(root: Arc<RwLock<OrdMap<Tree<Atom, TabInfo>>>>, it: Keys<'a, Tree<Atom, TabInfo>>) -> TabIter{
 		TabIter{
 			_root: root.clone(),
@@ -240,15 +271,16 @@ impl Iterator for TabIter {
 }
 
 
-// 表管理器
+/*
+* 表管理器
+*/
 pub struct Tabs {
-	//全部的表结构
-	map: Arc<RwLock<OrdMap<Tree<Atom, TabInfo>>>>,
-	// 预提交的元信息事务表
-	prepare: Arc<Mutex<XHashMap<Guid, TabLog>>>,
+	map: Arc<RwLock<OrdMap<Tree<Atom, TabInfo>>>>,	//全部的表结构，包括表名和表的元信息
+	prepare: Arc<Mutex<XHashMap<Guid, TabLog>>>,	//记录元信息表的所有预提交事务信息，包括元信息表事务id和元信息表操作日志
 }
 
 impl Tabs {
+	//构建一个表管理器
 	pub fn new() -> Self {
 		Tabs {
 			map : Arc::new(RwLock::new(OrdMap::new(new()))),
@@ -256,6 +288,7 @@ impl Tabs {
 		}
 	}
 
+	//复制表管理器
 	pub fn clone_map(&self) -> Self{
 		Tabs {
 			map : self.map.clone(),
@@ -263,18 +296,21 @@ impl Tabs {
 		}
 	}
 
-	// 列出全部的表
+	//列出全部的表
 	pub async fn list(&self) -> TabIter {
 		TabIter::new(self.map.clone(), self.map.read().await.keys(None, false))
 	}
-	// 获取指定的表结构
+
+	//获取指定表的元信息
+	//TODO get和get_tab_meta只保留一个...
 	pub async fn get(&self, tab: &Atom) -> Option<Arc<TabMeta>> {
 		match self.map.read().await.get(tab) {
 			Some(t) => Some(t.meta.clone()),
 			_ => None
 		}
 	}
-	// 获取当前表结构快照
+
+	//获取元信息表的快照
 	pub async fn snapshot(&self) -> TabLog {
 		let map = self.map.read().await.clone();
 		TabLog {
@@ -285,20 +321,23 @@ impl Tabs {
 			rename_logs: XHashMap::with_capacity_and_hasher(0, Default::default()),
 		}
 	}
-	// 获取表的元信息
+
+	//获取指定表的元信息
+	//TODO get和get_tab_meta只保留一个...
 	pub async fn get_tab_meta(&self, tab: &Atom) -> Option<Arc<TabMeta>> {
 		match self.map.read().await.get(tab) {
 			Some(info) => Some(info.meta.clone()),
 			_ => None,
 		}
 	}
-	// 设置表的元信息
+
+	//设置指定表的元信息
 	pub async fn set_tab_meta(&mut self, tab: Atom, meta: Arc<TabMeta>) -> bool {
 		let r = self.map.write().await.insert(tab, TabInfo::new(meta));
 		r
 	}
 
-	// 预提交
+	//元信息表的预提交
 	pub async fn prepare(&self, id: &Guid, log: &mut TabLog) -> DBResult {
 		// 先检查预提交的交易是否有冲突
 		for val in self.prepare.lock().await.values() {
@@ -326,7 +365,8 @@ impl Tabs {
 		self.prepare.lock().await.insert(id.clone(), log.replace());
 		Ok(())
 	}
-	// 元信息的提交
+
+	//元信息表的提交
 	pub async fn commit(&self, id: &Guid) {
 		match self.prepare.lock().await.remove(id) {
 			Some(log) => if self.map.read().await.ptr_eq(&log.old_map) {
@@ -346,18 +386,19 @@ impl Tabs {
 			_ => ()
 		}
 	}
-	// 回滚
+
+	//元信息表的回滚
 	pub async fn rollback(&self, id: &Guid) {
 		self.prepare.lock().await.remove(id);
 	}
 
 }
 //================================ 内部结构和方法
-// 表信息
+//表信息
 #[derive(Clone)]
 pub struct TabInfo {
-	meta:  Arc<TabMeta>,
-	init: Arc<Mutex<TabInit>>,
+	meta:  Arc<TabMeta>,		//表元信息
+	init: Arc<Mutex<TabInit>>,	//表初始化
 }
 impl TabInfo {
 	fn new(meta: Arc<TabMeta>) -> Self {
@@ -370,15 +411,16 @@ impl TabInfo {
 		}
 	}
 }
-// 表初始化
+//表初始化
 struct TabInit {
-	tab_type: TabType,
-	wait: Option<bool>, // 为None表示tab已经加载
+	tab_type: TabType,	//表类型
+	wait: Option<bool>, //是否等待初始化，为None表示不需要等待初始化
 }
 
+//表类型
 #[derive(Clone)]
 enum TabType {
-	Unkonwn,
-	MemTab(MTab),
-	LogFileTab(LogFileTab)
+	Unkonwn,				//未知
+	MemTab(MTab),			//内存表
+	LogFileTab(LogFileTab)	//日志文件表
 }

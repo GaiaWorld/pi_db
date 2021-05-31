@@ -30,8 +30,8 @@ use crate::fork::{ALL_TABLES, TableMetaInfo};
 
 #[derive(Clone)]
 pub struct Mgr {
-	ware_map: Arc<Mutex<WareMap>>,
-	guid: Arc<GuidGen>,
+	ware_map: Arc<Mutex<WareMap>>,				//库映射表，根据类型分类
+	guid: Arc<GuidGen>,							//Guid生成器
 	// 所有的表分叉信息, 根据这些信息, 计算加载顺序
 	// forks: XHashMap<String, TableMetaInfo>
 }
@@ -43,7 +43,7 @@ const TIMEOUT: usize = 100;
 
 impl Mgr {
 	/**
-	* 构建表库及事务管理器管理器
+	* 构建表库及事务管理器
 	* @param gen 全局唯一id生成器
 	* @returns 返回表库及事务管理器管理器
 	*/
@@ -56,6 +56,7 @@ impl Mgr {
 
 	/**
 	* 浅拷贝，库表不同，共用同一个统计信息和GuidGen
+	* 浅拷贝是指Clone了不同类型的数据库的内存OrderMap的Arc指针
 	* @returns 返回Mgr的clone对象
 	*/
 	pub async fn shallow_clone(&self) -> Self {
@@ -84,8 +85,8 @@ impl Mgr {
 
 	/**
 	* 注册库
-	* @param ware_name 库名
-	* @param ware 库的实例
+	* @param ware_name 库名，即数据库的类型名，例如"logfile"
+	* @param ware 库的实例，即不同类型数据库的实例
 	* @returns 是否注册成功
 	*/
 	pub async fn register(&self, ware_name: Atom, ware: Arc<DatabaseWare>) -> bool {
@@ -102,9 +103,9 @@ impl Mgr {
 	}
 
 	/**
-	* 获取表的元信息
-	* @param ware_name 库名
-	* @param tab_name 表名
+	* 获取指定类型的库的指定表的元信息
+	* @param ware_name 库名，即数据库的类型名，例如"logfile"
+	* @param tab_name 表名，例如"db/user"
 	* @returns 返回表的元信息
 	*/
 	pub async fn tab_info(&self, ware_name:&Atom, tab_name: &Atom) -> Option<Arc<TabMeta>> {
@@ -115,8 +116,9 @@ impl Mgr {
 	}
 
 	/**
-	* 创建事务
+	* 创建一个运行在指定异步运行时上的事务
 	* @param writable 是否为写事务
+	* @param rt	异步运行时
 	* @returns 返回事务
 	*/
 	pub async fn transaction(&self, writable: bool, rt: Option<MultiTaskRuntime<()>>) -> Tr {
@@ -145,8 +147,8 @@ impl Mgr {
 	}
 
 	/**
-	* 获取库的所有表名
-	* @returns 表名集合
+	* 获取所有的库类型名
+	* @returns 库类型名集合
 	*/
 	pub async fn ware_name_list(&self) -> Vec<String> {
 		let mut arr = Vec::new();
@@ -163,7 +165,8 @@ impl Mgr {
 
 	/**
 	* 寻找指定的库
-	* @returns 库信息
+	* ware_name 库名，即数据库的类型名，例如"logfile"
+	* @returns 库信息，即指定类型的数据库
 	*/
 	pub async fn find(&self, ware_name: &Atom) -> Option<Arc<DatabaseWare>> {
 		let map = {
@@ -178,7 +181,7 @@ pub trait Monitor {
 }
 
 
-// 库表
+//库表，Atom表示库类型的原子描述，DatabaseWare表示数据库的句柄
 #[derive(Clone)]
 struct WareMap(OrdMap<Tree<Atom, Arc<DatabaseWare>>>);
 
@@ -189,13 +192,11 @@ impl fmt::Debug for WareMap {
 }
 
 /**
-* 数据库快照种类
+* 数据库快照的句柄
 */
 enum DatabaseWareSnapshot {
-	// 内存数据库快照
-	MemSnapshot(Arc<MemDBSnapshot>),
-	// 日志数据库快照
-	LogFileSnapshot(Arc<LogFileDBSnapshot>)
+	MemSnapshot(Arc<MemDBSnapshot>),			//内存数据库快照
+	LogFileSnapshot(Arc<LogFileDBSnapshot>)		//日志文件数据库快照
 }
 
 impl DatabaseWareSnapshot {
@@ -304,7 +305,7 @@ impl DatabaseWareSnapshot {
 	}
 
 	/**
-	* 创建元信息事务
+	* 创建元信息表事务
 	* @param id 事务的唯一标识id
 	* @returns 数据库元信息事务
 	*/
@@ -320,7 +321,7 @@ impl DatabaseWareSnapshot {
 	}
 
 	/**
-	* 预提交事务
+	* 预提交元信息表事务
 	* @param id 事务的唯一标识id
 	* @returns
 	*/
@@ -336,7 +337,7 @@ impl DatabaseWareSnapshot {
 	}
 
 	/**
-	* 提交事务
+	* 提交元信息表事务
 	* @param id 事务的唯一标识id
 	* @returns
 	*/
@@ -352,7 +353,7 @@ impl DatabaseWareSnapshot {
 	}
 
 	/**
-	* 回滚事务
+	* 回滚元信息表事务
 	* @param id 事务的唯一标识id
 	* @returns
 	*/
@@ -367,19 +368,16 @@ impl DatabaseWareSnapshot {
 		}
 	}
 
+	//通知元信息表已修改，暂时未实现
 	pub fn notify(&self, _event: Event) {}
 }
 
 /**
-* 数据库种类
-* @param id 事务的唯一标识id
-* @returns
+* 数据库的句柄，跨线程安全
 */
 pub enum DatabaseWare {
-	// 内存库
-	MemWare(Arc<MemDB>),
-	// 日志文件库
-	LogFileWare(Arc<LogFileDB>)
+	MemWare(Arc<MemDB>),			//内存数据库
+	LogFileWare(Arc<LogFileDB>)		//日志文件数据库
 }
 
 unsafe impl Send for DatabaseWare {}
@@ -422,7 +420,7 @@ impl DatabaseWare {
 	}
 
 	/**
-	* 获取当前表结构快照
+	* 获取当前数据库的快照句柄
 	* @returns
 	*/
 	async fn snapshot(&self) -> Arc<DatabaseWareSnapshot> {
@@ -440,7 +438,7 @@ impl DatabaseWare {
 
 	/**
 	* 获取表的元信息
-	* @param tab_name 表名
+	* @param tab_name 表名，例如"db/user"
 	* @returns 表的元信息
 	*/
 	async fn tab_info(&self, tab_name: &Atom) -> Option<Arc<TabMeta>> {
@@ -489,10 +487,8 @@ impl DatabaseWare {
  * 数据库表事务
 */
 pub enum DatabaseTabTxn {
-	// 内存表事务
-	MemTabTxn(Arc<RefMemeryTxn>),
-	// 日志文件表事务
-	LogFileTabTxn(Arc<RefLogFileTxn>)
+	MemTabTxn(Arc<RefMemeryTxn>),		//内存表事务
+	LogFileTabTxn(Arc<RefLogFileTxn>)	//日志文件表事务
 }
 
 impl DatabaseTabTxn {
@@ -909,6 +905,7 @@ impl WareMap {
 		}
 	}
 
+	//通过库的类型名，查找指定类型的数据库
 	fn find(&self, ware_name: &Atom) -> Option<Arc<DatabaseWare>> {
 		match self.0.get(&ware_name) {
 			Some(b) => Some(b.clone()),
@@ -921,18 +918,20 @@ impl WareMap {
 	}
 }
 
-// 子事务
+/*
+* 事务，所有独立事务的抽象
+*/
 #[derive(Default)]
 pub struct Tr {
-	writable: bool,
-	timeout: usize, // 子事务的预提交的超时时间, TODO 取提交的库的最大超时时间
-	id: Guid,
-	ware_log_map: XHashMap<Atom, Arc<DatabaseWareSnapshot>>,// 库名对应库快照
-	state: TxState,
-	tab_txns: XHashMap<(Atom, Atom), Arc<DatabaseTabTxn>>, //表事务表
-	meta_txns: XHashMap<Atom, Arc<DatabaseMetaTxn>>, //元信息事务表
-	fork_txns: XHashMap<(Atom, Atom, Atom), (TabMeta, Arc<DatabaseTabTxn>)>, // 这个事务中产生的所有分叉操作
-	rt: Option<MultiTaskRuntime<()>>
+	writable: bool,																//是否是可写事务
+	timeout: usize, 															//事务的预提交的超时时长，暂时未使用
+	id: Guid,																	//事务id
+	ware_log_map: XHashMap<Atom, Arc<DatabaseWareSnapshot>>,					//库类型名对应的库快照
+	state: TxState,																//事务状态
+	tab_txns: XHashMap<(Atom, Atom), Arc<DatabaseTabTxn>>, 						//数据库表事务映射表
+	meta_txns: XHashMap<Atom, Arc<DatabaseMetaTxn>>, 							//元信息表事务映射表
+	fork_txns: XHashMap<(Atom, Atom, Atom), (TabMeta, Arc<DatabaseTabTxn>)>, 	//这个事务中产生的所有分叉操作
+	rt: Option<MultiTaskRuntime<()>>,											//异步运行时
 }
 
 impl Tr {
@@ -944,267 +943,113 @@ impl Tr {
 		self.state.clone()
 	}
 
-	/// 创建 tab_name 的一个分叉表
-	/// 原表的log产生分裂，生成一个新的log文件id，之前的数据就是两个表的公共数据
-	pub async fn fork_tab(&mut self, ware: Atom, tab_name: Atom, fork_tab_name: Atom, new_meta: TabMeta) -> DBResult {
-		// 判断本事务中是否有冲突的分叉表名
-		if let Some(_) = self.fork_txns.get(&(ware.clone(), tab_name.clone(), fork_tab_name.clone()))  {
-			return Err("duplicate fork tab name".to_string())
-		}
-		let txn = match self.ware_log_map.get(&ware) {
-			Some(ware) => match ware.tab_txn(&tab_name, &self.id, self.writable).await {
-				Ok(txn) => txn,
-				Err(e) =>{
-					return Err(e)
+	/**
+	* 数据库元信息操作
+	* @param ware_name 库类型名
+	* @param tab_name 表名
+	* @param meta 表元信息， None表示删除表，如果对应的库类型名和表名存在，则修改对应表在元信息表中的元信息，如果对应的库类型名存在而表名不存在，则插入对应表的元信息到元信息表中，如果库类型名不存在，则返回错误
+	* @returns 元信息操作结果
+	*/
+	pub async fn alter(&mut self, ware_name: &Atom, tab_name: &Atom, meta: Option<Arc<TabMeta>>) -> DBResult {
+		self.state = TxState::Doing;
+		let ware = match self.ware_log_map.get(ware_name) {
+			Some(w) => match w.check(tab_name, &meta) { // 检查
+				Ok(_) =>{
+					w.alter(tab_name, meta.clone()).await;
+					w
+				},
+				Err(s) => {
+					self.state = TxState::Err;
+					return Err(s)
 				}
 			},
-			_ => return Err(String::from("WareNotFound"))
+			_ => {
+				self.state = TxState::Err;
+				return Err(format!("ware not found:{}", ware_name.as_str()))
+			}
 		};
-		self.fork_txns.insert((ware, tab_name, fork_tab_name), (new_meta, txn));
+		let id = &self.id;
+		let txn = self.meta_txns.entry(ware_name.clone()).or_insert_with(|| {
+			ware.meta_txn(&id)
+		}).clone();
 
-		Ok(())
-	}
-
-	/**
-	* 预提交事务
-	* @returns 预提交结果
-	*/
-	pub async fn prepare(&mut self) -> DBResult {
-		//如果预提交内容为空，直接返回预提交成功
-		if self.meta_txns.len() == 0 && self.tab_txns.len() == 0 {
-			self.state = TxState::PreparOk;
-			return Ok(());
-		}
-		self.state = TxState::Preparing;
-		// 先检查mgr上的meta alter的预提交
-		let alter_len = self.meta_txns.len();
-		if alter_len > 0 {
-			for ware in self.meta_txns.keys() {
-				match self.ware_log_map.get_mut(ware).unwrap().prepare(&self.id).await {
-					Err(s) =>{
-						self.state = TxState::PreparFail;
-						return Err(s)
-					},
-					_ => ()
-				}
-			}
-		}
-		let len = self.tab_txns.len() + alter_len + self.fork_txns.len() ;
-		let count = Arc::new(AtomicUsize::new(len));
-
-		//处理每个表的预提交
-		for val in self.tab_txns.values() {
-			match val.prepare(self.timeout).await {
-				Ok(_) => {
-					if count.fetch_sub(1, Ordering::SeqCst) == 1 {
-						self.state = TxState::PreparOk;
-						return Ok(())
-					}
-				}
-				Err(e) => {
-					self.state = TxState::PreparFail;
-					return Err(e);
-				}
-			}
-		}
-		//处理tab alter的预提交
-		for val in self.meta_txns.values() {
-			match val.prepare(self.timeout).await {
-				Ok(_) => {
-					if count.fetch_sub(1, Ordering::SeqCst) == 1 {
-						self.state = TxState::PreparOk;
-						return Ok(())
-					}
-				}
-				Err(e) => {
-					self.state = TxState::PreparFail;
-					return Err(e)
-				}
-			}
-		}
-
-		// 处理每个表事务的分叉预提交
-		for (k, v) in self.fork_txns.iter() {
-			match v.1.fork_prepare(k.0.clone(), k.1.clone(), k.2.clone(), v.0.clone()).await {
-				Ok(_) => {
-					if count.fetch_sub(1, Ordering::SeqCst) == 1 {
-						self.state = TxState::PreparOk;
-						return Ok(())
-					}
-				}
-				Err(e) => {
-					self.state = TxState::PreparFail;
-					return Err(e)
-				}
-			}
-		}
-
-		Ok(())
-	}
-
-	/**
-	* 提交事务
-	* @returns 提交结果
-	*/
-	pub async fn commit(&mut self) -> DBResult {
-		self.state = TxState::Committing;
-		// 先提交mgr上的事务
-		let alter_len = self.meta_txns.len();
-		if alter_len > 0 {
-			for ware in self.meta_txns.keys() {
-				self.ware_log_map.get(ware).unwrap().commit(&self.id).await;
-			}
-		}
-		let len = self.tab_txns.len() + alter_len + self.fork_txns.len();
-		if len == 0 {
-			return Ok(())
-		}
-		// println!(" ======== pi_db::mgr::commit txid: {:?}, alter_len: {:?}, tab_txn_len: {:?}", self.id.time(), alter_len, self.tab_txns.len());
-		let count = Arc::new(AtomicUsize::new(len));
-		let rt = self.rt.as_ref().unwrap().clone();
-		let mut async_map = rt.map::<bool>();
-
-		//处理每个表的提交
-		for (txn_name, val) in self.tab_txns.iter_mut() {
-			let val = val.clone();
-			async_map.join(AsyncRuntime::Multi(rt.clone()), async move {
-				match val.commit().await {
-					Ok(logs) => {
-						Ok(true)
-					}
-					Err(e) => {
-						Ok(false)
-					}
-				}
-			});
-		}
-
-		match async_map.map(AsyncRuntime::Multi(rt.clone())).await {
-			Ok(res) => {
-				for r in res {
-					if r.is_ok() && r.unwrap() {
-						if count.fetch_sub(1, Ordering::SeqCst) == 1 {
-							self.state = TxState::Commited;
-							return Ok(())
-						}
-					}
-				}
+		match txn.alter(tab_name, meta.clone()).await {
+			Ok(r) => {
+				self.state = TxState::Ok;
+				Ok(r)
 			}
 			Err(e) => {
-				self.state = TxState::CommitFail;
-				return Err(e.to_string())
+				self.state = TxState::Err;
+				Err(e)
 			}
 		}
+	}
 
-		//处理tab alter的提交
-		for val in self.meta_txns.values() {
-			match val.commit().await {
-				Ok(_) => {
-					if count.fetch_sub(1, Ordering::SeqCst) == 1 {
-						self.state = TxState::Commited;
-						return Ok(())
-					}
-				}
-				Err(e) => {
-					self.state = TxState::CommitFail;
-					return Err(e)
-				}
-			}
-		}
-
-		// 处理表分叉的提交
-		for (k, v) in self.fork_txns.iter() {
-			match v.1.fork_commit(k.0.clone(), k.1.clone(), k.2.clone(), v.0.clone()).await {
-				Ok(_) => {
-					if count.fetch_sub(1, Ordering::SeqCst) == 1 {
-						self.state = TxState::Commited;
-						return Ok(())
-					}
-				}
-				Err(e) => {
-					self.state = TxState::CommitFail;
-					return Err(e)
-				}
-			}
-		}
-
+	/**
+	* 表改名(未实现)
+	* @returns 改名结果
+	*/
+	pub fn rename(&mut self, _ware_name: &Atom, _old_name: &Atom, _new_name: Atom, _cb: TxCallback) -> DBResult {
+		self.state = TxState::Doing;
 		Ok(())
 	}
 
 	/**
-	* 回滚事务
-	* @returns 回滚事务结果
+	* 获取表的元信息
+	* @param ware_name 库名
+	* @param tab_name 表名
+	* @returns 表元信息
 	*/
-	pub async fn rollback(&mut self) -> DBResult {
-		self.state = TxState::Rollbacking;
-		// 先回滚mgr上的事务
-		let alter_len = self.meta_txns.len();
-		if alter_len > 0 {
-			for ware in self.meta_txns.keys() {
-				self.ware_log_map.get(ware).unwrap().rollback(&self.id).await;
-			}
+	pub async fn tab_info(&self, ware_name:&Atom, tab_name: &Atom) -> Option<Arc<TabMeta>> {
+		match self.ware_log_map.get(ware_name) {
+			Some(ware) => ware.tab_info(tab_name).await,
+			_ => None
 		}
-		let len = self.tab_txns.len() + alter_len + self.fork_txns.len();
-		let count = Arc::new(AtomicUsize::new(len));
-		
-		//处理每个表的预提交
-		for val in self.tab_txns.values() {
-			match val.rollback().await {
-				Ok(()) => {
-					if count.fetch_sub(1, Ordering::SeqCst) == 1 {
-						self.state = TxState::Rollbacked;
-						return Ok(())
-					}
-				}
-				Err(e) => {
-					self.state = TxState::RollbackFail;
-					return Err(e)
-				}
-			}
-		}
-		//处理tab alter的预提交
-		for val in self.meta_txns.values() {
-			match val.rollback().await {
-				Ok(()) => {
-					if count.fetch_sub(1, Ordering::SeqCst) == 1 {
-						self.state = TxState::Rollbacked;
-						return Ok(())
-					}
-				}
-				Err(e) => {
-					self.state = TxState::RollbackFail;
-					return Err(e)
-				}
-			}
-		}
-
-		// 处理表分叉的回滚
-		for (k, v) in self.fork_txns.iter() {
-			match v.1.fork_rollback().await {
-				Ok(()) => {
-					if count.fetch_sub(1, Ordering::SeqCst) == 1 {
-						self.state = TxState::Rollbacked;
-						return Ok(())
-					}
-				}
-				Err(e) => {
-					self.state = TxState::RollbackFail;
-					return Err(e)
-				}
-			}
-		}
-
-		Ok(())
 	}
 
 	/**
-	* 键锁(未实现)
-	* @returns
+	* 列出指定库的所有表
+	* @param ware_name 库名
+	* @returns 所有表的集合
 	*/
-	async fn key_lock(&mut self, tr: &Tr, arr: Vec<TabKV>, lock_time: usize, read_lock: bool) -> DBResult {
-		Ok(())
+	pub async fn list(&self, ware_name: &Atom) -> Option<Vec<String>> {
+		match self.ware_log_map.get(ware_name) {
+			Some(ware) => {
+				let mut arr = Vec::new();
+				for e in ware.list().await {
+					arr.push(e.to_string())
+				}
+				Some(arr)
+			},
+			_ => None
+		}
 	}
-	
+
+	/**
+	* 构建表事务
+	* @param ware_name 库类型名
+	* @param tab_name 表名
+	* @returns 数据库表事务
+	*/
+	async fn build(&mut self, ware_name: &Atom, tab_name: &Atom) -> SResult<Arc<DatabaseTabTxn>> {
+		let txn_key = (ware_name.clone(), tab_name.clone());
+		let txn = match self.tab_txns.get(&txn_key) {
+			Some(r) => return Ok(r.clone()),
+			_ => match self.ware_log_map.get(ware_name) {
+				Some(ware) => match ware.tab_txn(tab_name, &self.id, self.writable).await {
+					Ok(txn) => txn,
+					Err(e) =>{
+						self.state = TxState::Err;
+						return Err(e)
+					}
+				},
+				_ => return Err(format!("WareNotFound: {:?}", ware_name))
+			}
+		};
+		self.tab_txns.insert(txn_key, txn.clone());
+		Ok(txn)
+	}
+
 	/**
 	* 数据库查询
 	* @param arr 查询参数
@@ -1327,7 +1172,7 @@ impl Tr {
 			Ok(())
 		}
 	}
-	
+
 	/**
 	* 数据库迭代
 	* @param ware 迭代的库名
@@ -1355,7 +1200,7 @@ impl Tr {
 			Err(e) => Err(e)
 		}
 	}
-	
+
 	/**
 	* 数据库键迭代
 	* @param ware 迭代的库名
@@ -1383,7 +1228,7 @@ impl Tr {
 			Err(e) => Err(e)
 		}
 	}
-	
+
 	/**
 	* 数据库表的记录数
 	* @param ware_name 库名
@@ -1408,112 +1253,270 @@ impl Tr {
 			Err(e) => Err(e)
 		}
 	}
-	
-	/**
-	* 数据库元信息操作
-	* @param ware_name 库名
-	* @param tab_name 表名
-	* @param meta 表元信息， None 表示删除表
-	* @returns 元信息操作结果
-	*/
-	pub async fn alter(&mut self, ware_name: &Atom, tab_name: &Atom, meta: Option<Arc<TabMeta>>) -> DBResult {
-		self.state = TxState::Doing;
-		let ware = match self.ware_log_map.get(ware_name) {
-			Some(w) => match w.check(tab_name, &meta) { // 检查
-				Ok(_) =>{
-					w.alter(tab_name, meta.clone()).await;
-					w
-				},
-				Err(s) => {
-					self.state = TxState::Err;
-					return Err(s)
-				}
-			},
-			_ => {
-				self.state = TxState::Err;
-				return Err(format!("ware not found:{}", ware_name.as_str()))
-			}
-		};
-		let id = &self.id;
-		let txn = self.meta_txns.entry(ware_name.clone()).or_insert_with(|| {
-			ware.meta_txn(&id)
-		}).clone();
 
-		match txn.alter(tab_name, meta.clone()).await {
-			Ok(r) => {
-				self.state = TxState::Ok;
-				Ok(r)
-			}
-			Err(e) => {
-				self.state = TxState::Err;
-				Err(e)
+	/**
+	* 预提交事务
+	* @returns 预提交结果
+	*/
+	pub async fn prepare(&mut self) -> DBResult {
+		//如果预提交内容为空，直接返回预提交成功
+		if self.meta_txns.len() == 0 && self.tab_txns.len() == 0 {
+			self.state = TxState::PreparOk;
+			return Ok(());
+		}
+		self.state = TxState::Preparing;
+
+		//检查并插入元信息表事务在表管理器中的预提交信息
+		let alter_len = self.meta_txns.len();
+		if alter_len > 0 {
+			for ware in self.meta_txns.keys() {
+				match self.ware_log_map.get_mut(ware).unwrap().prepare(&self.id).await {
+					Err(s) =>{
+						self.state = TxState::PreparFail;
+						return Err(s)
+					},
+					_ => ()
+				}
 			}
 		}
-	}
-	
-	/**
-	* 表改名(未实现)
-	* @returns 改名结果
-	*/
-	pub fn rename(&mut self, _ware_name: &Atom, _old_name: &Atom, _new_name: Atom, _cb: TxCallback) -> DBResult {
-		self.state = TxState::Doing;
+		let len = self.tab_txns.len() + alter_len + self.fork_txns.len() ;
+		let count = Arc::new(AtomicUsize::new(len));
+
+		//处理每个数据库表的预提交
+		for val in self.tab_txns.values() {
+			match val.prepare(self.timeout).await {
+				Ok(_) => {
+					if count.fetch_sub(1, Ordering::SeqCst) == 1 {
+						self.state = TxState::PreparOk;
+						return Ok(())
+					}
+				}
+				Err(e) => {
+					self.state = TxState::PreparFail;
+					return Err(e);
+				}
+			}
+		}
+
+		//处理元信息表alter的预提交(预提交不会修改元信息表，所以暂时是空实现)
+		for val in self.meta_txns.values() {
+			match val.prepare(self.timeout).await {
+				Ok(_) => {
+					if count.fetch_sub(1, Ordering::SeqCst) == 1 {
+						self.state = TxState::PreparOk;
+						return Ok(())
+					}
+				}
+				Err(e) => {
+					self.state = TxState::PreparFail;
+					return Err(e)
+				}
+			}
+		}
+
+		//处理每个表事务的分叉预提交
+		for (k, v) in self.fork_txns.iter() {
+			match v.1.fork_prepare(k.0.clone(), k.1.clone(), k.2.clone(), v.0.clone()).await {
+				Ok(_) => {
+					if count.fetch_sub(1, Ordering::SeqCst) == 1 {
+						self.state = TxState::PreparOk;
+						return Ok(())
+					}
+				}
+				Err(e) => {
+					self.state = TxState::PreparFail;
+					return Err(e)
+				}
+			}
+		}
+
 		Ok(())
 	}
 
 	/**
-	* 获取表的元信息
-	* @param ware_name 库名
-	* @param tab_name 表名
-	* @returns 表元信息
+	* 提交事务
+	* @returns 提交结果
 	*/
-	pub async fn tab_info(&self, ware_name:&Atom, tab_name: &Atom) -> Option<Arc<TabMeta>> {
-		match self.ware_log_map.get(ware_name) {
-			Some(ware) => ware.tab_info(tab_name).await,
-			_ => None
-		}
-	}
-
-	/**
-	* 列出指定库的所有表
-	* @param ware_name 库名
-	* @returns 所有表的集合
-	*/
-	pub async fn list(&self, ware_name: &Atom) -> Option<Vec<String>> {
-		match self.ware_log_map.get(ware_name) {
-			Some(ware) => {
-				let mut arr = Vec::new();
-				for e in ware.list().await {
-						arr.push(e.to_string())
-				}
-				Some(arr)
-			},
-			_ => None
-		}
-	}
-
-	/**
-	* 构建表事务
-	* @param ware_name 库名
-	* @param tab_name 表名
-	* @returns 构建结果
-	*/
-	async fn build(&mut self, ware_name: &Atom, tab_name: &Atom) -> SResult<Arc<DatabaseTabTxn>> {
-		let txn_key = (ware_name.clone(), tab_name.clone());
-		let txn = match self.tab_txns.get(&txn_key) {
-			Some(r) => return Ok(r.clone()),
-			_ => match self.ware_log_map.get(ware_name) {
-				Some(ware) => match ware.tab_txn(tab_name, &self.id, self.writable).await {
-					Ok(txn) => txn,
-					Err(e) =>{
-						self.state = TxState::Err;
-						return Err(e)
-					}
-				},
-				_ => return Err(format!("WareNotFound: {:?}", ware_name))
+	pub async fn commit(&mut self) -> DBResult {
+		self.state = TxState::Committing;
+		//检查并移除元信息表事务在表管理器中的预提交信息
+		let alter_len = self.meta_txns.len();
+		if alter_len > 0 {
+			for ware in self.meta_txns.keys() {
+				self.ware_log_map.get(ware).unwrap().commit(&self.id).await;
 			}
+		}
+		let len = self.tab_txns.len() + alter_len + self.fork_txns.len();
+		if len == 0 {
+			return Ok(())
+		}
+		// println!(" ======== pi_db::mgr::commit txid: {:?}, alter_len: {:?}, tab_txn_len: {:?}", self.id.time(), alter_len, self.tab_txns.len());
+		let count = Arc::new(AtomicUsize::new(len));
+		let rt = self.rt.as_ref().unwrap().clone();
+		let mut async_map = rt.map::<bool>();
+
+		//提交数据库表的事务
+		for (txn_name, val) in self.tab_txns.iter_mut() {
+			let val = val.clone();
+			async_map.join(AsyncRuntime::Multi(rt.clone()), async move {
+				match val.commit().await {
+					Ok(logs) => {
+						Ok(true)
+					}
+					Err(e) => {
+						Ok(false)
+					}
+				}
+			});
+		}
+
+		match async_map.map(AsyncRuntime::Multi(rt.clone())).await {
+			Ok(res) => {
+				for r in res {
+					if r.is_ok() && r.unwrap() {
+						if count.fetch_sub(1, Ordering::SeqCst) == 1 {
+							self.state = TxState::Commited;
+							return Ok(())
+						}
+					}
+				}
+			}
+			Err(e) => {
+				self.state = TxState::CommitFail;
+				return Err(e.to_string())
+			}
+		}
+
+		//提交元信息表的事务，并修改内存和文件数据
+		for val in self.meta_txns.values() {
+			match val.commit().await {
+				Ok(_) => {
+					if count.fetch_sub(1, Ordering::SeqCst) == 1 {
+						self.state = TxState::Commited;
+						return Ok(())
+					}
+				}
+				Err(e) => {
+					self.state = TxState::CommitFail;
+					return Err(e)
+				}
+			}
+		}
+
+		// 处理表分叉的提交
+		for (k, v) in self.fork_txns.iter() {
+			match v.1.fork_commit(k.0.clone(), k.1.clone(), k.2.clone(), v.0.clone()).await {
+				Ok(_) => {
+					if count.fetch_sub(1, Ordering::SeqCst) == 1 {
+						self.state = TxState::Commited;
+						return Ok(())
+					}
+				}
+				Err(e) => {
+					self.state = TxState::CommitFail;
+					return Err(e)
+				}
+			}
+		}
+
+		Ok(())
+	}
+
+	/**
+	* 回滚事务
+	* @returns 回滚事务结果
+	*/
+	pub async fn rollback(&mut self) -> DBResult {
+		self.state = TxState::Rollbacking;
+		//先移除元信息表事务在表管理器中的预提交信息
+		let alter_len = self.meta_txns.len();
+		if alter_len > 0 {
+			for ware in self.meta_txns.keys() {
+				self.ware_log_map.get(ware).unwrap().rollback(&self.id).await;
+			}
+		}
+		let len = self.tab_txns.len() + alter_len + self.fork_txns.len();
+		let count = Arc::new(AtomicUsize::new(len));
+		
+		//处理数据库表的回滚
+		for val in self.tab_txns.values() {
+			match val.rollback().await {
+				Ok(()) => {
+					if count.fetch_sub(1, Ordering::SeqCst) == 1 {
+						self.state = TxState::Rollbacked;
+						return Ok(())
+					}
+				}
+				Err(e) => {
+					self.state = TxState::RollbackFail;
+					return Err(e)
+				}
+			}
+		}
+
+		//回滚元信息表上的事务(回滚不会修改元信息表，所以暂时是空实现)
+		for val in self.meta_txns.values() {
+			match val.rollback().await {
+				Ok(()) => {
+					if count.fetch_sub(1, Ordering::SeqCst) == 1 {
+						self.state = TxState::Rollbacked;
+						return Ok(())
+					}
+				}
+				Err(e) => {
+					self.state = TxState::RollbackFail;
+					return Err(e)
+				}
+			}
+		}
+
+		// 处理表分叉的回滚
+		for (k, v) in self.fork_txns.iter() {
+			match v.1.fork_rollback().await {
+				Ok(()) => {
+					if count.fetch_sub(1, Ordering::SeqCst) == 1 {
+						self.state = TxState::Rollbacked;
+						return Ok(())
+					}
+				}
+				Err(e) => {
+					self.state = TxState::RollbackFail;
+					return Err(e)
+				}
+			}
+		}
+
+		Ok(())
+	}
+
+	///创建指定数据库表的一个分叉表，允许分叉后的表有新的元信息(主键和值类型)
+	///原表的log会立即强制分裂，生成一个新的log文件和文件id，之前的数据就是两个表的公共数据
+	///强制分裂后的最新的只读log文件就是分叉点
+	pub async fn fork_tab(&mut self, ware: Atom, tab_name: Atom, fork_tab_name: Atom, new_meta: TabMeta) -> DBResult {
+		//判断本事务中是否有冲突的分叉表名，例如
+		if let Some(_) = self.fork_txns.get(&(ware.clone(), tab_name.clone(), fork_tab_name.clone()))  {
+			return Err("duplicate fork tab name".to_string())
+		}
+		let txn = match self.ware_log_map.get(&ware) {
+			Some(ware) => match ware.tab_txn(&tab_name, &self.id, self.writable).await {
+				Ok(txn) => txn,
+				Err(e) =>{
+					return Err(e)
+				}
+			},
+			_ => return Err(String::from("WareNotFound"))
 		};
-		self.tab_txns.insert(txn_key, txn.clone());
-		Ok(txn)
+		self.fork_txns.insert((ware, tab_name, fork_tab_name), (new_meta, txn));
+
+		Ok(())
+	}
+
+	/**
+	* 记录锁(未实现)
+	* @returns
+	*/
+	async fn key_lock(&mut self, tr: &Tr, arr: Vec<TabKV>, lock_time: usize, read_lock: bool) -> DBResult {
+		Ok(())
 	}
 }
 

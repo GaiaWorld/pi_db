@@ -14,6 +14,7 @@ use pi_db::fork::TableMetaInfo;
 
 use log_file_db::STORE_RUNTIME;
 
+//加载hello表，并写数据，然后基于hello再分叉得到hello_fork表，并继续写入hello表
 #[test]
 fn test_fork() {
 	let pool = MultiTaskPool::new("Store-Runtime".to_string(), 4, 1024 * 1024, 10, Some(10));
@@ -143,8 +144,9 @@ fn test_fork() {
 	thread::sleep(Duration::from_secs(3));
 }
 
+//纯加载hello、hello_fork和hello_fork2
 #[test]
-fn test_load_data() {
+fn test_pure_load_data() {
 	let pool = MultiTaskPool::new("Store-Runtime".to_string(), 4, 1024 * 1024, 10, Some(10));
 	let rt: MultiTaskRuntime<()>  = pool.startup(true);
 	let rt1 = rt.clone();
@@ -155,6 +157,57 @@ fn test_load_data() {
 		let ware = DatabaseWare::new_log_file_ware(LogFileDB::new(Atom::from("./testlogfile"), 1024 * 1024 * 1024).await);
 		let _ = mgr.register(Atom::from("logfile"), Arc::new(ware)).await;
 
+		let mut tr1 = mgr.transaction(false, Some(rt.clone())).await;
+		let mut iter = tr1.iter(&Atom::from("logfile"), &Atom::from("./testlogfile/hello"), None, false, None).await;
+		println!("hello, not exist: {:?}", iter.is_err());
+		if let Ok(mut iter) = iter {
+			while let Some(Ok(Some(elem))) = iter.next() {
+				println!("elem = {:?}", elem);
+			}
+			tr1.prepare().await;
+			tr1.commit().await;
+		}
+
+		let mut tr2 = mgr.transaction(false, Some(rt.clone())).await;
+		let mut iter = tr2.iter(&Atom::from("logfile"), &Atom::from("./testlogfile/hello_fork"), None, false, None).await;
+		println!("hello_fork, not exist: {:?}", iter.is_err());
+		if let Ok(mut iter) = iter {
+			while let Some(Ok(Some(elem))) = iter.next() {
+				println!("elem = {:?}", elem);
+			}
+			tr2.prepare().await;
+			tr2.commit().await;
+		}
+
+		let mut tr3 = mgr.transaction(false, Some(rt.clone())).await;
+		let mut iter = tr3.iter(&Atom::from("logfile"), &Atom::from("./testlogfile/hello_fork2"), None, false, None).await;
+		println!("hello_fork2, not exist: {:?}", iter.is_err());
+		if let Ok(mut iter) = iter {
+			while let Some(Ok(Some(elem))) = iter.next() {
+				println!("elem = {:?}", elem);
+			}
+			tr3.prepare().await;
+			tr3.commit().await;
+		}
+	});
+
+	thread::sleep(Duration::from_secs(3));
+}
+
+//加载hello和hello_fork，并写数据，然后基于hello_fork再分叉得到hello_fork2表，并继续写入数据
+#[test]
+fn test_fork_write_data() {
+	let pool = MultiTaskPool::new("Store-Runtime".to_string(), 4, 1024 * 1024, 10, Some(10));
+	let rt: MultiTaskRuntime<()>  = pool.startup(true);
+	let rt1 = rt.clone();
+
+	let _ = rt1.spawn(rt.alloc(), async move {
+		*STORE_RUNTIME.write().await = Some(rt.clone());
+		let mgr = Mgr::new(GuidGen::new(0, 0));
+		let ware = DatabaseWare::new_log_file_ware(LogFileDB::new(Atom::from("./testlogfile"), 1024 * 1024 * 1024).await);
+		let _ = mgr.register(Atom::from("logfile"), Arc::new(ware)).await;
+
+		//创建表
 		let mut tr1 = mgr.transaction(true, Some(rt.clone())).await;
 		let meta1 = TabMeta::new(sinfo::EnumType::Str, sinfo::EnumType::Str);
 		tr1.alter(&Atom::from("logfile"), &Atom::from("./testlogfile/hello"), Some(Arc::new(meta1.clone()))).await;
@@ -232,6 +285,88 @@ fn test_load_data() {
 		tr7.prepare().await;
 		tr7.commit().await;
 
+	});
+
+	thread::sleep(Duration::from_secs(3));
+}
+
+#[test]
+fn test_delete() {
+	let pool = MultiTaskPool::new("Store-Runtime".to_string(), 4, 1024 * 1024, 10, Some(10));
+	let rt: MultiTaskRuntime<()>  = pool.startup(true);
+	let rt1 = rt.clone();
+	let rt2 = rt.clone();
+
+	let _ = rt1.spawn(rt.alloc(), async move {
+		*STORE_RUNTIME.write().await = Some(rt.clone());
+
+		let mgr = Mgr::new(GuidGen::new(0, 0));
+		let ware = DatabaseWare::new_log_file_ware(LogFileDB::new(Atom::from("./testlogfile"), 1024 * 1024 * 1024).await);
+		let _ = mgr.register(Atom::from("logfile"), Arc::new(ware)).await;
+
+		let mut tr = mgr.transaction(true, Some(rt.clone())).await;
+
+		// 删除非叶子节点表
+		tr.alter(&Atom::from("logfile"), &Atom::from("./testlogfile/hello"), None).await;
+		let _ = tr.prepare().await;
+		let res = tr.commit().await;
+		println!("res {:?}", res);
+		assert!(res.is_err());
+
+		let mut tr2 = mgr.transaction(true, Some(rt.clone())).await;
+		// 删除叶子节点表
+		tr2.alter(&Atom::from("logfile"), &Atom::from("./testlogfile/hello_fork2"), None).await;
+		let p = tr2.prepare().await;
+		let res = tr2.commit().await;
+		println!("res1 {:?}", res);
+		assert!(res.is_ok());
+
+
+		// 删除叶子节点表
+		let mut tr3 = mgr.transaction(true, Some(rt.clone())).await;
+		tr3.alter(&Atom::from("logfile"), &Atom::from("./testlogfile/hello_fork"), None).await;
+		let p = tr3.prepare().await;
+		let res = tr3.commit().await;
+		println!("res2 {:?}", res);
+
+		assert!(res.is_ok());
+
+		// 删除根节点表
+		let mut tr4 = mgr.transaction(true, Some(rt.clone())).await;
+		tr4.alter(&Atom::from("logfile"), &Atom::from("./testlogfile/hello"), None).await;
+		let p = tr4.prepare().await;
+		let res = tr4.commit().await;
+		println!("res3 {:?}", res);
+
+		assert!(res.is_ok());
+	});
+
+	thread::sleep(Duration::from_secs(3));
+
+	let _ = rt1.spawn(rt2.clone().alloc(), async move {
+		*STORE_RUNTIME.write().await = Some(rt2.clone());
+
+		let mgr = Mgr::new(GuidGen::new(0, 0));
+		let ware = DatabaseWare::new_log_file_ware(LogFileDB::new(Atom::from("./testlogfile"), 1024 * 1024 * 1024).await);
+		let _ = mgr.register(Atom::from("logfile"), Arc::new(ware)).await;
+
+		let mut tr2 = mgr.transaction(false, Some(rt2.clone())).await;
+		let iter = tr2.iter(&Atom::from("logfile"), &Atom::from("./testlogfile/hello"), None, false, None).await;
+		println!("iter hello result error === {:?}", iter.is_err());
+		tr2.prepare().await;
+		tr2.commit().await;
+
+		let mut tr3 = mgr.transaction(false, Some(rt2.clone())).await;
+		let iter = tr3.iter(&Atom::from("logfile"), &Atom::from("./testlogfile/hello_fork"), None, false, None).await;
+		println!("iter hello_frok result error === {:?}", iter.is_err());
+		tr3.prepare().await;
+		tr3.commit().await;
+
+		let mut tr4 = mgr.transaction(false, Some(rt2.clone())).await;
+		let iter = tr4.iter(&Atom::from("logfile"), &Atom::from("./testlogfile/hello_fork2"), None, false, None).await;
+		println!("iter hello_fork2 result error === {:?}", iter.is_err());
+		tr4.prepare().await;
+		tr4.commit().await;
 	});
 
 	thread::sleep(Duration::from_secs(3));

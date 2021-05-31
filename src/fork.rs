@@ -6,6 +6,9 @@ use r#async::lock::mutex_lock::Mutex;
 
 use crate::db::TabMeta;
 
+/*
+ 用于缓存分叉元信息的所有日志文件表的元信息映射表，Atom表示日志文件表的表名
+*/
 lazy_static! {
 	pub static ref ALL_TABLES: Arc<Mutex<HashMap<Atom, TableMetaInfo>>> = Arc::new(Mutex::new(HashMap::new()));
 }
@@ -17,6 +20,7 @@ lazy_static! {
 /// 2. 系统初始化的时候重建fork关系
 /// 两种方式在删除表时候的操作方便程度
 
+/// 所有表保存在日志文件中的元信息数据结构，非分叉表和分叉表都使用这个元信息数据结构
 /// 记录所有的元信息表，数据库打开时就应该先加载这部分的内容，取得各个表的元信息。
 /// 需要用一个表专门存储这些信息
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -110,7 +114,7 @@ impl Decode for TableMetaInfo {
 	}
 }
 
-/// 从根表到目标表路径
+/// 获取从指定表作为叶节点开始的整个分叉链上所有表的元信息向量
 pub async fn build_fork_chain(tab_name: Atom) -> Vec<TableMetaInfo> {
 	let mut chains = vec![];
 	let lock = ALL_TABLES.lock().await;
