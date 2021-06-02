@@ -186,30 +186,36 @@ impl Prepare{
 					RwLog::Read => return Ok(()),
 					RwLog::Write(_) => {
 						debug!("expect read log type, found write log type");
-						return Err(String::from("prepare conflicted rw"));
+						let key_str = format!("{:?}", key);
+						return Err(String::from("prepare conflicted rw") + key_str.as_str());
 					}
 					RwLog::Meta(_) => {
 						debug!("expect read log type, found meta log type");
-						return Err(String::from("unexpected meta log type1"));
+						let key_str = format!("{:?}", key);
+						return Err(String::from("unexpected meta log type1") + key_str.as_str());
 					}
 				},
 				Some(RwLog::Write(_)) => match log_type {
 					RwLog::Read => {
 						debug!("previous read log exist, key = {:?}", key);
-						return Err(String::from("previous read log exist"));
+						let key_str = format!("{:?}", key);
+						return Err(String::from("previous read log exist") + key_str.as_str());
 					}
 					RwLog::Write(_) => {
 						debug!("previous write log exist, key = {:?}", key);
-						return Err(String::from("previous write log exist"));
+						let key_str = format!("{:?}", key);
+						return Err(String::from("previous write log exist") + key_str.as_str());
 					}
 					RwLog::Meta(_) => {
 						debug!("previous meta log exist, key = {:?}", key);
-						return Err(String::from("previous meta log exist"));
+						let key_str = format!("{:?}", key);
+						return Err(String::from("previous meta log exist") + key_str.as_str());
 					}
 					
 				},
 				Some(RwLog::Meta(_)) => {
-					return Err(String::from("unexpected meta log type2"));
+					let key_str = format!("{:?}", key);
+					return Err(String::from("unexpected meta log type2") + key_str.as_str());
 				}
 				None => return Ok(()),
 			}
