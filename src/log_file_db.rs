@@ -641,11 +641,17 @@ impl FileMemTxn {
 				match lock.root.get(&key) {
 					Some(r1) => match self.old.get(&key) {
 						Some(r2) if (r1.as_ptr() as usize == r2.as_ptr() as usize) => (),
-						_ => return Err(String::from("prepare conflicted value diff"))
+						_ => {
+							let key_str = format!("{:?}", &*key);
+							return Err(String::from("prepare conflicted value diff") + key_str.as_str())
+						}
 					},
 					_ => match self.old.get(&key) {
 						None => (),
-						_ => return Err(String::from("prepare conflicted old not None"))
+						_ => {
+							let key_str = format!("{:?}", &*key);
+							return Err(String::from("prepare conflicted old not None") + key_str.as_str())
+						}
 					}
 				}
 			}
