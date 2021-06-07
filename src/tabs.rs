@@ -12,6 +12,7 @@ use atom::Atom;
 use guid::Guid;
 use r#async::lock::mutex_lock::Mutex;
 use r#async::lock::rw_lock::RwLock;
+use time::now_nanosecond;
 
 
 use crate::{db::{SResult, Bin, RwLog, TabMeta, BuildDbType, DBResult}, log_file_db::MemIter};
@@ -179,8 +180,15 @@ impl Prepare{
 
     //检查预提交是否冲突
 	//如果预提交的事务操作日志中存在对应的key，且其类型为Write，同时，本次预提交类型也为Write，则预提交冲突）
-	pub fn try_prepare (&self, key: &Bin, log_type: &RwLog) -> Result<(), String> {
-		for o_rwlog in self.0.values() {
+	pub fn try_prepare (&mut self, key: &Bin, log_type: &RwLog) -> Result<(), String> {
+		let mut timeout_tr = vec![];
+		for (guid, o_rwlog) in self.0.iter() {
+			// 判断事务是否过期(有效期为1分钟)
+			if (now_nanosecond() as u64 - guid.time()) > 60 * 1000 * 1000000 {
+				timeout_tr.push((guid.clone(), key.clone(), log_type.clone()));
+				continue;
+			}
+			
 			match o_rwlog.get(key) {
 				Some(RwLog::Read) => match log_type {
 					RwLog::Read => return Ok(()),
@@ -220,7 +228,10 @@ impl Prepare{
 				None => return Ok(()),
 			}
 		}
-
+		for (guid, key, log_type) in timeout_tr {
+			self.0.remove(&guid);
+			warn!("overdue transactions guid:{:?}, key:{:?}, log_type:{:?}", guid, key, log_type);
+		}
 		Ok(())
 	}
 }
