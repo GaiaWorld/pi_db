@@ -12,7 +12,7 @@ use guid::GuidGen;
 use pi_db::db::{TabKV, TabMeta};
 use pi_db::log_file_db::LogFileDB;
 use pi_db::mgr::{DatabaseWare, Mgr};
-use r#async::rt::multi_thread::{MultiTaskPool, MultiTaskRuntime};
+use r#async::rt::multi_thread::{MultiTaskRuntimeBuilder, MultiTaskRuntime};
 use r#async::rt::{AsyncRuntime, AsyncValue};
 use sinfo;
 
@@ -22,8 +22,8 @@ use std::time::Duration;
 
 #[bench]
 fn bench_log_file_alter_tab(b: &mut Bencher) {
-    let pool = MultiTaskPool::new("Store-Runtime".to_string(), 4, 1024 * 1024, 10, Some(10));
-    let rt: MultiTaskRuntime<()> = pool.startup(true);
+    let builder = MultiTaskRuntimeBuilder::default();
+    let rt = builder.build();
 
     b.iter(|| {
         let (s, r) = bounded(1);
@@ -41,8 +41,8 @@ fn bench_log_file_alter_tab(b: &mut Bencher) {
 
 #[bench]
 fn bench_log_file_iter_tab(b: &mut Bencher) {
-    let pool = MultiTaskPool::new("Store-Runtime".to_string(), 4, 1024 * 1024, 10, Some(10));
-    let rt: MultiTaskRuntime<()> = pool.startup(true);
+    let builder = MultiTaskRuntimeBuilder::default();
+    let rt = builder.build();
 
     b.iter(|| {
         let (s, r) = bounded(1);
@@ -60,8 +60,8 @@ fn bench_log_file_iter_tab(b: &mut Bencher) {
 
 #[bench]
 fn bench_log_file_write(b: &mut Bencher) {
-    let pool = MultiTaskPool::new("Store-Runtime".to_string(), 8, 1024 * 1024, 10, Some(10));
-    let rt: MultiTaskRuntime<()> = pool.startup(false);
+    let builder = MultiTaskRuntimeBuilder::default();
+    let rt = builder.build();
 
     let mgr = Mgr::new(GuidGen::new(0, 0));
     let mgr_copy = mgr.clone();
@@ -97,36 +97,33 @@ fn bench_log_file_write(b: &mut Bencher) {
 
     let rt_copy = rt.clone();
     b.iter(|| {
-        let rt_copy1 = rt_copy.clone();
-        let mgr_copy = mgr.clone();
+        let rt_copy0 = rt_copy.clone();
+
+        let start = std::time::Instant::now();
+        let mut map = rt.map_reduce(1000);
+        for index in 0..1000 {
+            let rt_copy1 = rt_copy.clone();
+            let mgr_copy = mgr.clone();
+            map.map(AsyncRuntime::Multi(rt_copy1.clone()), async move {
+                log_file_write(&rt_copy1, &mgr_copy, index).await;
+                Ok(())
+            }).is_ok();
+        }
 
         let (s, r) = bounded(1);
-        let _ = rt.spawn(rt.alloc(), async move {
-            for index in 0..1000 {
-                log_file_write(&rt_copy1, &mgr_copy, index).await;
-            }
+        rt_copy0.spawn(rt_copy0.alloc(), async move {
+            map.reduce(true).await.is_ok();
             s.send(());
         });
-        loop {
-            if let Err(e) = r.recv_timeout(Duration::from_millis(10000)) {
-                println!(
-                    "!!!!!!recv timeout, wait_len: {}, len: {}, e: {:?}",
-                    rt_copy.wait_len(),
-                    rt_copy.len(),
-                    e
-                );
-                continue;
-            }
-
-            break;
-        }
+        r.recv().is_ok();
+        println!("time: {:?}", std::time::Instant::now() - start);
     });
 }
 
 #[bench]
 fn bench_log_file_read(b: &mut Bencher) {
-    let pool = MultiTaskPool::new("Store-Runtime".to_string(), 4, 1024 * 1024, 10, Some(10));
-    let rt: MultiTaskRuntime<()> = pool.startup(false);
+    let builder = MultiTaskRuntimeBuilder::default();
+    let rt = builder.build();
 
     let mgr = Mgr::new(GuidGen::new(0, 0));
     let mgr_copy = mgr.clone();
@@ -167,7 +164,7 @@ fn bench_log_file_read(b: &mut Bencher) {
 
         let (s, r) = bounded(1);
         let _ = rt_copy.spawn(rt_copy.alloc(), async move {
-            for _ in 0..1000 {
+            for _ in 0..1000usize {
                 log_file_read(&rt_copy1, &mgr_copy).await;
             }
             s.send(());
@@ -175,8 +172,7 @@ fn bench_log_file_read(b: &mut Bencher) {
         loop {
             if let Err(e) = r.recv_timeout(Duration::from_millis(10000)) {
                 println!(
-                    "!!!!!!recv timeout, wait_len: {}, len: {}, e: {:?}",
-                    rt_copy.wait_len(),
+                    "!!!!!!recv timeout, len: {}, e: {:?}",
                     rt_copy.len(),
                     e
                 );
@@ -190,8 +186,8 @@ fn bench_log_file_read(b: &mut Bencher) {
 
 #[bench]
 fn bench_file_db_concurrent_write(b: &mut Bencher) {
-    let pool = MultiTaskPool::new("Store-Runtime".to_string(), 4, 1024 * 1024, 10, Some(10));
-    let rt: MultiTaskRuntime<()> = pool.startup(true);
+    let builder = MultiTaskRuntimeBuilder::default();
+    let rt = builder.build();
 
     b.iter(|| {
         let (s, r) = bounded(1);
@@ -209,8 +205,8 @@ fn bench_file_db_concurrent_write(b: &mut Bencher) {
 
 #[bench]
 fn bench_file_db_concurrent_read(b: &mut Bencher) {
-    let pool = MultiTaskPool::new("Store-Runtime".to_string(), 4, 1024 * 1024, 10, Some(10));
-    let rt: MultiTaskRuntime<()> = pool.startup(true);
+    let builder = MultiTaskRuntimeBuilder::default();
+    let rt = builder.build();
     let mgr = Mgr::new(GuidGen::new(0, 0));
 
     b.iter(|| {
@@ -252,15 +248,14 @@ async fn test_log_file_db_concurrent_read(rt: MultiTaskRuntime<()>, mgr: Mgr) {
     let mgr4 = mgr.clone();
     let mgr6 = mgr.clone();
 
-    let mut map = rt.map();
+    let mut map = rt.map_reduce(5);
     let rt1 = rt.clone();
     let rt2 = rt.clone();
     let rt3 = rt.clone();
     let rt4 = rt.clone();
-    let rt5 = rt.clone();
 
     async move {
-        map.join(AsyncRuntime::Multi(rt1.clone()), async move {
+        map.map(AsyncRuntime::Multi(rt1.clone()), async move {
             let mut items = vec![];
             let mut wb = WriteBuffer::new();
             let key = b"hello world1";
@@ -282,7 +277,7 @@ async fn test_log_file_db_concurrent_read(rt: MultiTaskRuntime<()>, mgr: Mgr) {
             Ok(())
         });
 
-        map.join(AsyncRuntime::Multi(rt.clone()), async move {
+        map.map(AsyncRuntime::Multi(rt.clone()), async move {
             let mut items = vec![];
             let mut wb = WriteBuffer::new();
             let key = b"hello world2";
@@ -304,7 +299,7 @@ async fn test_log_file_db_concurrent_read(rt: MultiTaskRuntime<()>, mgr: Mgr) {
             Ok(())
         });
 
-        map.join(AsyncRuntime::Multi(rt2.clone()), async move {
+        map.map(AsyncRuntime::Multi(rt2.clone()), async move {
             let mut items = vec![];
             let mut wb = WriteBuffer::new();
             let key = b"hello world3";
@@ -326,7 +321,7 @@ async fn test_log_file_db_concurrent_read(rt: MultiTaskRuntime<()>, mgr: Mgr) {
             Ok(())
         });
 
-        map.join(AsyncRuntime::Multi(rt3.clone()), async move {
+        map.map(AsyncRuntime::Multi(rt3.clone()), async move {
             let mut items = vec![];
             let mut wb = WriteBuffer::new();
             let key = b"hello world4";
@@ -348,7 +343,7 @@ async fn test_log_file_db_concurrent_read(rt: MultiTaskRuntime<()>, mgr: Mgr) {
             Ok(())
         });
 
-        map.join(AsyncRuntime::Multi(rt4.clone()), async move {
+        map.map(AsyncRuntime::Multi(rt4.clone()), async move {
             let mut items = vec![];
             let mut wb = WriteBuffer::new();
             let key = b"hello world5";
@@ -369,7 +364,7 @@ async fn test_log_file_db_concurrent_read(rt: MultiTaskRuntime<()>, mgr: Mgr) {
             tr2.commit().await;
             Ok(())
         });
-        map.map(AsyncRuntime::Multi(rt5.clone())).await;
+        map.reduce(true).await;
     }
         .await
 }
@@ -399,7 +394,7 @@ async fn test_log_file_db_concurrent_write(rt: MultiTaskRuntime<()>) {
     let mgr4 = mgr.clone();
     let mgr6 = mgr.clone();
 
-    let mut map = rt.map();
+    let mut map = rt.map_reduce(5);
     let rt1 = rt.clone();
     let rt2 = rt.clone();
     let rt3 = rt.clone();
@@ -408,7 +403,7 @@ async fn test_log_file_db_concurrent_write(rt: MultiTaskRuntime<()>) {
     let rt6 = rt.clone();
 
     async move {
-        map.join(AsyncRuntime::Multi(rt1.clone()), async move {
+        map.map(AsyncRuntime::Multi(rt1.clone()), async move {
             let mut items = vec![];
             let mut wb = WriteBuffer::new();
             let key = b"hello world1";
@@ -430,7 +425,7 @@ async fn test_log_file_db_concurrent_write(rt: MultiTaskRuntime<()>) {
             Ok(())
         });
 
-        map.join(AsyncRuntime::Multi(rt2.clone()), async move {
+        map.map(AsyncRuntime::Multi(rt2.clone()), async move {
             let mut items = vec![];
             let mut wb = WriteBuffer::new();
             let key = b"hello world2";
@@ -452,7 +447,7 @@ async fn test_log_file_db_concurrent_write(rt: MultiTaskRuntime<()>) {
             Ok(())
         });
 
-        map.join(AsyncRuntime::Multi(rt3.clone()), async move {
+        map.map(AsyncRuntime::Multi(rt3.clone()), async move {
             let mut items = vec![];
             let mut wb = WriteBuffer::new();
             let key = b"hello world3";
@@ -474,7 +469,7 @@ async fn test_log_file_db_concurrent_write(rt: MultiTaskRuntime<()>) {
             Ok(())
         });
 
-        map.join(AsyncRuntime::Multi(rt4.clone()), async move {
+        map.map(AsyncRuntime::Multi(rt4.clone()), async move {
             let mut items = vec![];
             let mut wb = WriteBuffer::new();
             let key = b"hello world4";
@@ -496,7 +491,7 @@ async fn test_log_file_db_concurrent_write(rt: MultiTaskRuntime<()>) {
             Ok(())
         });
 
-        map.join(AsyncRuntime::Multi(rt5.clone()), async move {
+        map.map(AsyncRuntime::Multi(rt5.clone()), async move {
             println!("rt555555");
             let mut items = vec![];
             let mut wb = WriteBuffer::new();
@@ -518,13 +513,13 @@ async fn test_log_file_db_concurrent_write(rt: MultiTaskRuntime<()>) {
             tr2.commit().await;
             Ok(())
         });
-        map.map(AsyncRuntime::Multi(rt6.clone())).await;
+        map.reduce(true).await;
     }
         .await
 }
 
 async fn log_file_read(rt: &MultiTaskRuntime<()>, mgr: &Mgr) {
-    let mut tr = mgr.transaction(true, Some(rt.clone())).await;
+    let mut tr = mgr.transaction(true, Some((*rt).clone())).await;
 
     let mut wb = WriteBuffer::new();
     wb.write_bin(b"hello0", 0..6);
@@ -543,7 +538,7 @@ async fn log_file_read(rt: &MultiTaskRuntime<()>, mgr: &Mgr) {
 }
 
 async fn log_file_write(rt: &MultiTaskRuntime<()>, mgr: &Mgr, index: usize) {
-    let mut tr = mgr.transaction(true, Some(rt.clone())).await;
+    let mut tr = mgr.transaction(true, Some((*rt).clone())).await;
     let mut items = vec![];
 
     let mut wb = WriteBuffer::new();

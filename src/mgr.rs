@@ -13,7 +13,7 @@ use ordmap::asbtree::{Tree, new};
 use atom::Atom;
 use guid::{Guid, GuidGen};
 use r#async::lock::mutex_lock::Mutex;
-use r#async::rt::{AsyncRuntime, AsyncMap, multi_thread::MultiTaskRuntime};
+use r#async::rt::{AsyncRuntime, AsyncMapReduce, multi_thread::MultiTaskRuntime};
 use bon::{ReadBuffer, Decode, Encode, WriteBuffer, ReadBonErr};
 
 use crate::db::{SResult, IterResult, KeyIterResult, Filter, TabKV, TxCallback, TxState, Event, Bin, RwLog, TabMeta, CommitResult, DBResult};
@@ -1120,11 +1120,12 @@ impl Tr {
 		}
 
 		// 保存每个txid的修改
+		let arr_len = arr.len();
 		let map = tab_map(arr);
 		self.state = TxState::Doing;
 
-		let rt = self.rt.as_ref().unwrap().clone();
-		let mut async_map = rt.map::<bool>();
+		let rt = (*self.rt.as_ref().unwrap()).clone();
+		let mut async_map = rt.map_reduce(arr_len);
 
 		let mut txns = vec![];
 		for ((ware_name, tab_name), val) in map.into_iter() {
@@ -1139,7 +1140,7 @@ impl Tr {
 		}
 
 		for (txn, tkv) in txns {
-			async_map.join(AsyncRuntime::Multi(rt.clone()), async move {
+			async_map.map(AsyncRuntime::Multi(rt.clone()), async move {
 				match txn.modify(Arc::new(tkv), lock_time, read_lock).await {
 					Ok(_) => {
 						Ok(true)
@@ -1152,7 +1153,7 @@ impl Tr {
 		}
 
 		let mut error = false;
-		match async_map.map(AsyncRuntime::Multi(rt.clone())).await {
+		match async_map.reduce(true).await {
 			Ok(res) => {
 				for r in res {
 					if r.is_ok() && !r.unwrap() {
@@ -1352,13 +1353,13 @@ impl Tr {
 		}
 		// println!(" ======== pi_db::mgr::commit txid: {:?}, alter_len: {:?}, tab_txn_len: {:?}", self.id.time(), alter_len, self.tab_txns.len());
 		let count = Arc::new(AtomicUsize::new(len));
-		let rt = self.rt.as_ref().unwrap().clone();
-		let mut async_map = rt.map::<bool>();
+		let rt = (*self.rt.as_ref().unwrap()).clone();
+		let mut async_map = rt.map_reduce(self.tab_txns.len());
 
 		//提交数据库表的事务
 		for (txn_name, val) in self.tab_txns.iter_mut() {
 			let val = val.clone();
-			async_map.join(AsyncRuntime::Multi(rt.clone()), async move {
+			async_map.map(AsyncRuntime::Multi(rt.clone()), async move {
 				match val.commit().await {
 					Ok(logs) => {
 						Ok(true)
@@ -1370,7 +1371,7 @@ impl Tr {
 			});
 		}
 
-		match async_map.map(AsyncRuntime::Multi(rt.clone())).await {
+		match async_map.reduce(true).await {
 			Ok(res) => {
 				for r in res {
 					if r.is_ok() && r.unwrap() {
