@@ -12,7 +12,7 @@ use guid::GuidGen;
 use pi_db::db::{TabKV, TabMeta};
 use pi_db::log_file_db::LogFileDB;
 use pi_db::mgr::{DatabaseWare, Mgr};
-use r#async::rt::multi_thread::{MultiTaskRuntimeBuilder, MultiTaskRuntime};
+use r#async::rt::multi_thread::{StealableTaskPool, MultiTaskRuntimeBuilder, MultiTaskRuntime};
 use r#async::rt::{AsyncRuntime, AsyncValue};
 use sinfo;
 
@@ -97,25 +97,40 @@ fn bench_log_file_write(b: &mut Bencher) {
 
     let rt_copy = rt.clone();
     b.iter(|| {
-        let rt_copy0 = rt_copy.clone();
+        let (s, r) = unbounded();
 
         let start = std::time::Instant::now();
-        let mut map = rt.map_reduce(1000);
         for index in 0..1000 {
             let rt_copy1 = rt_copy.clone();
+            let s_copy = s.clone();
             let mgr_copy = mgr.clone();
-            map.map(AsyncRuntime::Multi(rt_copy1.clone()), async move {
+            rt_copy.spawn(rt_copy.alloc(), async move {
+                // println!("!!!!!!time0");
                 log_file_write(&rt_copy1, &mgr_copy, index).await;
-                Ok(())
-            }).is_ok();
+                s_copy.send(index);
+            });
         }
 
-        let (s, r) = bounded(1);
-        rt_copy0.spawn(rt_copy0.alloc(), async move {
-            map.reduce(true).await.is_ok();
-            s.send(());
-        });
-        r.recv().is_ok();
+        let mut count = 0;
+        loop {
+            match r.recv_timeout(Duration::from_millis(10000)) {
+                Err(e) => {
+                    println!(
+                        "!!!!!!recv timeout, len: {}, timer_len: {}, e: {:?}",
+                        rt_copy.timing_len(),
+                        rt_copy.len(),
+                        e
+                    );
+                    continue;
+                },
+                Ok(_) => {
+                    count += 1;
+                    if count >= 1000 {
+                        break;
+                    }
+                },
+            }
+        }
         println!("time: {:?}", std::time::Instant::now() - start);
     });
 }
@@ -540,6 +555,7 @@ async fn log_file_read(rt: &MultiTaskRuntime<()>, mgr: &Mgr) {
 async fn log_file_write(rt: &MultiTaskRuntime<()>, mgr: &Mgr, index: usize) {
     let mut tr = mgr.transaction(true, Some((*rt).clone())).await;
     let mut items = vec![];
+    // println!("!!!!!!time1");
 
     let mut wb = WriteBuffer::new();
     let string = "hello world".to_string() + index.to_string().as_str();
@@ -553,10 +569,20 @@ async fn log_file_write(rt: &MultiTaskRuntime<()>, mgr: &Mgr, index: usize) {
         value: Some(Arc::new(wb.bytes)),
         index: 0,
     });
+    // println!("!!!!!!time2");
 
-    let _ = tr.modify(items, None, false).await;
-    let _ = tr.prepare().await;
-    let _ = tr.commit().await;
+    if let Err(e) = tr.modify(items, None, false).await {
+        panic!("modify failed, index: {}, reason: {}", index, e);
+    }
+    // println!("!!!!!!time3");
+    if let Err(e) = tr.prepare().await {
+        panic!("prepare failed, index: {}, reason: {}", index, e);
+    }
+    // println!("!!!!!!time4");
+    if let Err(e) = tr.commit().await {
+        panic!("commit failed, index: {}, reason: {}", index, e);
+    }
+    // println!("!!!!!!time5");
 }
 
 async fn log_file_alter_tab(rt: MultiTaskRuntime<()>) {

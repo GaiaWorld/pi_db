@@ -517,18 +517,26 @@ fn bench_log_file_write() {
     std::thread::sleep(std::time::Duration::from_millis(5000));
 
 	let rt_copy = rt.clone();
-	
-	let rt_copy1 = rt_copy.clone();
-	let mgr_copy = mgr.clone();
 
-	let (s, r) = bounded(1);
-	let _ = rt.spawn(rt.alloc(), async move {
-		for index in 0..100000 {
-			log_file_write(&rt_copy1, &mgr_copy, index).await;
-		}
-		s.send(());
-	});
-	r.recv();
+	let mut total_time = 0;
+	for index in 0..100 {
+		let rt_copy1 = rt_copy.clone();
+		let mgr_copy = mgr.clone();
+		let (s, r) = bounded(1);
+
+		let start = std::time::Instant::now();
+		let _ = rt.spawn(rt.alloc(), async move {
+			for index in 0..1000 {
+				log_file_write(&rt_copy1, &mgr_copy, index).await;
+			}
+			s.send(());
+		});
+		r.recv();
+		let time = start.elapsed();
+		total_time += time.as_micros();
+		println!("!!!!!!index: {}, time: {:?}, total_time: {}", index, time, total_time);
+	}
+	println!("!!!!!!time: {}", total_time / 100);
 }
 
 async fn log_file_write(rt: &MultiTaskRuntime<()>, mgr: &Mgr, index: usize) {
