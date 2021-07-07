@@ -11,7 +11,7 @@ use pi_db::log_file_db::{LOG_FILE_SIZE, AsyncLogFileStore, LogFileDB};
 use atom::Atom;
 use sinfo;
 use guid::GuidGen;
-use r#async::{lock::spin_lock::SpinLock, rt::multi_thread::{MultiTaskPool, MultiTaskRuntime}};
+use r#async::{lock::spin_lock::SpinLock, rt::multi_thread::{MultiTaskRuntimeBuilder, MultiTaskRuntime}};
 use pi_db::db::{TabKV, TabMeta};
 use bon::WriteBuffer;
 use hash::XHashMap;
@@ -21,8 +21,8 @@ fn test_collect_log_file_db() {
 	//初始化日志服务器
 	env_logger::init();
 
-	let pool = MultiTaskPool::new("Store-Runtime".to_string(), 8, 1024 * 1024, 10, Some(10));
-	let rt: MultiTaskRuntime<()>  = pool.startup(false);
+	let builder = MultiTaskRuntimeBuilder::default();
+	let rt  = builder.build();
 
 	let rt_copy = rt.clone();
 	rt.spawn(rt.alloc(), async move {
@@ -265,8 +265,8 @@ fn test_collect_log_file_db() {
 
 #[test]
 fn test_log_file_db() {
-	let pool = MultiTaskPool::new("Store-Runtime".to_string(), 4, 1024 * 1024, 10, Some(10));
-	let rt: MultiTaskRuntime<()>  = pool.startup(true);
+	let builder = MultiTaskRuntimeBuilder::default();
+	let rt  = builder.build();
 	let rt1 = rt.clone();
 
 	let _ = rt1.spawn(rt.alloc(), async move {
@@ -367,8 +367,8 @@ fn test_log_file_db() {
 
 #[test]
 fn write_test_data() {
-	let pool = MultiTaskPool::new("Store-Runtime".to_string(), 4, 1024 * 1024, 10, Some(10));
-	let rt: MultiTaskRuntime<()>  = pool.startup(true);
+	let builder = MultiTaskRuntimeBuilder::default();
+	let rt  = builder.build();
 	let rt1 = rt.clone();
 
 	let _ = rt1.spawn(rt.alloc(), async move {
@@ -435,8 +435,8 @@ fn write_test_data() {
 
 #[test]
 fn read_test_data() {
-	let pool = MultiTaskPool::new("Store-Runtime".to_string(), 4, 1024 * 1024, 10, Some(10));
-	let rt: MultiTaskRuntime<()>  = pool.startup(true);
+	let builder = MultiTaskRuntimeBuilder::default();
+	let rt  = builder.build();
 	let rt1 = rt.clone();
 
 	let _ = rt1.spawn(rt.alloc(), async move {
@@ -481,8 +481,8 @@ fn read_test_data() {
 
 #[test]
 fn bench_log_file_write() {
-    let pool = MultiTaskPool::new("Store-Runtime".to_string(), 4, 1024 * 1024, 10, Some(10));
-    let rt: MultiTaskRuntime<()> = pool.startup(false);
+	let builder = MultiTaskRuntimeBuilder::default();
+	let rt  = builder.build();
 
     let mgr = Mgr::new(GuidGen::new(0, 0));
     let mgr_copy = mgr.clone();
@@ -517,22 +517,30 @@ fn bench_log_file_write() {
     std::thread::sleep(std::time::Duration::from_millis(5000));
 
 	let rt_copy = rt.clone();
-	
-	let rt_copy1 = rt_copy.clone();
-	let mgr_copy = mgr.clone();
 
-	let (s, r) = bounded(1);
-	let _ = rt.spawn(rt.alloc(), async move {
-		for index in 0..100000 {
-			log_file_write(&rt_copy1, &mgr_copy, index).await;
-		}
-		s.send(());
-	});
-	r.recv();
+	let mut total_time = 0;
+	for index in 0..100 {
+		let rt_copy1 = rt_copy.clone();
+		let mgr_copy = mgr.clone();
+		let (s, r) = bounded(1);
+
+		let start = std::time::Instant::now();
+		let _ = rt.spawn(rt.alloc(), async move {
+			for index in 0..1000 {
+				log_file_write(&rt_copy1, &mgr_copy, index).await;
+			}
+			s.send(());
+		});
+		r.recv();
+		let time = start.elapsed();
+		total_time += time.as_micros();
+		println!("!!!!!!index: {}, time: {:?}, total_time: {}", index, time, total_time);
+	}
+	println!("!!!!!!time: {}", total_time / 100);
 }
 
 async fn log_file_write(rt: &MultiTaskRuntime<()>, mgr: &Mgr, index: usize) {
-    let mut tr = mgr.transaction(true, Some(rt.clone())).await;
+    let mut tr = mgr.transaction(true, Some((*rt).clone())).await;
     let mut items = vec![];
 
     let mut wb = WriteBuffer::new();

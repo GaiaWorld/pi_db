@@ -6,7 +6,7 @@ use std::sync::atomic::{Ordering, AtomicI64};
 use atom::Atom;
 use bon::{Decode, ReadBuffer};
 use hash::XHashMap;
-use r#async::rt::multi_thread::{MultiTaskPool, MultiTaskRuntime};
+use r#async::rt::multi_thread::{MultiTaskRuntimeBuilder, MultiTaskRuntime};
 use r#async::rt::{AsyncRuntime, AsyncValue};
 use r#async::lock::spin_lock::SpinLock;
 use chrono::prelude::*;

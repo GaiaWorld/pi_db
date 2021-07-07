@@ -15,7 +15,7 @@ use hash::{XHashMap, XHashSet};
 use r#async::lock::mutex_lock::Mutex;
 use r#async::lock::rw_lock::RwLock;
 use pi_store::log_store::log_file::{read_log_paths, read_log_file, read_log_file_block, PairLoader, LogMethod, LogFile};
-use r#async::rt::multi_thread::{MultiTaskPool, MultiTaskRuntime};
+use r#async::rt::multi_thread::{MultiTaskRuntimeBuilder, MultiTaskRuntime};
 use r#async::rt::{AsyncRuntime, AsyncValue};
 use r#async::lock::spin_lock::SpinLock;
 use async_file::file::{AsyncFile, AsyncFileOptions};
@@ -87,8 +87,8 @@ impl LogFileDB {
 		let mut tabs = Tabs::new();
 
 		let map = store.map.lock();
-		let rt = STORE_RUNTIME.read().await.as_ref().unwrap().clone();
-		let mut async_map = rt.map();
+		let rt = (*STORE_RUNTIME.read().await.as_ref().unwrap()).clone();
+		let mut async_map = rt.map_reduce(map.len());
 		let start = std::time::Instant::now();
 		let mut count = 0;
 		for (k, v) in map.iter() {
@@ -98,14 +98,14 @@ impl LogFileDB {
 			ALL_TABLES.lock().await.insert(tab_name.clone(), meta);
 
 			let chains = build_fork_chain(tab_name.clone()).await;
-			async_map.join(AsyncRuntime::Multi(rt.clone()), async move {
+			async_map.map(AsyncRuntime::Multi(rt.clone()), async move {
 				//并发异步的通过指定表的名称和分叉链，初始化加载指定表
 				Ok((tab_name.clone(), LogFileTab::new(&tab_name, &chains).await))
 			});
 		}
 
 		// 等待所有表加载完成
-		match async_map.map(AsyncRuntime::Multi(rt.clone())).await {
+		match async_map.reduce(true).await {
 			Ok(res) => {
 				for r in res {
 					count += 1;
