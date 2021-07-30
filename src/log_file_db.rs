@@ -1310,7 +1310,7 @@ impl LogFileTab {
 		}
 		store.is_init.store(false, Ordering::SeqCst);
 		LOG_FILE_TOTAL_SIZE.fetch_add(load_size as u64, Ordering::Relaxed);
-		info!("load tab: {} {} KB", tab_name_clone.as_str(), format!("{0} {1:.2}", "size", load_size as f64 / 1024.0));
+		debug!("load tab: {} {} KB", tab_name_clone.as_str(), format!("{0} {1:.2}", "size", load_size as f64 / 1024.0));
 
 		// 再加载分叉路径中的表的数据
 		for tm in chains.iter().skip(1) {
