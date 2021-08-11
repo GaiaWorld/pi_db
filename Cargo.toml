@@ -15,7 +15,6 @@ guid = {path = "../pi_lib/guid"}
 bon = {path = "../pi_lib/bon"}
 sinfo = {path = "../pi_lib/sinfo"}
 ordmap = {path = "../pi_lib/ordmap"}
-worker = {path = "../pi_lib/worker"}
 time = {path = "../pi_lib/time"}
 apm = {path = "../pi_lib/apm"}
 handler = { path = "../pi_lib/handler" }
