@@ -5,28 +5,22 @@ authors = ["zmythleo <zmythleo@gmail.com>"]
 edition = "2018"
 
 [dependencies]
+parking_lot = "0.11"
+futures = "0.3"
+async-stream = "0.3"
+bytes = "1.0"
+dashmap = "4.0"
 log = "0.4"
-lazy_static = "1.3"
-fnv = "1.0.3"
-parking_lot = {version = "0.10.0", features = ["nightly"]}
-crc = "*"
-atom = {path = "../pi_lib/atom"}
-guid = {path = "../pi_lib/guid"}
-bon = {path = "../pi_lib/bon"}
-sinfo = {path = "../pi_lib/sinfo"}
-ordmap = {path = "../pi_lib/ordmap"}
-worker = {path = "../pi_lib/worker"}
-time = {path = "../pi_lib/time"}
-apm = {path = "../pi_lib/apm"}
-handler = { path = "../pi_lib/handler" }
-async = { path = "../pi_lib/async"}
-futures = "0.3.4"
-pi_store = { path = "../pi_store"}
-hash = { path = "../pi_lib/hash" }
-num_cpus = "1.13.0"
-chrono = "0.4"
+atom = { path = "../pi_lib/atom" }
+guid = { path = "../pi_lib/guid" }
+async = { path = "../pi_lib/async" }
 async_file = { path = "../pi_lib/async_file" }
+async_transaction = { path = "../pi_lib/async_transaction" }
+pi_store = { path = "../pi_store" }
+ordmap = { path = "../pi_lib/ordmap" }
+hash = { path = "../pi_lib/hash" }
+sinfo = { path = "../pi_lib/sinfo" }
 
 [dev-dependencies]
 crossbeam-channel = "0.5"
-env_logger = "0.8"
+time = { path = "../pi_lib/time" }
