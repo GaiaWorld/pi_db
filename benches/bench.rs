@@ -29,6 +29,7 @@ use pi_db::{Binary,
 
 #[bench]
 fn bench_memory_table(b: &mut Bencher) {
+    use std::thread;
     use std::time::{Duration, Instant};
 
     let builder = MultiTaskRuntimeBuilder::default();
@@ -64,11 +65,13 @@ fn bench_memory_table(b: &mut Bencher) {
                     //创建有序内存表失败
                     println!("!!!!!!create memory ordered table failed, reason: {:?}", e);
                 }
+                println!("!!!!!!db table size: {:?}", db.table_size().await);
 
                 sender.send(db);
             },
         }
     });
+    thread::sleep(Duration::from_millis(3000));
 
     let rt_copy = rt.clone();
     let db = receiver.recv().unwrap();
@@ -155,6 +158,7 @@ fn bench_memory_table(b: &mut Bencher) {
 
 #[bench]
 fn bench_multi_memory_table(b: &mut Bencher) {
+    use std::thread;
     use std::time::{Duration, Instant};
 
     let builder = MultiTaskRuntimeBuilder::default();
@@ -193,11 +197,13 @@ fn bench_multi_memory_table(b: &mut Bencher) {
                         println!("!!!!!!create memory ordered table failed, index: {:?}, reason: {:?}", index, e);
                     }
                 }
+                println!("!!!!!!db table size: {:?}", db.table_size().await);
 
                 sender.send(db);
             },
         }
     });
+    thread::sleep(Duration::from_millis(3000));
 
     let rt_copy = rt.clone();
     let db = receiver.recv().unwrap();
@@ -290,6 +296,7 @@ fn bench_multi_memory_table(b: &mut Bencher) {
 
 #[bench]
 fn bench_commit_log(b: &mut Bencher) {
+    use std::thread;
     use std::time::{Duration, Instant};
 
     let builder = MultiTaskRuntimeBuilder::default();
@@ -325,11 +332,13 @@ fn bench_commit_log(b: &mut Bencher) {
                     //创建有序内存表失败
                     println!("!!!!!!create memory ordered table failed, reason: {:?}", e);
                 }
+                println!("!!!!!!db table size: {:?}", db.table_size().await);
 
                 sender.send(db);
             },
         }
     });
+    thread::sleep(Duration::from_millis(3000));
 
     let rt_copy = rt.clone();
     let db = receiver.recv().unwrap();
@@ -416,6 +425,7 @@ fn bench_commit_log(b: &mut Bencher) {
 
 #[bench]
 fn bench_multi_commit_log(b: &mut Bencher) {
+    use std::thread;
     use std::time::{Duration, Instant};
 
     let builder = MultiTaskRuntimeBuilder::default();
@@ -454,11 +464,13 @@ fn bench_multi_commit_log(b: &mut Bencher) {
                         println!("!!!!!!create memory ordered table failed, index: {:?}, reason: {:?}", index, e);
                     }
                 }
+                println!("!!!!!!db table size: {:?}", db.table_size().await);
 
                 sender.send(db);
             },
         }
     });
+    thread::sleep(Duration::from_millis(3000));
 
     let rt_copy = rt.clone();
     let db = receiver.recv().unwrap();

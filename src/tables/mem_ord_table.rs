@@ -117,7 +117,7 @@ impl<
     }
 }
 
-// 内部内存数据表
+// 内部有序内存数据表
 struct InnerMemoryOrderedTable<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>,
@@ -279,13 +279,10 @@ impl<
                         for (_key, action) in tr.0.actions.lock().iter() {
                             match action {
                                 KVActionLog::Write(_) => {
-                                    //预提交中的写操作，则增加计数
+                                    //对指定关键字进行了写操作，则增加本次事务写操作计数
                                     writed_count += 1;
-                                },
-                                KVActionLog::Read => {
-                                    //预提交中的读操作，则忽略计数
-                                    continue;
                                 }
+                                KVActionLog::Read => (), //忽略指定关键字的读操作计数
                             }
                         }
                         tr
@@ -389,7 +386,7 @@ impl<
             }
 
             if tr.is_require_persistence() {
-                //持久化的有序内存表事务，则立即异步确认提交成功
+                //持久化的有序内存表事务，则立即确认提交成功
                 let commit_uid = tr.get_commit_uid().unwrap();
                 confirm(transaction_uid, commit_uid, Ok(()));
             }
@@ -486,7 +483,7 @@ impl<
 
             if let None = actions_locked.get(&key) {
                 //在事务内还未未记录指定关键字的操作，则记录对指定关键字的读操作
-                actions_locked.insert(key.clone(), KVActionLog::Read);
+                let _ = actions_locked.insert(key.clone(), KVActionLog::Read);
             }
 
             if let Some(value) = tr.0.root_mut.lock().get(&key) {
@@ -506,10 +503,10 @@ impl<
 
         async move {
             //记录对指定关键字的最新插入或更新操作
-            tr.0.actions.lock().insert(key.clone(), KVActionLog::Write(Some(value.clone())));
+            let _ = tr.0.actions.lock().insert(key.clone(), KVActionLog::Write(Some(value.clone())));
 
             //插入或更新指定的键值对
-            tr.0.root_mut.lock().upsert(key, value, false);
+            let _ = tr.0.root_mut.lock().upsert(key, value, false);
 
             Ok(())
         }.boxed()
@@ -521,7 +518,7 @@ impl<
 
         async move {
             //记录对指定关键字的最新删除操作，并增加写操作计数
-            tr.0.actions.lock().insert(key.clone(), KVActionLog::Write(None));
+            let _ = tr.0.actions.lock().insert(key.clone(), KVActionLog::Write(None));
 
             if let Some(Some(value)) = tr.0.root_mut.lock().delete(&key, false) {
                 //指定关键字存在
@@ -572,14 +569,14 @@ impl<
         stream.boxed()
     }
 
-    fn lock_key(&self, key: <Self as KVAction>::Key)
+    fn lock_key(&self, _key: <Self as KVAction>::Key)
                 -> BoxFuture<Result<(), <Self as KVAction>::Error>> {
         async move {
             Ok(())
         }.boxed()
     }
 
-    fn unlock_key(&self, key: <Self as KVAction>::Key)
+    fn unlock_key(&self, _key: <Self as KVAction>::Key)
                   -> BoxFuture<Result<(), <Self as KVAction>::Error>> {
         async move {
             Ok(())
@@ -614,7 +611,6 @@ impl<
             root_ref,
             table,
             actions: SpinLock::new(XHashMap::default()),
-            marker: PhantomData,
         };
 
         MemOrdTabTr(Arc::new(inner))
@@ -637,13 +633,13 @@ impl<
                         },
                         KVActionLog::Write(_) => {
                             //本地预提交事务对相同的关键字执行了写操作，则存在读写冲突
-                            return Err(<Self as Transaction2Pc>::PrepareError::new_transaction_error(ErrorLevel::Normal, format!("Prepare memory ordered table conflicted, table: {:?}, key: {:?}, source: {:?}, transaction_uid: {:?}, prepare_uid: {:?}, confilicted_transaction_uid: {:?}, reason: require write key but reading now", self.0.table.name(), key, self.0.source, self.get_transaction_uid(), self.get_prepare_uid(), guid)));
+                            return Err(<Self as Transaction2Pc>::PrepareError::new_transaction_error(ErrorLevel::Normal, format!("Prepare memory ordered table conflicted, table: {:?}, key: {:?}, source: {:?}, transaction_uid: {:?}, prepare_uid: {:?}, confilicted_transaction_uid: {:?}, reason: require write key but reading now", self.0.table.name().as_str(), key, self.0.source, self.get_transaction_uid(), self.get_prepare_uid(), guid)));
                         },
                     }
                 },
                 Some(KVActionLog::Write(_)) => {
                     //有序内存表的预提交表中的一个预提交事务与本地预提交事务操作了相同的关键字，且是写操作，则存在读写冲突
-                    return Err(<Self as Transaction2Pc>::PrepareError::new_transaction_error(ErrorLevel::Normal, format!("Prepare memory ordered table conflicted, table: {:?}, key: {:?}, source: {:?}, transaction_uid: {:?}, prepare_uid: {:?}, confilicted_transaction_uid: {:?}, reason: writing now", self.0.table.name(), key, self.0.source, self.get_transaction_uid(), self.get_prepare_uid(), guid)));
+                    return Err(<Self as Transaction2Pc>::PrepareError::new_transaction_error(ErrorLevel::Normal, format!("Prepare memory ordered table conflicted, table: {:?}, key: {:?}, source: {:?}, transaction_uid: {:?}, prepare_uid: {:?}, confilicted_transaction_uid: {:?}, reason: writing now", self.0.table.name().as_str(), key, self.0.source, self.get_transaction_uid(), self.get_prepare_uid(), guid)));
                 },
                 None => {
                     //有序内存表的预提交表中没有任何预提交事务与本地预提交事务操作了相同的关键字，则不存在读写冲突，并立即返回检查成功
@@ -676,7 +672,7 @@ impl<
                             //事务的当前操作记录中的关键字，在事务创建时的表中已存在
                             //表示此关键字在当前事务执行过程中被删除，则此关键字的操作记录不允许预提交
                             //并立即返回当前事务预提交冲突
-                            return Err(<Self as Transaction2Pc>::PrepareError::new_transaction_error(ErrorLevel::Normal, format!("Prepare memory ordered table conflicted, table: {:?}, key: {:?}, source: {:?}, transaction_uid: {:?}, prepare_uid: {:?}, reason: the key is deleted in table while the transaction is running", self.0.table.name(), key, self.0.source, self.get_transaction_uid(), self.get_prepare_uid())));
+                            return Err(<Self as Transaction2Pc>::PrepareError::new_transaction_error(ErrorLevel::Normal, format!("Prepare memory ordered table conflicted, table: {:?}, key: {:?}, source: {:?}, transaction_uid: {:?}, prepare_uid: {:?}, reason: the key is deleted in table while the transaction is running", self.0.table.name().as_str(), key, self.0.source, self.get_transaction_uid(), self.get_prepare_uid())));
                         },
                     }
                 },
@@ -699,7 +695,7 @@ impl<
                             //事务的当前操作记录中的关键字，在事务创建时的表中也存在，但值不相同
                             //表示此关键字在当前事务执行过程中未改变，但值已改变，则此关键字的操作记录不允许预提交
                             //并立即返回当前事务预提交冲突
-                            return Err(<Self as Transaction2Pc>::PrepareError::new_transaction_error(ErrorLevel::Normal, format!("Prepare memory ordered table conflicted, table: {:?}, key: {:?}, source: {:?}, transaction_uid: {:?}, prepare_uid: {:?}, reason: the value is updated in table while the transaction is running", self.0.table.name(), key, self.0.source, self.get_transaction_uid(), self.get_prepare_uid())));
+                            return Err(<Self as Transaction2Pc>::PrepareError::new_transaction_error(ErrorLevel::Normal, format!("Prepare memory ordered table conflicted, table: {:?}, key: {:?}, source: {:?}, transaction_uid: {:?}, prepare_uid: {:?}, reason: the value is updated in table while the transaction is running", self.0.table.name().as_str(), key, self.0.source, self.get_transaction_uid(), self.get_prepare_uid())));
                         },
                     }
                 },
@@ -727,5 +723,4 @@ struct InnerMemOrdTabTr<
     root_ref:           OrdMap<Tree<Binary, Binary>>,               //有序内存表的根节点的只读复制
     table:              MemoryOrderedTable<C, Log>,                 //事务对应的有序内存表
     actions:            SpinLock<XHashMap<Binary, KVActionLog>>,    //事务内操作记录
-    marker:             PhantomData<(C, Log)>,
 }

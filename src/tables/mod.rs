@@ -13,10 +13,13 @@ use async_transaction::{AsyncTransaction,
                         UnitTransaction,
                         SequenceTransaction,
                         TransactionTree};
+use hash::XHashMap;
 
-use crate::{Binary, KVAction};
+use crate::{Binary,
+            KVAction};
 
 pub mod mem_ord_table;
+pub mod log_ord_table;
 
 ///
 /// 默认的数据库表名最大长度，64KB
@@ -63,7 +66,7 @@ pub trait KVTable: Send + Sync + 'static {
         let bytes_len = bytes.len();
         if bytes_len == 0 || bytes_len > DEFAULT_DB_TABLE_NAME_MAX_LEN {
             //无效的表名长度，则立即抛出异常
-            panic!("Init table prepare output failed, table_name: {:?}, reason: invalid table name length", table_name);
+            panic!("Init table prepare output failed, table_name: {:?}, reason: invalid table name length", table_name.as_str());
         }
 
         prepare_output.put_u16_le(bytes_len as u16); //写入表名长度
@@ -87,7 +90,7 @@ pub trait KVTable: Send + Sync + 'static {
             prepare_output.put_slice(bytes); //写入值
         } else {
             //无值
-            prepare_output.put_u32_le(0);
+            prepare_output.put_u32_le(0); //写入值长度
         }
     }
 }
@@ -116,3 +119,4 @@ impl TableKV {
         }
     }
 }
+
