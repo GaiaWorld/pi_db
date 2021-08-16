@@ -57,15 +57,17 @@ fn bench_memory_table(b: &mut Bencher) {
                 println!("!!!!!!startup db failed, reason: {:?}", e);
             },
             Ok(db) => {
-                if let Err(e) = db.create_table(KVDBTableType::MemOrdTab,
-                                                Atom::from("test_memory"),
-                                                false,
+                let tr = db.transaction(Atom::from("test_memory"), true, 500, 500);
+                if let Err(e) = tr.create_table(Atom::from("test_memory"),
                                                 KVTableMeta::new(KVDBTableType::MemOrdTab,
                                                                  false,
-                                                                 EnumType::Str, EnumType::Str)).await {
+                                                                 EnumType::Usize,
+                                                                 EnumType::Str)).await {
                     //创建有序内存表失败
                     println!("!!!!!!create memory ordered table failed, reason: {:?}", e);
                 }
+                let output = tr.prepare_modified().await.unwrap();
+                let _ = tr.commit_modified(output).await;
                 println!("!!!!!!db table size: {:?}", db.table_size().await);
 
                 sender.send(db);
@@ -188,15 +190,17 @@ fn bench_multi_memory_table(b: &mut Bencher) {
             Ok(db) => {
                 //创建指定数量的有序内存表
                 for index in 0..100 {
-                    if let Err(e) = db.create_table(KVDBTableType::MemOrdTab,
-                                                    Atom::from("test_memory".to_string() + index.to_string().as_str()),
-                                                    false,
+                    let tr = db.transaction(Atom::from("test_memory"), true, 500, 500);
+                    if let Err(e) = tr.create_table(Atom::from("test_memory".to_string() + index.to_string().as_str()),
                                                     KVTableMeta::new(KVDBTableType::MemOrdTab,
                                                                      false,
-                                                                     EnumType::Str, EnumType::Str)).await {
+                                                                     EnumType::Usize,
+                                                                     EnumType::Str)).await {
                         //创建有序内存表失败
-                        println!("!!!!!!create memory ordered table failed, index: {:?}, reason: {:?}", index, e);
+                        println!("!!!!!!create memory ordered table failed, reason: {:?}", e);
                     }
+                    let output = tr.prepare_modified().await.unwrap();
+                    let _ = tr.commit_modified(output).await;
                 }
                 println!("!!!!!!db table size: {:?}", db.table_size().await);
 
@@ -324,15 +328,17 @@ fn bench_commit_log(b: &mut Bencher) {
                 println!("!!!!!!startup db failed, reason: {:?}", e);
             },
             Ok(db) => {
-                if let Err(e) = db.create_table(KVDBTableType::MemOrdTab,
-                                                Atom::from("test_memory"),
-                                                true,
+                let tr = db.transaction(Atom::from("test_memory"), true, 500, 500);
+                if let Err(e) = tr.create_table(Atom::from("test_memory"),
                                                 KVTableMeta::new(KVDBTableType::MemOrdTab,
                                                                  true,
-                                                                 EnumType::Str, EnumType::Str)).await {
+                                                                 EnumType::Usize,
+                                                                 EnumType::Str)).await {
                     //创建有序内存表失败
                     println!("!!!!!!create memory ordered table failed, reason: {:?}", e);
                 }
+                let output = tr.prepare_modified().await.unwrap();
+                let _ = tr.commit_modified(output).await;
                 println!("!!!!!!db table size: {:?}", db.table_size().await);
 
                 sender.send(db);
@@ -455,15 +461,17 @@ fn bench_multi_commit_log(b: &mut Bencher) {
             Ok(db) => {
                 //创建指定数量的有序内存表
                 for index in 0..10 {
-                    if let Err(e) = db.create_table(KVDBTableType::MemOrdTab,
-                                                    Atom::from("test_memory".to_string() + index.to_string().as_str()),
-                                                    true,
+                    let tr = db.transaction(Atom::from("test_memory"), true, 500, 500);
+                    if let Err(e) = tr.create_table(Atom::from("test_memory".to_string() + index.to_string().as_str()),
                                                     KVTableMeta::new(KVDBTableType::MemOrdTab,
                                                                      true,
-                                                                     EnumType::Str, EnumType::Str)).await {
+                                                                     EnumType::Usize,
+                                                                     EnumType::Str)).await {
                         //创建有序内存表失败
-                        println!("!!!!!!create memory ordered table failed, index: {:?}, reason: {:?}", index, e);
+                        println!("!!!!!!create memory ordered table failed, reason: {:?}", e);
                     }
+                    let output = tr.prepare_modified().await.unwrap();
+                    let _ = tr.commit_modified(output).await;
                 }
                 println!("!!!!!!db table size: {:?}", db.table_size().await);
 
@@ -593,15 +601,17 @@ fn bench_log_table(b: &mut Bencher) {
                 println!("!!!!!!startup db failed, reason: {:?}", e);
             },
             Ok(db) => {
-                if let Err(e) = db.create_table(KVDBTableType::LogOrdTab,
-                                                Atom::from("test_log"),
-                                                true,
+                let tr = db.transaction(Atom::from("test_log"), true, 500, 500);
+                if let Err(e) = tr.create_table(Atom::from("test_log"),
                                                 KVTableMeta::new(KVDBTableType::LogOrdTab,
                                                                  true,
-                                                                 EnumType::Str, EnumType::Str)).await {
-                    //创建有序内存表失败
+                                                                 EnumType::Usize,
+                                                                 EnumType::Str)).await {
+                    //创建有序日志表失败
                     println!("!!!!!!create log ordered table failed, reason: {:?}", e);
                 }
+                let output = tr.prepare_modified().await.unwrap();
+                let _ = tr.commit_modified(output).await;
                 println!("!!!!!!db table size: {:?}", db.table_size().await);
 
                 sender.send(db);
@@ -727,15 +737,17 @@ fn bench_multi_log_table(b: &mut Bencher) {
             },
             Ok(db) => {
                 for index in 0..10 {
-                    if let Err(e) = db.create_table(KVDBTableType::LogOrdTab,
-                                                    Atom::from("test_log".to_string() + index.to_string().as_str()),
-                                                    true,
+                    let tr = db.transaction(Atom::from("test_log"), true, 500, 500);
+                    if let Err(e) = tr.create_table(Atom::from("test_log".to_string() + index.to_string().as_str()),
                                                     KVTableMeta::new(KVDBTableType::LogOrdTab,
                                                                      true,
-                                                                     EnumType::Str, EnumType::Str)).await {
-                        //创建有序内存表失败
+                                                                     EnumType::Usize,
+                                                                     EnumType::Str)).await {
+                        //创建有序日志表失败
                         println!("!!!!!!create log ordered table failed, reason: {:?}", e);
                     }
+                    let output = tr.prepare_modified().await.unwrap();
+                    let _ = tr.commit_modified(output).await;
                 }
                 println!("!!!!!!db table size: {:?}", db.table_size().await);
 
