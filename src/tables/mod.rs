@@ -1,10 +1,6 @@
-use std::ops::Deref;
 use std::fmt::Debug;
-use std::hash::Hash;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use futures::{future::{FutureExt, BoxFuture},
-              stream::BoxStream};
 use bytes::BufMut;
 
 use atom::Atom;
@@ -13,11 +9,11 @@ use async_transaction::{AsyncTransaction,
                         UnitTransaction,
                         SequenceTransaction,
                         TransactionTree};
-use hash::XHashMap;
 
 use crate::{Binary,
             KVAction};
 
+pub mod meta_table;
 pub mod mem_ord_table;
 pub mod log_ord_table;
 

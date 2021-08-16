@@ -6,14 +6,12 @@ use std::marker::PhantomData;
 use parking_lot::Mutex;
 use futures::{future::{FutureExt, BoxFuture}, stream::{StreamExt, BoxStream}};
 use async_stream::stream;
-use bytes::BufMut;
 
 use atom::Atom;
 use guid::Guid;
 use hash::XHashMap;
 use ordmap::{ordmap::{Iter, OrdMap, Keys, Entry}, asbtree::Tree};
-use r#async::{lock::spin_lock::SpinLock,
-              rt::multi_thread::MultiTaskRuntime};
+use r#async::lock::spin_lock::SpinLock;
 use async_transaction::{AsyncTransaction,
                         Transaction2Pc,
                         UnitTransaction,
@@ -98,8 +96,7 @@ impl<
     Log: AsyncCommitLog<C = C, Cid = Guid>,
 > MemoryOrderedTable<C, Log> {
     /// 构建一个有序内存表
-    pub fn new(rt: MultiTaskRuntime<()>,
-               name: Atom,
+    pub fn new(name: Atom,
                is_persistence: bool) -> Self {
         let root = Mutex::new(OrdMap::new(None));
         let prepare = Mutex::new(XHashMap::default());
@@ -109,7 +106,6 @@ impl<
             persistence: is_persistence,
             root,
             prepare,
-            rt,
             marker: PhantomData,
         };
 
@@ -126,7 +122,6 @@ struct InnerMemoryOrderedTable<
     persistence:    bool,                                                   //是否持久化
     root:           Mutex<OrdMap<Tree<Binary, Binary>>>,                    //有序内存表的根节点
     prepare:        Mutex<XHashMap<Guid, XHashMap<Binary, KVActionLog>>>,   //有序内存表的预提交表
-    rt:             MultiTaskRuntime<()>,                                   //异步运行时
     marker:         PhantomData<(C, Log)>,
 }
 
@@ -388,7 +383,9 @@ impl<
             if tr.is_require_persistence() {
                 //持久化的有序内存表事务，则立即确认提交成功
                 let commit_uid = tr.get_commit_uid().unwrap();
-                confirm(transaction_uid, commit_uid, Ok(()));
+                if let Err(e) = confirm(transaction_uid, commit_uid, Ok(())) {
+                    return Err(e);
+                }
             }
 
             Ok(())

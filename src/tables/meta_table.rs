@@ -45,29 +45,29 @@ use std::collections::VecDeque;
 const DEFAULT_LOG_FILE_COMMIT_DELAY_TIMEOUT: usize = 1000;
 
 ///
-/// 有序的日志数据表
+/// 元信息表
 ///
 #[derive(Clone)]
-pub struct LogOrderedTable<
+pub struct MetaTable<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>,
->(Arc<InnerLogOrderedTable<C, Log>>);
+>(Arc<InnerMetaTable<C, Log>>);
 
 unsafe impl<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>,
-> Send for LogOrderedTable<C, Log> {}
+> Send for MetaTable<C, Log> {}
 unsafe impl<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>,
-> Sync for LogOrderedTable<C, Log> {}
+> Sync for MetaTable<C, Log> {}
 
 impl<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>,
-> KVTable for LogOrderedTable<C, Log> {
+> KVTable for MetaTable<C, Log> {
     type Name = Atom;
-    type Tr = LogOrdTabTr<C, Log>;
+    type Tr = MetaTabTr<C, Log>;
     type Error = KVTableTrError;
 
     fn name(&self) -> <Self as KVTable>::Name {
@@ -95,19 +95,19 @@ impl<
                    is_writable: bool,
                    prepare_timeout: u64,
                    commit_timeout: u64) -> Self::Tr {
-        LogOrdTabTr::new(source,
-                         is_writable,
-                         prepare_timeout,
-                         commit_timeout,
-                         self.clone())
+        MetaTabTr::new(source,
+                       is_writable,
+                       prepare_timeout,
+                       commit_timeout,
+                       self.clone())
     }
 }
 
 impl<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>,
-> LogOrderedTable<C, Log> {
-    /// 构建一个有序日志表
+> MetaTable<C, Log> {
+    /// 构建一个元信息表
     pub async fn new<P: AsRef<Path>>(rt: MultiTaskRuntime<()>,
                                      path: P,
                                      name: Atom,
@@ -121,7 +121,7 @@ impl<
         let root = Mutex::new(OrdMap::new(None));
         let prepare = Mutex::new(XHashMap::default());
 
-        //打开指定的日志文件，并加载日志文件的内容到有序日志表的内存表中
+        //打开指定的日志文件，并加载日志文件的内容到元信息表的内存表中
         match LogFile::open(rt.clone(),
                             path.as_ref().to_path_buf(),
                             block_limit,
@@ -129,7 +129,7 @@ impl<
                             init_log_file_index).await {
             Err(e) => {
                 //打开日志文件失败，则立即抛出异常
-                panic!("Open log ordered table failed, table: {:?}, path: {:?}, reason: {:?}",
+                panic!("Open meta table failed, table: {:?}, path: {:?}, reason: {:?}",
                        name.as_str(),
                        path.as_ref(),
                        e);
@@ -137,7 +137,7 @@ impl<
             Ok(log_file) => {
                 //打开日志文件成功
                 let waits = AsyncMutex::new(VecDeque::new());
-                let inner = InnerLogOrderedTable {
+                let inner = InnerMetaTable {
                     name: name.clone(),
                     root,
                     prepare,
@@ -148,22 +148,22 @@ impl<
                     log_file,
                 };
 
-                let table = LogOrderedTable(Arc::new(inner));
+                let table = MetaTable(Arc::new(inner));
 
-                //加载指定的日志文件的内容到有序日志表的内存表
+                //加载指定的日志文件的内容到元信息表的内存表
                 let now = Instant::now();
-                let mut loader = LogOrderedTableLoader::new(table.clone());
+                let mut loader = MetaTableLoader::new(table.clone());
                 if let Err(e) = table.0.log_file.load(&mut loader,
-                                      Some(path.as_ref().to_path_buf()),
-                                      load_buf_len,
-                                      is_checksum).await {
+                                                      Some(path.as_ref().to_path_buf()),
+                                                      load_buf_len,
+                                                      is_checksum).await {
                     //加载指定的日志文件失败，则立即抛出异常
-                    panic!("Load log ordered table failed, table: {:?}, path: {:?}, reason: {:?}",
+                    panic!("Load meta table failed, table: {:?}, path: {:?}, reason: {:?}",
                            name.as_str(),
                            path.as_ref(),
                            e);
                 }
-                info!("Load log ordered table ok, table: {:?}, path: {:?}, files: {}, keys: {}, bytes: {}, time: {:?}",
+                info!("Load meta table ok, table: {:?}, path: {:?}, files: {}, keys: {}, bytes: {}, time: {:?}",
                     name.as_str(),
                     path.as_ref(),
                     loader.log_files_len(),
@@ -171,7 +171,7 @@ impl<
                     loader.bytes_len(),
                     now.elapsed());
 
-                //启动有序日志表的提交待确认事务的定时整理
+                //启动元信息表的提交待确认事务的定时整理
                 let table_copy = table.clone();
                 let _ = table.0.rt.spawn(table.0.rt.alloc(), async move {
                     let table_ref = &table_copy;
@@ -179,13 +179,13 @@ impl<
                         match collect_waits(table_ref,
                                             Some(table_copy.0.wait_timeout)).await {
                             Err((collect_time, statistics)) => {
-                                error!("Collect log ordered table failed, table: {:?}, time: {:?}, statistics: {:?}, reason: out of time",
+                                error!("Collect meta table failed, table: {:?}, time: {:?}, statistics: {:?}, reason: out of time",
                                     table_copy.name().as_str(),
                                     collect_time,
                                     statistics);
                             },
                             Ok((collect_time, statistics)) => {
-                                info!("Collect log ordered table ok, table: {:?}, time: {:?}, statistics: {:?}, reason: out of time",
+                                info!("Collect meta table ok, table: {:?}, time: {:?}, statistics: {:?}, reason: out of time",
                                     table_copy.name().as_str(),
                                     collect_time,
                                     statistics);
@@ -200,17 +200,17 @@ impl<
     }
 }
 
-// 内部有序日志数据表
-struct InnerLogOrderedTable<
+// 内部元信息表
+struct InnerMetaTable<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>,
 > {
     name:           Atom,                                                                                                   //表名
-    root:           Mutex<OrdMap<Tree<Binary, Binary>>>,                                                                    //有序日志表的根节点
-    prepare:        Mutex<XHashMap<Guid, XHashMap<Binary, KVActionLog>>>,                                                   //有序日志表的预提交表
+    root:           Mutex<OrdMap<Tree<Binary, Binary>>>,                                                                    //元信息表的根节点
+    prepare:        Mutex<XHashMap<Guid, XHashMap<Binary, KVActionLog>>>,                                                   //元信息表的预提交表
     rt:             MultiTaskRuntime<()>,                                                                                   //异步运行时
-    waits:          AsyncMutex<VecDeque<(LogOrdTabTr<C, Log>, XHashMap<Binary, KVActionLog>, <LogOrdTabTr<C, Log> as Transaction2Pc>::CommitConfirm)>>,                                                                                         //等待异步写日志文件的已提交的有序日志事务列表
-    waits_limit:    usize,                                                                                                  //等待异步写日志文件的已提交的有序日志事务数量限制
+    waits:          AsyncMutex<VecDeque<(MetaTabTr<C, Log>, XHashMap<Binary, KVActionLog>, <MetaTabTr<C, Log> as Transaction2Pc>::CommitConfirm)>>,                                                                                         //等待异步写日志文件的已提交的元信息事务列表
+    waits_limit:    usize,                                                                                                  //等待异步写日志文件的已提交的元信息事务数量限制
     wait_timeout:   usize,                                                                                                  //等待异步写日志文件的超时时长，单位毫秒
     log_file:       LogFile,                                                                                                //日志文件
 }
@@ -218,34 +218,34 @@ struct InnerLogOrderedTable<
 unsafe impl<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>,
-> Send for InnerLogOrderedTable<C, Log> {}
+> Send for InnerMetaTable<C, Log> {}
 unsafe impl<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>,
-> Sync for InnerLogOrderedTable<C, Log> {}
+> Sync for InnerMetaTable<C, Log> {}
 
 ///
-/// 有序日志表事务
+/// 元信息表事务
 ///
 #[derive(Clone)]
-pub struct LogOrdTabTr<
+pub struct MetaTabTr<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>,
->(Arc<InnerLogOrdTabTr<C, Log>>);
+>(Arc<InnerMetaTabTr<C, Log>>);
 
 unsafe impl<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>,
-> Send for LogOrdTabTr<C, Log> {}
+> Send for MetaTabTr<C, Log> {}
 unsafe impl<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>,
-> Sync for LogOrdTabTr<C, Log> {}
+> Sync for MetaTabTr<C, Log> {}
 
 impl<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>,
-> AsyncTransaction for LogOrdTabTr<C, Log> {
+> AsyncTransaction for MetaTabTr<C, Log> {
     type Output = ();
     type Error = KVTableTrError;
 
@@ -277,7 +277,7 @@ impl<
         let tr = self.clone();
 
         async move {
-            //移除事务在有序日志表的预提交表中的操作记录
+            //移除事务在元信息表的预提交表中的操作记录
             let transaction_uid = tr.get_transaction_uid().unwrap();
             let _ = tr.0.table.0.prepare.lock().remove(&transaction_uid);
 
@@ -289,7 +289,7 @@ impl<
 impl<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>,
-> Transaction2Pc for LogOrdTabTr<C, Log> {
+> Transaction2Pc for MetaTabTr<C, Log> {
     type Tid = Guid;
     type Pid = Guid;
     type Cid = Guid;
@@ -354,7 +354,7 @@ impl<
                 let mut write_buf = None; //默认的写操作缓冲区
 
                 {
-                    //同步锁住有序日志表的预提交表，并进行预提交表的检查和修改
+                    //同步锁住元信息表的预提交表，并进行预提交表的检查和修改
                     let mut prepare_locked = tr.0.table.0.prepare.lock();
 
                     //将事务的操作记录与表的预提交表进行比较
@@ -412,7 +412,7 @@ impl<
 
                 Ok(write_buf)
             } else {
-                //只读事务，则不需要同步锁住有序日志表的预提交表，并立即返回
+                //只读事务，则不需要同步锁住元信息表的预提交表，并立即返回
                 Ok(None)
             }
         }.boxed()
@@ -423,15 +423,15 @@ impl<
         let tr = self.clone();
 
         async move {
-            //移除事务在有序日志表的预提交表中的操作记录
+            //移除事务在元信息表的预提交表中的操作记录
             let transaction_uid = tr.get_transaction_uid().unwrap();
-            let actions = tr.0.table.0.prepare.lock().remove(&transaction_uid); //获取有序日志表，本次事务预提交成功的相关操作记录
+            let actions = tr.0.table.0.prepare.lock().remove(&transaction_uid); //获取元信息表，本次事务预提交成功的相关操作记录
 
-            //更新有序日志表的根节点
+            //更新元信息表的根节点
             let actions = actions.unwrap();
             let b = tr.0.table.0.root.lock().ptr_eq(&tr.0.root_ref);
             if !b {
-                //有序日志表的根节点在当前事务执行过程中已改变
+                //元信息表的根节点在当前事务执行过程中已改变
                 for (key, action) in actions.iter() {
                     match action {
                         KVActionLog::Write(None) => {
@@ -446,12 +446,12 @@ impl<
                     }
                 }
             } else {
-                //有序日志表的根节点在当前事务执行过程中未改变，则用本次事务修改并提交成功的根节点替换有序日志表的根节点
+                //元信息表的根节点在当前事务执行过程中未改变，则用本次事务修改并提交成功的根节点替换元信息表的根节点
                 *tr.0.table.0.root.lock() = tr.0.root_mut.lock().clone();
             }
 
             if tr.is_require_persistence() {
-                //持久化的有序日志表事务，则异步将表的修改写入日志文件后，再确认提交成功
+                //持久化的元信息表事务，则异步将表的修改写入日志文件后，再确认提交成功
                 let table_copy = tr.0.table.clone();
                 let _ = self.0.table.0.rt.spawn(self.0.table.0.rt.alloc(), async move {
                     table_copy.0.waits.lock().await.push_back((tr, actions, confirm)); //注册待确认的已提交事务
@@ -462,13 +462,13 @@ impl<
                         match collect_waits(&table_copy,
                                             None).await {
                             Err((collect_time, statistics)) => {
-                                error!("Collect log ordered table failed, table: {:?}, time: {:?}, statistics: {:?}, reason: out of size",
+                                error!("Collect meta table failed, table: {:?}, time: {:?}, statistics: {:?}, reason: out of size",
                                     table_copy.name().as_str(),
                                     collect_time,
                                     statistics);
                             },
                             Ok((collect_time, statistics)) => {
-                                debug!("Collect log ordered table ok, table: {:?}, time: {:?}, statistics: {:?}, reason: out of size",
+                                debug!("Collect meta table ok, table: {:?}, time: {:?}, statistics: {:?}, reason: out of size",
                                     table_copy.name().as_str(),
                                     collect_time,
                                     statistics);
@@ -486,11 +486,11 @@ impl<
 impl<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>,
-> UnitTransaction for LogOrdTabTr<C, Log> {
+> UnitTransaction for MetaTabTr<C, Log> {
     type Status = Transaction2PcStatus;
     type Qos = TableTrQos;
 
-    //有序日志表事务，一定是单元事务
+    //元信息表事务，一定是单元事务
     fn is_unit(&self) -> bool {
         true
     }
@@ -515,10 +515,10 @@ impl<
 impl<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>,
-> SequenceTransaction for LogOrdTabTr<C, Log> {
+> SequenceTransaction for MetaTabTr<C, Log> {
     type Item = Self;
 
-    //有序日志表事务，一定不是顺序事务
+    //元信息表事务，一定不是顺序事务
     fn is_sequence(&self) -> bool {
         false
     }
@@ -535,11 +535,11 @@ impl<
 impl<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>,
-> TransactionTree for LogOrdTabTr<C, Log> {
+> TransactionTree for MetaTabTr<C, Log> {
     type Node = KVDBTransaction<C, Log>;
     type NodeInterator = KVDBChildTrList<C, Log>;
 
-    //有序日志表事务，一定不是事务树
+    //元信息表事务，一定不是事务树
     fn is_tree(&self) -> bool {
         false
     }
@@ -556,7 +556,7 @@ impl<
 impl<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>,
-> KVAction for LogOrdTabTr<C, Log> {
+> KVAction for MetaTabTr<C, Log> {
     type Key = Binary;
     type Value = Binary;
     type Error = KVTableTrError;
@@ -674,17 +674,17 @@ impl<
 impl<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>,
-> LogOrdTabTr<C, Log> {
-    // 构建一个有序日志表事务
+> MetaTabTr<C, Log> {
+    // 构建一个元信息表事务
     #[inline]
     fn new(source: Atom,
            is_writable: bool,
            prepare_timeout: u64,
            commit_timeout: u64,
-           table: LogOrderedTable<C, Log>) -> Self {
+           table: MetaTable<C, Log>) -> Self {
         let root_ref = table.0.root.lock().clone();
 
-        let inner = InnerLogOrdTabTr {
+        let inner = InnerMetaTabTr {
             source,
             tid: SpinLock::new(None),
             cid: SpinLock::new(None),
@@ -698,10 +698,10 @@ impl<
             actions: SpinLock::new(XHashMap::default()),
         };
 
-        LogOrdTabTr(Arc::new(inner))
+        MetaTabTr(Arc::new(inner))
     }
 
-    // 检查有序日志表的预提交表的读写冲突
+    // 检查元信息表的预提交表的读写冲突
     fn check_prepare_conflict(&self,
                               prepare: &mut XHashMap<Guid, XHashMap<Binary, KVActionLog>>,
                               key: &Binary,
@@ -710,7 +710,7 @@ impl<
         for (guid, actions) in prepare.iter() {
             match actions.get(key) {
                 Some(KVActionLog::Read) => {
-                    //有序日志表的预提交表中的一个预提交事务与本地预提交事务操作了相同的关键字，且是读操作
+                    //元信息表的预提交表中的一个预提交事务与本地预提交事务操作了相同的关键字，且是读操作
                     match action {
                         KVActionLog::Read => {
                             //本地预提交事务对相同的关键字也执行了读操作，则不存在读写冲突，并立即返回检查成功
@@ -718,16 +718,16 @@ impl<
                         },
                         KVActionLog::Write(_) => {
                             //本地预提交事务对相同的关键字执行了写操作，则存在读写冲突
-                            return Err(<Self as Transaction2Pc>::PrepareError::new_transaction_error(ErrorLevel::Normal, format!("Prepare log ordered table conflicted, table: {:?}, key: {:?}, source: {:?}, transaction_uid: {:?}, prepare_uid: {:?}, confilicted_transaction_uid: {:?}, reason: require write key but reading now", self.0.table.name().as_str(), key, self.0.source, self.get_transaction_uid(), self.get_prepare_uid(), guid)));
+                            return Err(<Self as Transaction2Pc>::PrepareError::new_transaction_error(ErrorLevel::Normal, format!("Prepare meta table conflicted, table: {:?}, key: {:?}, source: {:?}, transaction_uid: {:?}, prepare_uid: {:?}, confilicted_transaction_uid: {:?}, reason: require write key but reading now", self.0.table.name().as_str(), key, self.0.source, self.get_transaction_uid(), self.get_prepare_uid(), guid)));
                         },
                     }
                 },
                 Some(KVActionLog::Write(_)) => {
-                    //有序日志表的预提交表中的一个预提交事务与本地预提交事务操作了相同的关键字，且是写操作，则存在读写冲突
-                    return Err(<Self as Transaction2Pc>::PrepareError::new_transaction_error(ErrorLevel::Normal, format!("Prepare log ordered table conflicted, table: {:?}, key: {:?}, source: {:?}, transaction_uid: {:?}, prepare_uid: {:?}, confilicted_transaction_uid: {:?}, reason: writing now", self.0.table.name().as_str(), key, self.0.source, self.get_transaction_uid(), self.get_prepare_uid(), guid)));
+                    //元信息表的预提交表中的一个预提交事务与本地预提交事务操作了相同的关键字，且是写操作，则存在读写冲突
+                    return Err(<Self as Transaction2Pc>::PrepareError::new_transaction_error(ErrorLevel::Normal, format!("Prepare meta table conflicted, table: {:?}, key: {:?}, source: {:?}, transaction_uid: {:?}, prepare_uid: {:?}, confilicted_transaction_uid: {:?}, reason: writing now", self.0.table.name().as_str(), key, self.0.source, self.get_transaction_uid(), self.get_prepare_uid(), guid)));
                 },
                 None => {
-                    //有序日志表的预提交表中没有任何预提交事务与本地预提交事务操作了相同的关键字，则不存在读写冲突，并立即返回检查成功
+                    //元信息表的预提交表中没有任何预提交事务与本地预提交事务操作了相同的关键字，则不存在读写冲突，并立即返回检查成功
                     return Ok(())
                 },
             }
@@ -736,12 +736,12 @@ impl<
         Ok(())
     }
 
-    // 检查有序日志表的根节点冲突
+    // 检查元信息表的根节点冲突
     fn check_root_conflict(&self, key: &Binary)
                            -> Result<(), KVTableTrError> {
         let b = self.0.table.0.root.lock().ptr_eq(&self.0.root_ref);
         if !b {
-            //有序日志表的根节点在当前事务执行过程中已改变
+            //元信息表的根节点在当前事务执行过程中已改变
             let key = key.clone();
             match self.0.table.0.root.lock().get(&key) {
                 None => {
@@ -757,7 +757,7 @@ impl<
                             //事务的当前操作记录中的关键字，在事务创建时的表中已存在
                             //表示此关键字在当前事务执行过程中被删除，则此关键字的操作记录不允许预提交
                             //并立即返回当前事务预提交冲突
-                            return Err(<Self as Transaction2Pc>::PrepareError::new_transaction_error(ErrorLevel::Normal, format!("Prepare log ordered table conflicted, table: {:?}, key: {:?}, source: {:?}, transaction_uid: {:?}, prepare_uid: {:?}, reason: the key is deleted in table while the transaction is running", self.0.table.name().as_str(), key, self.0.source, self.get_transaction_uid(), self.get_prepare_uid())));
+                            return Err(<Self as Transaction2Pc>::PrepareError::new_transaction_error(ErrorLevel::Normal, format!("Prepare meta table conflicted, table: {:?}, key: {:?}, source: {:?}, transaction_uid: {:?}, prepare_uid: {:?}, reason: the key is deleted in table while the transaction is running", self.0.table.name().as_str(), key, self.0.source, self.get_transaction_uid(), self.get_prepare_uid())));
                         },
                     }
                 },
@@ -780,7 +780,7 @@ impl<
                             //事务的当前操作记录中的关键字，在事务创建时的表中也存在，但值不相同
                             //表示此关键字在当前事务执行过程中未改变，但值已改变，则此关键字的操作记录不允许预提交
                             //并立即返回当前事务预提交冲突
-                            return Err(<Self as Transaction2Pc>::PrepareError::new_transaction_error(ErrorLevel::Normal, format!("Prepare log ordered table conflicted, table: {:?}, key: {:?}, source: {:?}, transaction_uid: {:?}, prepare_uid: {:?}, reason: the value is updated in table while the transaction is running", self.0.table.name().as_str(), key, self.0.source, self.get_transaction_uid(), self.get_prepare_uid())));
+                            return Err(<Self as Transaction2Pc>::PrepareError::new_transaction_error(ErrorLevel::Normal, format!("Prepare meta table conflicted, table: {:?}, key: {:?}, source: {:?}, transaction_uid: {:?}, prepare_uid: {:?}, reason: the value is updated in table while the transaction is running", self.0.table.name().as_str(), key, self.0.source, self.get_transaction_uid(), self.get_prepare_uid())));
                         },
                     }
                 },
@@ -791,8 +791,8 @@ impl<
     }
 }
 
-// 内部有序日志表事务
-struct InnerLogOrdTabTr<
+// 内部元信息表事务
+struct InnerMetaTabTr<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>,
 > {
@@ -803,28 +803,28 @@ struct InnerLogOrdTabTr<
     writable:           bool,                                                                       //事务是否可写
     prepare_timeout:    u64,                                                                        //事务预提交超时时长，单位毫秒
     commit_timeout:     u64,                                                                        //事务提交超时时长，单位毫秒
-    root_mut:           SpinLock<OrdMap<Tree<Binary, Binary>>>,                                     //有序日志表的根节点的可写复制
-    root_ref:           OrdMap<Tree<Binary, Binary>>,                                               //有序日志表的根节点的只读复制
-    table:              LogOrderedTable<C, Log>,                                                    //事务对应的有序日志表
+    root_mut:           SpinLock<OrdMap<Tree<Binary, Binary>>>,                                     //元信息表的根节点的可写复制
+    root_ref:           OrdMap<Tree<Binary, Binary>>,                                               //元信息表的根节点的只读复制
+    table:              MetaTable<C, Log>,                                                    //事务对应的元信息表
     actions:            SpinLock<XHashMap<Binary, KVActionLog>>,                                    //事务内操作记录
 }
 
-// 有序日志表的加载器
-struct LogOrderedTableLoader<
+// 元信息表的加载器
+struct MetaTableLoader<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>,
 > {
     statistics:         XHashMap<PathBuf, (u64, u64)>,  //加载统计信息，包括关键字数量和键值对的字节数
     removed:            XHashMap<Vec<u8>, ()>,          //已删除关键字表
-    table:              LogOrderedTable<C, Log>,        //有序日志表
+    table:              MetaTable<C, Log>,        //元信息表
 }
 
 impl<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>,
-> PairLoader for LogOrderedTableLoader<C, Log> {
+> PairLoader for MetaTableLoader<C, Log> {
     fn is_require(&self, _log_file: Option<&PathBuf>, key: &Vec<u8>) -> bool {
-        //不在已删除关键字表中且不在有序日志表的内存表中的关键字，才允许被加载
+        //不在已删除关键字表中且不在元信息表的内存表中的关键字，才允许被加载
         !self
             .removed
             .contains_key(key)
@@ -860,10 +860,10 @@ impl<
                 }
             }
 
-            //加载到有序日志表的内存表中
+            //加载到元信息表的内存表中
             self.table.0.root.lock().insert(Binary::new(key), Binary::new(value));
         } else {
-            //删除指定关键字的值，则不需要加载到有序日志表的内存表中，并记录到已删除关键字表中
+            //删除指定关键字的值，则不需要加载到元信息表的内存表中，并记录到已删除关键字表中
             self.removed.insert(key, ());
         }
     }
@@ -872,10 +872,10 @@ impl<
 impl<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>,
-> LogOrderedTableLoader<C, Log> {
-    /// 构建一个有序日志表的加载器
-    pub fn new(table: LogOrderedTable<C, Log>) -> Self {
-        LogOrderedTableLoader {
+> MetaTableLoader<C, Log> {
+    /// 构建一个元信息表的加载器
+    pub fn new(table: MetaTable<C, Log>) -> Self {
+        MetaTableLoader {
             statistics: XHashMap::default(),
             removed: XHashMap::default(),
             table,
@@ -910,12 +910,12 @@ impl<
     }
 }
 
-// 异步整理有序日志表中，等待写入日志文件的事务，
+// 异步整理元信息表中，等待写入日志文件的事务，
 // 返回本次整理消耗的时间，本次写入日志文件成功的事务数、关键字数和字节数，以及本次写入日志文件失败的事务数、关键字数和字节数
 async fn collect_waits<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>,
->(table: &LogOrderedTable<C, Log>,
+>(table: &MetaTable<C, Log>,
   timeout: Option<usize>) -> Result<(Duration, (usize, usize, usize)), (Duration, (usize, usize, usize))> {
     //等待指定的时间
     if let Some(timeout) = timeout {
@@ -923,7 +923,7 @@ async fn collect_waits<
         table.0.rt.wait_timeout(timeout).await;
     }
 
-    //将有序日志表中等待写入日志文件的事务，写入日志文件
+    //将元信息表中等待写入日志文件的事务，写入日志文件
     let mut waits = VecDeque::new();
     let mut log_uid = 0;
     let mut trs_len = 0;
@@ -941,7 +941,7 @@ async fn collect_waits<
         for (key, actions) in actions.iter() {
             match actions {
                 KVActionLog::Write(None) => {
-                    //删除了有序日志表中指定关键字的值
+                    //删除了元信息表中指定关键字的值
                     log_uid = table
                         .0
                         .log_file
@@ -953,7 +953,7 @@ async fn collect_waits<
                     bytes_len += key.len();
                 },
                 KVActionLog::Write(Some(value)) => {
-                    //插入或更新了有序日志表中指定关键字的值
+                    //插入或更新了元信息表中指定关键字的值
                     log_uid = table
                         .0
                         .log_file
@@ -980,7 +980,7 @@ async fn collect_waits<
                       DEFAULT_LOG_FILE_COMMIT_DELAY_TIMEOUT)
         .await {
         //写入日志文件失败，则立即中止本次整理
-        error!("Collect log ordered table failed, table: {:?}, transactions: {}, keys: {}, bytes: {}, reason: {:?}",
+        error!("Collect meta table failed, table: {:?}, transactions: {}, keys: {}, bytes: {}, reason: {:?}",
             table.name().as_str(),
             trs_len,
             keys_len,
@@ -994,7 +994,7 @@ async fn collect_waits<
             if let Err(e) = confirm(wait_tr.get_transaction_uid().unwrap(),
                                     wait_tr.get_commit_uid().unwrap(),
                                     Ok(())) {
-                error!("Collect log ordered table failed, table: {:?}, transactions: {}, keys: {}, bytes: {}, reason: {:?}",
+                error!("Collect meta table failed, table: {:?}, transactions: {}, keys: {}, bytes: {}, reason: {:?}",
                     table.name().as_str(),
                     trs_len,
                     keys_len,

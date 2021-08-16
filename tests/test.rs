@@ -52,16 +52,17 @@ fn test_memory_table() {
                 println!("!!!!!!db table size: {:?}", db.table_size().await);
 
                 let table_name = Atom::from("test_memory");
-                if let Err(e) = db.create_table(KVDBTableType::MemOrdTab,
-                                                table_name.clone(),
-                                                false,
+                let tr = db.transaction(table_name.clone(), true, 500, 500);
+                if let Err(e) = tr.create_table(table_name.clone(),
                                                 KVTableMeta::new(KVDBTableType::MemOrdTab,
                                                                  false,
-                                                                 EnumType::Str,
+                                                                 EnumType::U8,
                                                                  EnumType::Str)).await {
                     //创建有序内存表失败
                     println!("!!!!!!create memory ordered table failed, reason: {:?}", e);
                 }
+                let output = tr.prepare_modified().await.unwrap();
+                let _ = tr.commit_modified(output).await;
 
                 println!("!!!!!!db table size: {:?}", db.table_size().await);
 
@@ -356,16 +357,17 @@ fn test_commit_log() {
                 println!("!!!!!!db table size: {:?}", db.table_size().await);
 
                 let table_name = Atom::from("test_memory");
-                if let Err(e) = db.create_table(KVDBTableType::MemOrdTab,
-                                                table_name.clone(),
-                                                false,
+                let tr = db.transaction(table_name.clone(), true, 500, 500);
+                if let Err(e) = tr.create_table(table_name.clone(),
                                                 KVTableMeta::new(KVDBTableType::MemOrdTab,
-                                                                 false,
-                                                                 EnumType::Str,
+                                                                 true,
+                                                                 EnumType::U8,
                                                                  EnumType::Str)).await {
                     //创建有序内存表失败
                     println!("!!!!!!create memory ordered table failed, reason: {:?}", e);
                 }
+                let output = tr.prepare_modified().await.unwrap();
+                let _ = tr.commit_modified(output).await;
 
                 println!("!!!!!!db table size: {:?}", db.table_size().await);
 
@@ -662,16 +664,17 @@ fn test_log_table() {
                 println!("!!!!!!db table size: {:?}", db.table_size().await);
 
                 let table_name = Atom::from("test_log");
-                if let Err(e) = db.create_table(KVDBTableType::LogOrdTab,
-                                                table_name.clone(),
-                                                true,
+                let tr = db.transaction(table_name.clone(), true, 500, 500);
+                if let Err(e) = tr.create_table(table_name.clone(),
                                                 KVTableMeta::new(KVDBTableType::LogOrdTab,
                                                                  true,
-                                                                 EnumType::Str,
+                                                                 EnumType::U8,
                                                                  EnumType::Str)).await {
                     //创建有序内存表失败
                     println!("!!!!!!create log ordered table failed, reason: {:?}", e);
                 }
+                let output = tr.prepare_modified().await.unwrap();
+                let _ = tr.commit_modified(output).await;
 
                 println!("!!!!!!db table size: {:?}", db.table_size().await);
 

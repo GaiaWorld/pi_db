@@ -8,12 +8,15 @@ use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
 
 use futures::{future::BoxFuture,
               stream::BoxStream};
+use bytes::{Buf, BufMut};
 use log::warn;
 
+use bon::{WriteBuffer, ReadBuffer, Encode, Decode};
 use guid::Guid;
 use sinfo::EnumType;
 use r#async::rt::multi_thread::MultiTaskRuntime;
 use async_transaction::{AsyncCommitLog, TransactionError, ErrorLevel};
+use std::convert::TryInto;
 
 pub mod db;
 pub mod tables;
@@ -37,6 +40,38 @@ impl Deref for Binary {
 
     fn deref(&self) -> &Self::Target {
         self.0.as_slice()
+    }
+}
+
+impl From<KVTableMeta> for Binary {
+    //将键值对表的元信息序列化为二进制数据
+    fn from(src: KVTableMeta) -> Self {
+        let mut buf = Vec::new();
+
+        //写入键值对表的类型
+        buf.put_u8(src.table_type as u8);
+
+        if src.persistence {
+            //写入键值对表需要持久化的标记
+            buf.put_u8(1);
+        } else {
+            //写入键值对表不需要持久化的标记
+            buf.put_u8(0);
+        }
+
+        //写入键值对表的关键字类型
+        let mut write_buffer = WriteBuffer::new();
+        src.key.encode(&mut write_buffer);
+        buf.put_u16_le(write_buffer.len() as u16); //写入关键字类型的长度
+        buf.put_slice(write_buffer.get_byte().as_slice());
+
+        //写入键值对表的值类型
+        let mut write_buffer = WriteBuffer::new();
+        src.value.encode(&mut write_buffer);
+        buf.put_u16_le(write_buffer.len() as u16); //写入值类型的长度
+        buf.put_slice(write_buffer.get_byte().as_slice());
+
+        Binary::new(buf)
     }
 }
 
@@ -119,21 +154,68 @@ pub trait KVAction: Send + Sync + 'static {
 ///
 /// 键值对数据库的表类型
 ///
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum KVDBTableType {
     MemOrdTab = 1,  //有序内存表
     LogOrdTab,      //有序日志表
 }
 
+impl From<u8> for KVDBTableType {
+    fn from(src: u8) -> Self {
+        match src {
+            1 => KVDBTableType::MemOrdTab,
+            2 => KVDBTableType::LogOrdTab,
+            _ => panic!("From u8 to KVDBTableType failed, src: {}, reason: invalid src", src),
+        }
+    }
+}
+
 ///
 /// 键值对表的元信息
 ///
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct KVTableMeta {
     table_type:     KVDBTableType,  //表类型
     persistence:    bool,           //是否持久化
     key:            EnumType,       //关键字类型
     value:          EnumType,       //值类型
+}
+
+impl From<Binary> for KVTableMeta {
+    //将二进制数据反序列化为键值对表的元信息
+    fn from(src: Binary) -> Self {
+        let mut buf = src.as_ref();
+
+        //读取键值对表的类型
+        let table_type = KVDBTableType::from(buf.get_u8());
+
+        let persistence = if buf.get_u8() == 0 {
+            //读取键值对表不需要持久化的标记
+            false
+        } else {
+            //读取键值对表需要持久化的标记
+            true
+        };
+
+        //读取键值对表的关键字类型
+        let key_len = buf.get_u16_le();
+        let taked = buf.take(key_len as usize);
+        buf.advance(key_len as usize);
+        let mut read_buffer = ReadBuffer::new(taked.into_inner(), 0);
+        let key = EnumType::decode(&mut read_buffer).unwrap();
+
+        let value_len = buf.get_u16_le();
+        let taked = buf.take(value_len as usize);
+        let mut read_buffer = ReadBuffer::new(taked.into_inner(), 0);
+        let value = EnumType::decode(&mut read_buffer).unwrap();
+
+        KVTableMeta {
+            table_type,
+            persistence,
+            key,
+            value,
+        }
+    }
 }
 
 impl KVTableMeta {
@@ -148,6 +230,16 @@ impl KVTableMeta {
             key,
             value,
         }
+    }
+
+    /// 获取键值对表的类型
+    pub fn table_type(&self) -> &KVDBTableType {
+        &self.table_type
+    }
+
+    /// 判断键值对表是否需要持久化
+    pub fn is_persistence(&self) -> bool {
+        self.persistence
     }
 
     /// 获取键值对表的关键字类型
@@ -282,7 +374,7 @@ impl<
         if (self.0).4.fetch_sub(1, Ordering::SeqCst) <= 1 {
             //本次事务的所有子事务已确认提交，则异步的确认本次事务已提交，并立即返回成功
             let confirmer = self.clone();
-            (self.0).0.spawn((self.0).0.alloc(), async move {
+            let _ = (self.0).0.spawn((self.0).0.alloc(), async move {
                 if let Err(e) = (confirmer.0)
                     .1
                     .confirm(cid.clone())

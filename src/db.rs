@@ -1,14 +1,13 @@
 use std::path::{Path, PathBuf};
 use std::collections::VecDeque;
 use std::io::{Error, Result as IOResult, ErrorKind};
-use std::sync::{Arc, atomic::{AtomicBool, AtomicUsize, Ordering}};
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 
-use futures::{future::{FutureExt, BoxFuture},
-              stream::{StreamExt, BoxStream}};
+use futures::{future::{FutureExt, BoxFuture}, stream::BoxStream, StreamExt};
 use bytes::BufMut;
 
 use atom::Atom;
-use guid::{GuidGen, Guid};
+use guid::Guid;
 use r#async::{lock::{spin_lock::SpinLock,
                      rw_lock::RwLock},
               rt::multi_thread::MultiTaskRuntime};
@@ -18,7 +17,6 @@ use async_transaction::{AsyncTransaction,
                         SequenceTransaction,
                         TransactionTree,
                         AsyncCommitLog,
-                        ErrorLevel,
                         manager_2pc::{Transaction2PcStatus, Transaction2PcManager}};
 use async_file::file::create_dir;
 use hash::XHashMap;
@@ -32,6 +30,8 @@ use crate::{Binary,
             KVTableTrError,
             tables::{KVTable,
                      TableKV,
+                     meta_table::{MetaTable,
+                                  MetaTabTr},
                      mem_ord_table::{MemoryOrderedTable,
                                      MemOrdTabTr},
                      log_ord_table::{LogOrderedTable,
@@ -94,6 +94,7 @@ impl<
             let _ = create_dir(self.rt.clone(), self.tables_path.clone()).await?;
         }
 
+        //创建键值对数据库管理器
         let rt = self.rt;
         let tr_mgr = self.tr_mgr;
         let db_path = self.db_path;
@@ -108,8 +109,50 @@ impl<
             tables_path,
             tables,
         };
+        let db_mgr = KVDBManager(Arc::new(inner));
 
-        Ok(KVDBManager(Arc::new(inner)))
+        //加载并注册元信息表
+        let meta_table_name = Atom::from(DEFAULT_DB_TABLES_META_DIR);
+        let meta_table: MetaTable<C, Log> =
+            MetaTable::new(db_mgr.0.rt.clone(),
+                           db_mgr.tables_meta_path().to_path_buf(),
+                           meta_table_name.clone(),
+                           512 * 1024 * 1024,
+                           2 * 1024 * 1024,
+                           None,
+                           2 * 1024 * 1024,
+                           true,
+                           8,
+                           1000).await;
+        db_mgr.0.tables.write().await.insert(meta_table_name.clone(), KVDBTable::MetaTab(meta_table));
+
+        //根据元信息表的元信息，加载其它表，加载操作使用的事务，不需要预提交和提交
+        let mut tr = db_mgr
+            .transaction(Atom::from("Startup db"),
+                         true,
+                         1000,
+                         1000);
+        let mut meta_iterator = tr
+            .values(meta_table_name.clone(),
+                    None,
+                    false)
+            .await
+            .unwrap();
+        while let Some((key, value)) = meta_iterator.next().await {
+            let table_name = Atom::from(key.as_ref());
+            if table_name == meta_table_name {
+                //忽略元信息表
+                continue;
+            }
+            let table_meta = KVTableMeta::from(value);
+
+            if let Err(e) = tr.create_table(table_name.clone(), table_meta.clone()).await {
+                //加载指定的表失败，则立即返回错误原因
+                return Err(Error::new(ErrorKind::Other, format!("Load table failed, tables_path: {:?}, table: {:?}, meta: {:?}, reason: {:?}", db_mgr.tables_path(), table_name, table_meta, e)));
+            }
+        }
+
+        Ok(db_mgr)
     }
 }
 
@@ -213,6 +256,13 @@ impl<
     pub async fn table_path(&self, table_name: &Atom) -> Option<PathBuf> {
         match self.0.tables.read().await.get(&table_name) {
             None => None,
+            Some(KVDBTable::MetaTab(table)) => {
+                if let Some(path) = table.path() {
+                    Some(path.to_path_buf())
+                } else {
+                    None
+                }
+            },
             Some(KVDBTable::MemOrdTab(table)) => {
                 if let Some(path) = table.path() {
                     Some(path.to_path_buf())
@@ -234,6 +284,9 @@ impl<
     pub async fn is_persistent_table(&self, table_name: &Atom) -> Option<bool> {
         match self.0.tables.read().await.get(&table_name) {
             None => None,
+            Some(KVDBTable::MetaTab(table)) => {
+                Some(table.is_persistent())
+            },
             Some(KVDBTable::MemOrdTab(table)) => {
                 Some(table.is_persistent())
             },
@@ -247,6 +300,9 @@ impl<
     pub async fn is_ordered_table(&self, table_name: &Atom) -> Option<bool> {
         match self.0.tables.read().await.get(&table_name) {
             None => None,
+            Some(KVDBTable::MetaTab(table)) => {
+                Some(table.is_ordered())
+            },
             Some(KVDBTable::MemOrdTab(table)) => {
                 Some(table.is_ordered())
             },
@@ -260,6 +316,9 @@ impl<
     pub async fn table_record_size(&self, table_name: &Atom) -> Option<usize> {
         match self.0.tables.read().await.get(&table_name) {
             None => None,
+            Some(KVDBTable::MetaTab(table)) => {
+                Some(table.len())
+            },
             Some(KVDBTable::MemOrdTab(table)) => {
                 Some(table.len())
             },
@@ -267,57 +326,6 @@ impl<
                 Some(table.len())
             },
         }
-    }
-
-    /// 异步创建表，需要指定表类型、表名、是否持久化和表的元信息
-    pub async fn create_table(&self,
-                              table_type: KVDBTableType,
-                              name: Atom,
-                              is_persistence: bool,
-                              meta: KVTableMeta) -> IOResult<()> {
-        let mut tables = self.0.tables.write().await;
-
-        if tables.contains_key(&name) {
-            //指定名称的表已存在，则立即返回错误原因
-            return Err(Error::new(ErrorKind::AlreadyExists,
-                                  format!("Create table failed, type: {:?}, name: {:?}, is_persistence: {:?}, meta: {:?}, reason: name conflict", table_type, name, is_persistence, meta)));
-        }
-
-        match table_type {
-            KVDBTableType::MemOrdTab => {
-                //创建一个有序内存表
-                let table = MemoryOrderedTable::new(self.0.rt.clone(),
-                                                    name.clone(),
-                                                    is_persistence);
-
-                //TODO 设置元信息...
-
-                //注册创建的有序内存表
-                tables.insert(name, KVDBTable::MemOrdTab(table));
-            },
-            KVDBTableType::LogOrdTab => {
-                //创建一个有序日志表
-                let table_path = self.0.tables_path.join(name.as_str()); //通过键值对数据库的表所在目录的路径与表名，生成表所在目录的路径
-                let table =
-                    LogOrderedTable::new(self.0.rt.clone(),
-                                         table_path,
-                                         name.clone(),
-                                         512 * 1024 * 1024,
-                                         2 * 1024 * 1024,
-                                         None,
-                                         2 * 1024 * 1024,
-                                         true,
-                                         1024,
-                                         60 * 1000).await;
-
-                //TODO 设置元信息...
-
-                //注册创建的有序内存表
-                tables.insert(name, KVDBTable::LogOrdTab(table));
-            },
-        }
-
-        Ok(())
     }
 }
 
@@ -343,6 +351,7 @@ pub enum KVDBTransaction<
     Log: AsyncCommitLog<C = C, Cid = Guid>,
 > {
     RootTr(RootTransaction<C, Log>),    //键值对数据库的根事务
+    MetaTabTr(MetaTabTr<C, Log>),       //元信息表事务
     MemOrdTabTr(MemOrdTabTr<C, Log>),   //有序内存表事务
     LogOrdTabTr(LogOrdTabTr<C, Log>),   //有序日志表事务
 }
@@ -368,6 +377,9 @@ impl<
             KVDBTransaction::RootTr(tr) => {
                 tr.is_writable()
             },
+            KVDBTransaction::MetaTabTr(tr) => {
+                tr.is_writable()
+            },
             KVDBTransaction::MemOrdTabTr(tr) => {
                 tr.is_writable()
             },
@@ -381,6 +393,9 @@ impl<
     fn is_concurrent_commit(&self) -> bool {
         match self {
             KVDBTransaction::RootTr(tr) => {
+                tr.is_concurrent_commit()
+            },
+            KVDBTransaction::MetaTabTr(tr) => {
                 tr.is_concurrent_commit()
             },
             KVDBTransaction::MemOrdTabTr(tr) => {
@@ -398,6 +413,9 @@ impl<
             KVDBTransaction::RootTr(tr) => {
                 tr.is_concurrent_rollback()
             },
+            KVDBTransaction::MetaTabTr(tr) => {
+                tr.is_concurrent_rollback()
+            },
             KVDBTransaction::MemOrdTabTr(tr) => {
                 tr.is_concurrent_rollback()
             },
@@ -410,6 +428,9 @@ impl<
     fn get_source(&self) -> Atom {
         match self {
             KVDBTransaction::RootTr(tr) => {
+                tr.get_source()
+            },
+            KVDBTransaction::MetaTabTr(tr) => {
                 tr.get_source()
             },
             KVDBTransaction::MemOrdTabTr(tr) => {
@@ -427,6 +448,9 @@ impl<
             KVDBTransaction::RootTr(tr) => {
                 tr.init()
             },
+            KVDBTransaction::MetaTabTr(tr) => {
+                tr.init()
+            },
             KVDBTransaction::MemOrdTabTr(tr) => {
                 tr.init()
             },
@@ -440,6 +464,9 @@ impl<
                 -> BoxFuture<Result<<Self as AsyncTransaction>::Output, <Self as AsyncTransaction>::Error>> {
         match self {
             KVDBTransaction::RootTr(tr) => {
+                tr.rollback()
+            },
+            KVDBTransaction::MetaTabTr(tr) => {
                 tr.rollback()
             },
             KVDBTransaction::MemOrdTabTr(tr) => {
@@ -470,6 +497,9 @@ impl<
             KVDBTransaction::RootTr(tr) => {
                 tr.is_require_persistence()
             },
+            KVDBTransaction::MetaTabTr(tr) => {
+                tr.is_require_persistence()
+            },
             KVDBTransaction::MemOrdTabTr(tr) => {
                 tr.is_require_persistence()
             },
@@ -482,6 +512,9 @@ impl<
     fn is_concurrent_prepare(&self) -> bool {
         match self {
             KVDBTransaction::RootTr(tr) => {
+                tr.is_concurrent_prepare()
+            },
+            KVDBTransaction::MetaTabTr(tr) => {
                 tr.is_concurrent_prepare()
             },
             KVDBTransaction::MemOrdTabTr(tr) => {
@@ -498,6 +531,9 @@ impl<
             KVDBTransaction::RootTr(tr) => {
                 tr.is_enable_inherit_uid()
             },
+            KVDBTransaction::MetaTabTr(tr) => {
+                tr.is_enable_inherit_uid()
+            },
             KVDBTransaction::MemOrdTabTr(tr) => {
                 tr.is_enable_inherit_uid()
             },
@@ -510,6 +546,9 @@ impl<
     fn get_transaction_uid(&self) -> Option<<Self as Transaction2Pc>::Tid> {
         match self {
             KVDBTransaction::RootTr(tr) => {
+                tr.get_transaction_uid()
+            },
+            KVDBTransaction::MetaTabTr(tr) => {
                 tr.get_transaction_uid()
             },
             KVDBTransaction::MemOrdTabTr(tr) => {
@@ -526,6 +565,9 @@ impl<
             KVDBTransaction::RootTr(tr) => {
                 tr.set_transaction_uid(uid);
             },
+            KVDBTransaction::MetaTabTr(tr) => {
+                tr.set_transaction_uid(uid);
+            },
             KVDBTransaction::MemOrdTabTr(tr) => {
                 tr.set_transaction_uid(uid);
             },
@@ -538,6 +580,9 @@ impl<
     fn get_prepare_uid(&self) -> Option<<Self as Transaction2Pc>::Pid> {
         match self {
             KVDBTransaction::RootTr(tr) => {
+                tr.get_prepare_uid()
+            },
+            KVDBTransaction::MetaTabTr(tr) => {
                 tr.get_prepare_uid()
             },
             KVDBTransaction::MemOrdTabTr(tr) => {
@@ -554,6 +599,9 @@ impl<
             KVDBTransaction::RootTr(tr) => {
                 tr.set_prepare_uid(uid);
             },
+            KVDBTransaction::MetaTabTr(tr) => {
+                tr.set_prepare_uid(uid);
+            },
             KVDBTransaction::MemOrdTabTr(tr) => {
                 tr.set_prepare_uid(uid);
             },
@@ -566,6 +614,9 @@ impl<
     fn get_commit_uid(&self) -> Option<<Self as Transaction2Pc>::Cid> {
         match self {
             KVDBTransaction::RootTr(tr) => {
+                tr.get_commit_uid()
+            },
+            KVDBTransaction::MetaTabTr(tr) => {
                 tr.get_commit_uid()
             },
             KVDBTransaction::MemOrdTabTr(tr) => {
@@ -582,6 +633,9 @@ impl<
             KVDBTransaction::RootTr(tr) => {
                 tr.set_commit_uid(uid);
             },
+            KVDBTransaction::MetaTabTr(tr) => {
+                tr.set_commit_uid(uid);
+            },
             KVDBTransaction::MemOrdTabTr(tr) => {
                 tr.set_commit_uid(uid);
             },
@@ -596,6 +650,9 @@ impl<
             KVDBTransaction::RootTr(tr) => {
                 tr.get_prepare_timeout()
             },
+            KVDBTransaction::MetaTabTr(tr) => {
+                tr.get_prepare_timeout()
+            },
             KVDBTransaction::MemOrdTabTr(tr) => {
                 tr.get_prepare_timeout()
             },
@@ -608,6 +665,9 @@ impl<
     fn get_commit_timeout(&self) -> u64 {
         match self {
             KVDBTransaction::RootTr(tr) => {
+                tr.get_commit_timeout()
+            },
+            KVDBTransaction::MetaTabTr(tr) => {
                 tr.get_commit_timeout()
             },
             KVDBTransaction::MemOrdTabTr(tr) => {
@@ -625,6 +685,9 @@ impl<
             KVDBTransaction::RootTr(tr) => {
                 tr.prepare()
             },
+            KVDBTransaction::MetaTabTr(tr) => {
+                tr.prepare()
+            },
             KVDBTransaction::MemOrdTabTr(tr) => {
                 tr.prepare()
             },
@@ -638,6 +701,9 @@ impl<
               -> BoxFuture<Result<<Self as AsyncTransaction>::Output, <Self as AsyncTransaction>::Error>> {
         match self {
             KVDBTransaction::RootTr(tr) => {
+                tr.commit(confirm)
+            },
+            KVDBTransaction::MetaTabTr(tr) => {
                 tr.commit(confirm)
             },
             KVDBTransaction::MemOrdTabTr(tr) => {
@@ -662,6 +728,9 @@ impl<
             KVDBTransaction::RootTr(tr) => {
                 tr.is_unit()
             },
+            KVDBTransaction::MetaTabTr(tr) => {
+                tr.is_unit()
+            },
             KVDBTransaction::MemOrdTabTr(tr) => {
                 tr.is_unit()
             },
@@ -674,6 +743,9 @@ impl<
     fn get_status(&self) -> <Self as UnitTransaction>::Status {
         match self {
             KVDBTransaction::RootTr(tr) => {
+                tr.get_status()
+            },
+            KVDBTransaction::MetaTabTr(tr) => {
                 tr.get_status()
             },
             KVDBTransaction::MemOrdTabTr(tr) => {
@@ -690,6 +762,9 @@ impl<
             KVDBTransaction::RootTr(tr) => {
                 tr.set_status(status);
             },
+            KVDBTransaction::MetaTabTr(tr) => {
+                tr.set_status(status);
+            },
             KVDBTransaction::MemOrdTabTr(tr) => {
                 tr.set_status(status);
             },
@@ -702,6 +777,9 @@ impl<
     fn qos(&self) -> <Self as UnitTransaction>::Qos {
         match self {
             KVDBTransaction::RootTr(tr) => {
+                tr.qos()
+            },
+            KVDBTransaction::MetaTabTr(tr) => {
                 tr.qos()
             },
             KVDBTransaction::MemOrdTabTr(tr) => {
@@ -746,6 +824,9 @@ impl<
             KVDBTransaction::RootTr(tr) => {
                 tr.is_tree()
             },
+            KVDBTransaction::MetaTabTr(tr) => {
+                tr.is_tree()
+            },
             KVDBTransaction::MemOrdTabTr(tr) => {
                 tr.is_tree()
             },
@@ -760,6 +841,9 @@ impl<
             KVDBTransaction::RootTr(tr) => {
                 tr.children_len()
             },
+            KVDBTransaction::MetaTabTr(tr) => {
+                tr.children_len()
+            },
             KVDBTransaction::MemOrdTabTr(tr) => {
                 tr.children_len()
             },
@@ -772,6 +856,9 @@ impl<
     fn to_children(&self) -> Self::NodeInterator {
         match self {
             KVDBTransaction::RootTr(tr) => {
+                tr.to_children()
+            },
+            KVDBTransaction::MetaTabTr(tr) => {
                 tr.to_children()
             },
             KVDBTransaction::MemOrdTabTr(tr) => {
@@ -791,6 +878,38 @@ impl<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>,
 > KVDBTransaction<C, Log> {
+    /// 异步获取表的元信息
+    pub async fn table_meta(&self, name: Atom) -> Option<KVTableMeta> {
+        match self {
+            KVDBTransaction::RootTr(tr) => {
+                tr.table_meta(name).await
+            },
+            _ => panic!("Get table meta failed, reason: invalid root transaction"),
+        }
+    }
+
+    /// 异步创建表，需要指定表名和表的元信息
+    pub async fn create_table(&self,
+                              name: Atom,
+                              meta: KVTableMeta) -> IOResult<()> {
+        match self {
+            KVDBTransaction::RootTr(tr) => {
+                tr.create_table(name, meta).await
+            },
+            _ => panic!("Create table failed, reason: invalid root transaction"),
+        }
+    }
+
+    /// 异步移除表
+    pub async fn remove_table(&self, name: Atom) -> IOResult<()> {
+        match self {
+            KVDBTransaction::RootTr(tr) => {
+                tr.remove_table(name).await
+            },
+            _ => panic!("Remove table failed, reason: invalid root transaction"),
+        }
+    }
+
     /// 在键值对数据库事务的根事务内，异步查询多个表和键的值的结果集
     pub async fn query(&self,
                        table_kv_list: Vec<TableKV>) -> Vec<Option<Binary>> {
@@ -1191,6 +1310,20 @@ impl<
                          childes_map: &mut XHashMap<Atom, KVDBTransaction<C, Log>>)
                          -> KVDBTransaction<C, Log> {
         match table {
+            KVDBTable::MetaTab(tab) => {
+                //创建元信息表的表事务，并作为子事务注册到根事务上
+                let tr = tab.transaction(self.get_source(),
+                                         self.is_writable(),
+                                         self.get_prepare_timeout(),
+                                         self.get_commit_timeout());
+                let table_tr = KVDBTransaction::MetaTabTr(tr);
+
+                //注册到键值对数据库的根事务
+                childes_map.insert(name, table_tr.clone());
+                self.0.childs.lock().join(table_tr.clone());
+
+                table_tr
+            },
             KVDBTable::MemOrdTab(tab) => {
                 //创建有序内存表的表事务，并作为子事务注册到根事务上
                 let tr = tab.transaction(self.get_source(),
@@ -1229,6 +1362,165 @@ impl<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>,
 > RootTransaction<C, Log> {
+    /// 异步获取表的元信息
+    #[inline]
+    pub async fn table_meta(&self, table: Atom) -> Option<KVTableMeta> {
+        let meta_table = Atom::from(DEFAULT_DB_TABLES_META_DIR);
+        let result = self.query(vec![TableKV::new(meta_table.clone(),
+                                                  Binary::new(table.as_bytes().to_vec()),
+                                                  None)]).await;
+        if let Some(binary) = &result[0] {
+            //指定名称的表，已注册元信息
+            Some(KVTableMeta::from(binary.clone()))
+        } else {
+            None
+        }
+    }
+
+    /// 异步创建表
+    #[inline]
+    pub async fn create_table(&self,
+                              name: Atom,
+                              meta: KVTableMeta) -> IOResult<()> {
+        //检查待创建的指定名称的表是否存在
+        let meta_table_name = Atom::from(DEFAULT_DB_TABLES_META_DIR);
+        let mut tables = self.0.db_mgr.0.tables.write().await;
+
+        self.0.persistence.store(true, Ordering::Relaxed); //创建表的操作，一定会创建元信息表事务，而元信息表事务是需要持久化的事务，则根事务也设置为需要持久化
+        if tables.contains_key(&name) {
+            //指定名称的表已存在
+            if let Some(meta_table) = tables.get(&meta_table_name) {
+                //元信息表存在，则获取元信息表事务，并查询指定表的元信息
+                let mut childes_map = self.0.childs_map.lock();
+                let meta_table_tr = if let Some(table_tr) = childes_map.get(&meta_table_name) {
+                    //元信息表的子事务存在
+                    table_tr.clone()
+                } else {
+                    //元信息表的子事务不存在，则创建元信息表的事务
+                    self.table_transaction(meta_table_name, meta_table, &mut *childes_map)
+                };
+
+                if let KVDBTransaction::MetaTabTr(tr) = meta_table_tr {
+                    if let Some(value) = tr.query(Binary::new(name.as_bytes().to_vec())).await {
+                        //指定名称的表的元信息存在
+                        let table_meta = KVTableMeta::from(value);
+                        if table_meta == meta {
+                            //待创建表的名称与已存在的表相同，且元信息相同，则立即返回创建成功
+                            return Ok(());
+                        } else {
+                            //待创建表的名称与已存在的表相同，但元信息不同，则表名冲突
+                            return Err(Error::new(ErrorKind::AlreadyExists,
+                                                  format!("Create table failed, name: {:?}, meta: {:?}, reason: name conflict", name, meta)));
+                        }
+                    } else {
+                        //指定名称的表的元信息不存在，则立即返回错误原因
+                        return Err(Error::new(ErrorKind::AlreadyExists,
+                                              format!("Create table failed, name: {:?}, meta: {:?}, reason: name conflict and table meta not exist", name, meta)));
+                    }
+                } else {
+                    //不是元信息表事务，则立即返回错误原因
+                    return Err(Error::new(ErrorKind::AlreadyExists,
+                                          format!("Create table failed, name: {:?}, meta: {:?}, reason: invalid meta table transaction", name, meta)));
+                }
+            }
+        }
+
+        //待创建的指定名称的表不存在，则创建指定名称的表，并将表的元信息注册到元信息表
+        match meta.table_type {
+            KVDBTableType::MemOrdTab => {
+                //创建一个有序内存表
+                let table = MemoryOrderedTable::new(name.clone(),
+                                                    meta.persistence);
+
+                //注册创建的有序内存表
+                tables.insert(name.clone(), KVDBTable::MemOrdTab(table));
+            },
+            KVDBTableType::LogOrdTab => {
+                //创建一个有序日志表
+                let table_path = self.0.db_mgr.0.tables_path.join(name.as_str()); //通过键值对数据库的表所在目录的路径与表名，生成表所在目录的路径
+                let table =
+                    LogOrderedTable::new(self.0.db_mgr.0.rt.clone(),
+                                         table_path,
+                                         name.clone(),
+                                         512 * 1024 * 1024,
+                                         2 * 1024 * 1024,
+                                         None,
+                                         2 * 1024 * 1024,
+                                         true,
+                                         1024,
+                                         60 * 1000).await;
+
+                //注册创建的有序内存表
+                tables.insert(name.clone(), KVDBTable::LogOrdTab(table));
+            },
+        }
+
+        //注册表的元信息
+        if let Some(meta_table) = tables.get(&meta_table_name) {
+            //元信息表存在，则获取元信息表事务，并查询指定表的元信息
+            let mut childes_map = self.0.childs_map.lock();
+            let meta_table_tr = if let Some(table_tr) = childes_map.get(&meta_table_name) {
+                //元信息表的子事务存在
+                table_tr.clone()
+            } else {
+                //元信息表的子事务不存在，则创建元信息表的事务
+                self.table_transaction(meta_table_name, meta_table, &mut *childes_map)
+            };
+
+            if let KVDBTransaction::MetaTabTr(tr) = meta_table_tr {
+                if let Err(e) = tr.upsert(Binary::new(name.as_bytes().to_vec()),
+                                               Binary::from(meta.clone())).await {
+                    //写入表的元信息失败，则立即返回错误原因
+                    return Err(Error::new(ErrorKind::Other,
+                                          format!("Create table failed, name: {:?}, meta: {:?}, reason: {:?}", name, meta, e)));
+                }
+            } else {
+                //不是元信息表事务，则立即返回错误原因
+                return Err(Error::new(ErrorKind::Other,
+                                      format!("Create table failed, name: {:?}, meta: {:?}, reason: invalid meta table transaction", name, meta)));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// 异步移除表
+    #[inline]
+    pub async fn remove_table(&self, table: Atom) -> IOResult<()> {
+        let mut tables = self.0.db_mgr.0.tables.write().await;
+
+        //移除表
+        let _ = tables.remove(&table);
+
+        //删除表的元信息
+        let meta_table_name = Atom::from(DEFAULT_DB_TABLES_META_DIR);
+        if let Some(meta_table) = tables.get(&meta_table_name) {
+            //元信息表存在，则获取元信息表事务，并查询指定表的元信息
+            let mut childes_map = self.0.childs_map.lock();
+            let meta_table_tr = if let Some(table_tr) = childes_map.get(&meta_table_name) {
+                //元信息表的子事务存在
+                table_tr.clone()
+            } else {
+                //元信息表的子事务不存在，则创建元信息表的事务
+                self.table_transaction(meta_table_name, meta_table, &mut *childes_map)
+            };
+
+            if let KVDBTransaction::MetaTabTr(tr) = meta_table_tr {
+                if let Err(e) = tr.delete(Binary::new(table.as_bytes().to_vec())).await {
+                    //删除表的元信息失败，则立即返回错误原因
+                    return Err(Error::new(ErrorKind::Other,
+                                          format!("Remove table failed, name: {:?}, reason: {:?}", table, e)));
+                }
+            } else {
+                //不是元信息表事务，则立即返回错误原因
+                return Err(Error::new(ErrorKind::Other,
+                                      format!("Remove table failed, name: {:?}, reason: invalid meta table transaction", table)));
+            }
+        }
+
+        Ok(())
+    }
+
     /// 异步查询多个表和键的值的结果集
     #[inline]
     pub async fn query(&self,
@@ -1251,6 +1543,11 @@ impl<
                     KVDBTransaction::RootTr(_tr) => {
                         //忽略键值对数据库的根事务
                         ()
+                    },
+                    KVDBTransaction::MetaTabTr(tr) => {
+                        //查询元信息表的指定关键字的值
+                        let value = tr.query(table_kv.key).await;
+                        result.push(value);
                     },
                     KVDBTransaction::MemOrdTabTr(tr) => {
                         //查询有序内存表的指定关键字的值
@@ -1297,6 +1594,16 @@ impl<
                     KVDBTransaction::RootTr(_tr) => {
                         //忽略键值对数据库的根事务
                         ()
+                    },
+                    KVDBTransaction::MetaTabTr(tr) => {
+                        //插入或更新元信息表的指定关键字的值
+                        if let Some(value) = table_kv.value {
+                            //有值则插入或更新
+                            if let Err(e) = tr.upsert(table_kv.key, value).await {
+                                //插入或更新元信息表的指定关键字的值错误，则立即返回错误原因
+                                return Err(e);
+                            }
+                        }
                     },
                     KVDBTransaction::MemOrdTabTr(tr) => {
                         //插入或更新有序内存表的指定关键字的值
@@ -1353,6 +1660,19 @@ impl<
                     KVDBTransaction::RootTr(_tr) => {
                         //忽略键值对数据库的根事务
                         ()
+                    },
+                    KVDBTransaction::MetaTabTr(tr) => {
+                        //删除元信息表的指定关键字的值
+                        match tr.delete(table_kv.key).await {
+                            Err(e) => {
+                                //删除元信息表的指定关键字的值错误，则立即返回错误原因
+                                return Err(e);
+                            },
+                            Ok(value) => {
+                                //删除元信息表的指定关键字的值成功
+                                result.push(value);
+                            },
+                        }
                     },
                     KVDBTransaction::MemOrdTabTr(tr) => {
                         //删除有序内存表的指定关键字的值
@@ -1413,6 +1733,10 @@ impl<
                     //忽略键值对数据库的根事务
                     None
                 },
+                KVDBTransaction::MetaTabTr(tr) => {
+                    //获取元信息表的关键字的异步流
+                    Some(tr.keys(key, descending))
+                },
                 KVDBTransaction::MemOrdTabTr(tr) => {
                     //获取有序内存表的关键字的异步流
                     Some(tr.keys(key, descending))
@@ -1450,6 +1774,10 @@ impl<
                     //忽略键值对数据库的根事务
                     None
                 },
+                KVDBTransaction::MetaTabTr(tr) => {
+                    //获取元信息表的键值对异步流
+                    Some(tr.values(key, descending))
+                },
                 KVDBTransaction::MemOrdTabTr(tr) => {
                     //获取有序内存表的键值对异步流
                     Some(tr.values(key, descending))
@@ -1486,6 +1814,10 @@ impl<
                     //忽略键值对数据库的根事务
                     Ok(())
                 },
+                KVDBTransaction::MetaTabTr(tr) => {
+                    //锁住元信息表的指定关键字
+                    tr.lock_key(key).await
+                },
                 KVDBTransaction::MemOrdTabTr(tr) => {
                     //锁住有序内存表的指定关键字
                     tr.lock_key(key).await
@@ -1521,6 +1853,10 @@ impl<
                 KVDBTransaction::RootTr(_tr) => {
                     //忽略键值对数据库的根事务
                     Ok(())
+                },
+                KVDBTransaction::MetaTabTr(tr) => {
+                    //解锁元信息表的指定关键字
+                    tr.unlock_key(key).await
                 },
                 KVDBTransaction::MemOrdTabTr(tr) => {
                     //解锁有序内存表的指定关键字
@@ -1674,6 +2010,7 @@ pub enum KVDBTable<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>,
 > {
+    MetaTab(MetaTable<C, Log>),             //元信息表
     MemOrdTab(MemoryOrderedTable<C, Log>),  //有序内存表
     LogOrdTab(LogOrderedTable<C, Log>),     //有序日志表
 }
