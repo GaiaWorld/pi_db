@@ -8,7 +8,7 @@ use parking_lot::Mutex;
 use futures::{future::{FutureExt, BoxFuture}, stream::{StreamExt, BoxStream}};
 use async_stream::stream;
 use bytes::BufMut;
-use log::{info, error};
+use log::{debug, info, error};
 
 use atom::Atom;
 use guid::Guid;
@@ -54,7 +54,7 @@ const DEFAULT_WIAT_WRITE_LOG_TRANSACTION_TIMEOUT: usize = 60 * 1000;
 ///
 /// 默认的日志文件延迟提交的超时时长，单位ms
 ///
-const DEFAULT_LOG_FILE_COMMIT_DELAY_TIMEOUT: usize = 10;
+const DEFAULT_LOG_FILE_COMMIT_DELAY_TIMEOUT: usize = 1000;
 
 ///
 /// 有序的日志数据表
@@ -188,14 +188,21 @@ impl<
                 table.0.rt.spawn(table.0.rt.alloc(), async move {
                     let table_ref = &table_copy;
                     loop {
-                        let (collect_time, ok, error) =
-                            collect_waits(table_ref,
-                                          Some(wait_timeout)).await;
-                        info!("Collect log ordered table finish, table: {:?}, time: {:?}, ok: {:?}, error: {:?}, reason: out of time",
-                            table_copy.name().as_str(),
-                            collect_time,
-                            ok,
-                            error);
+                        match collect_waits(table_ref,
+                                            Some(wait_timeout)).await {
+                            Err((collect_time, statistics)) => {
+                                error!("Collect log ordered table failed, table: {:?}, time: {:?}, statistics: {:?}, reason: out of time",
+                                    table_copy.name().as_str(),
+                                    collect_time,
+                                    statistics);
+                            },
+                            Ok((collect_time, statistics)) => {
+                                info!("Collect log ordered table ok, table: {:?}, time: {:?}, statistics: {:?}, reason: out of time",
+                                    table_copy.name().as_str(),
+                                    collect_time,
+                                    statistics);
+                            },
+                        }
                     }
                 });
 
@@ -463,14 +470,21 @@ impl<
                     let waits_len = table_copy.0.waits.lock().await.len();
                     if waits_len >= table_copy.0.waits_limit {
                         //如果当前已注册的待确认的已提交事务数量已达限制，则立即整理
-                        let (collect_time, ok, error) =
-                            collect_waits(&table_copy,
-                                          None).await;
-                        info!("Collect log ordered table finish, table: {:?}, time: {:?}, ok: {:?}, error: {:?}, reason: out of size",
-                            table_copy.name().as_str(),
-                            collect_time,
-                            ok,
-                            error);
+                        match collect_waits(&table_copy,
+                                            None).await {
+                            Err((collect_time, statistics)) => {
+                                error!("Collect log ordered table failed, table: {:?}, time: {:?}, statistics: {:?}, reason: out of size",
+                                    table_copy.name().as_str(),
+                                    collect_time,
+                                    statistics);
+                            },
+                            Ok((collect_time, statistics)) => {
+                                debug!("Collect log ordered table ok, table: {:?}, time: {:?}, statistics: {:?}, reason: out of size",
+                                    table_copy.name().as_str(),
+                                    collect_time,
+                                    statistics);
+                            },
+                        }
                     }
                 });
             }
@@ -913,7 +927,7 @@ async fn collect_waits<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>,
 >(table: &LogOrderedTable<C, Log>,
-  timeout: Option<usize>) -> (Duration, (usize, usize, usize), (usize, usize, usize)) {
+  timeout: Option<usize>) -> Result<(Duration, (usize, usize, usize)), (Duration, (usize, usize, usize))> {
     //等待指定的时间
     if let Some(timeout) = timeout {
         //需要等待指定时间后，再开始整理
@@ -921,117 +935,78 @@ async fn collect_waits<
     }
 
     //将有序日志中等待写入日志文件的事务，写入日志文件
+    let mut waits = VecDeque::new();
+    let mut log_uid = 0;
+    let mut trs_len = 0;
+    let mut keys_len = 0;
+    let mut bytes_len = 0;
+
     let now = Instant::now();
-
-    let mut trs_ok_len = 0;
-    let mut keys_ok_len = 0;
-    let mut bytes_ok_len = 0;
-
-    let mut trs_err_len = 0;
-    let mut keys_err_len = 0;
-    let mut bytes_err_len = 0;
-
-
     while let Some((wait_tr, actions, confirm)) = table
         .0
         .waits
         .lock()
         .await
         .pop_front() {
-        let mut is_writed = true; //指定事务是否已写入日志文件
 
         for (key, actions) in actions.iter() {
             match actions {
                 KVActionLog::Write(None) => {
                     //删除了有序日志表中指定关键字的值
-                    let log_uid = table
+                    log_uid = table
                         .0
                         .log_file
                         .append(LogMethod::Remove,
                                 key.as_ref(),
                                 &[]);
 
-                    if let Err(e) = table
-                        .0
-                        .log_file
-                        .delay_commit(log_uid,
-                                      false,
-                                      DEFAULT_LOG_FILE_COMMIT_DELAY_TIMEOUT)
-                        .await {
-                        //写入日志文件失败
-                        is_writed = false;
-
-                        //更新本次写入日志文件失败的关键字数和字节数
-                        keys_ok_len += 1;
-                        bytes_ok_len += key.len();
-
-                        error!("Collect log ordered table failed, table: {:?}, key: {:?}, action: delete, transaction_uid: {:?}, commit_uid: {:?}, reason: {:?}",
-                            table.name().as_str(),
-                            key,
-                            wait_tr.get_transaction_uid(),
-                            wait_tr.get_commit_uid(),
-                            e);
-                        break;
-                    }
-
-                    //更新本次写入日志文件成功的关键字数和字节数
-                    keys_ok_len += 1;
-                    bytes_ok_len += key.len();
+                    keys_len += 1;
+                    bytes_len += key.len();
                 },
                 KVActionLog::Write(Some(value)) => {
                     //插入或更新了有序日志表中指定关键字的值
-                    let log_uid = table
+                    log_uid = table
                         .0
                         .log_file
                         .append(LogMethod::PlainAppend,
                                 key.as_ref(),
                                 value.as_ref());
 
-                    if let Err(e) = table
-                        .0
-                        .log_file
-                        .delay_commit(log_uid,
-                                      false,
-                                      DEFAULT_LOG_FILE_COMMIT_DELAY_TIMEOUT)
-                        .await {
-                        //写入日志文件失败
-                        is_writed = false;
-
-                        //更新本次写入日志文件失败的关键字数和字节数
-                        keys_ok_len += 1;
-                        bytes_ok_len += key.len();
-
-                        error!("Collect log ordered table failed, table: {:?}, key: {:?}, action: upsert, transaction_uid: {:?}, commit_uid: {:?}, reason: {:?}",
-                            table.name().as_str(),
-                            key,
-                            wait_tr.get_transaction_uid(),
-                            wait_tr.get_commit_uid(),
-                            e);
-                        break;
-                    }
-
-                    //更新本次写入日志文件成功的关键字数和字节数
-                    keys_ok_len += 1;
-                    bytes_ok_len += (key.len() + value.len());
+                    keys_len += 1;
+                    bytes_len += (key.len() + value.len());
                 },
                 KVActionLog::Read => (), //忽略读操作
             }
         }
 
-        if is_writed {
-            //指定事务的所有写操作已经写入日志文件
-            trs_ok_len += 1; //更新本次写入日志文件成功的事务数
+        trs_len += 1;
+        waits.push_back((wait_tr, confirm));
+    }
 
-            //调用指定事务的确认提交回调
+    if let Err(e) = table
+        .0
+        .log_file
+        .delay_commit(log_uid,
+                      false,
+                      DEFAULT_LOG_FILE_COMMIT_DELAY_TIMEOUT)
+        .await {
+        //写入日志文件失败，则立即中止本次整理
+        error!("Collect log ordered table failed, table: {:?}, transactions: {}, keys: {}, bytes: {}, reason: {:?}",
+            table.name().as_str(),
+            trs_len,
+            keys_len,
+            bytes_len,
+            e);
+
+        Err((now.elapsed(), (trs_len, keys_len, bytes_len)))
+    } else {
+        //写入日志文件成功，则调用指定事务的确认提交回调，并继续写入下一个事务
+        for (wait_tr, confirm) in waits {
             confirm(wait_tr.get_transaction_uid().unwrap(),
                     wait_tr.get_commit_uid().unwrap(),
                     Ok(()));
-        } else {
-            trs_ok_len += 1; //更新本次写入日志文件失败的事务数
         }
-    }
 
-    (now.elapsed(),
-     (trs_ok_len, keys_ok_len, bytes_ok_len),
-     (trs_err_len, keys_err_len, bytes_err_len))
+        Ok((now.elapsed(), (trs_len, keys_len, bytes_len)))
+    }
 }
