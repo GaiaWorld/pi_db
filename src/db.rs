@@ -1438,7 +1438,7 @@ impl<
         }
     }
 
-    /// 异步创建表
+    /// 异步创建表，表名可以是用文件分隔符分隔的路径，但必须是相对路径，且不允许使用".."
     #[inline]
     pub async fn create_table(&self,
                               name: Atom,
