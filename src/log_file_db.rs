@@ -1300,6 +1300,7 @@ impl LogFileTab {
 			statistics: Arc::new(SpinLock::new(VecDeque::new())),
 		};
 
+		debug!("start load tab: {} ", tab_name_clone.as_str());
 		file.load(&mut store, Some(path), 32 * 1024, true).await;
 		let mut root= OrdMap::<Tree<Bon, Bin>>::new(None);
 		let mut load_size = 0;
