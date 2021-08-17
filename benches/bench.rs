@@ -57,7 +57,7 @@ fn bench_memory_table(b: &mut Bencher) {
                 println!("!!!!!!startup db failed, reason: {:?}", e);
             },
             Ok(db) => {
-                let tr = db.transaction(Atom::from("test_memory"), true, 500, 500);
+                let tr = db.transaction(Atom::from("test_memory"), true, 500, 500).unwrap();
                 if let Err(e) = tr.create_table(Atom::from("test_memory"),
                                                 KVTableMeta::new(KVDBTableType::MemOrdTab,
                                                                  false,
@@ -93,7 +93,8 @@ fn bench_memory_table(b: &mut Bencher) {
                     .transaction(Atom::from("test memory table"),
                                  true,
                                  500,
-                                 500);
+                                 500)
+                    .unwrap();
 
                 let _ = tr.upsert(vec![TableKV {
                     table: table_name_copy,
@@ -190,7 +191,7 @@ fn bench_multi_memory_table(b: &mut Bencher) {
             Ok(db) => {
                 //创建指定数量的有序内存表
                 for index in 0..100 {
-                    let tr = db.transaction(Atom::from("test_memory"), true, 500, 500);
+                    let tr = db.transaction(Atom::from("test_memory"), true, 500, 500).unwrap();
                     if let Err(e) = tr.create_table(Atom::from("test_memory".to_string() + index.to_string().as_str()),
                                                     KVTableMeta::new(KVDBTableType::MemOrdTab,
                                                                      false,
@@ -230,7 +231,8 @@ fn bench_multi_memory_table(b: &mut Bencher) {
                     .transaction(Atom::from("test memory table"),
                                  true,
                                  500,
-                                 500);
+                                 500)
+                    .unwrap();
 
                 //操作指定数量的表
                 for table_name in table_names_copy {
@@ -328,7 +330,7 @@ fn bench_commit_log(b: &mut Bencher) {
                 println!("!!!!!!startup db failed, reason: {:?}", e);
             },
             Ok(db) => {
-                let tr = db.transaction(Atom::from("test_memory"), true, 500, 500);
+                let tr = db.transaction(Atom::from("test_memory"), true, 500, 500).unwrap();
                 if let Err(e) = tr.create_table(Atom::from("test_memory"),
                                                 KVTableMeta::new(KVDBTableType::MemOrdTab,
                                                                  true,
@@ -364,7 +366,8 @@ fn bench_commit_log(b: &mut Bencher) {
                     .transaction(Atom::from("test memory table"),
                                  true,
                                  500,
-                                 500);
+                                 500)
+                    .unwrap();
 
                 let _ = tr.upsert(vec![TableKV {
                     table: table_name_copy,
@@ -461,7 +464,7 @@ fn bench_multi_commit_log(b: &mut Bencher) {
             Ok(db) => {
                 //创建指定数量的有序内存表
                 for index in 0..10 {
-                    let tr = db.transaction(Atom::from("test_memory"), true, 500, 500);
+                    let tr = db.transaction(Atom::from("test_memory"), true, 500, 500).unwrap();
                     if let Err(e) = tr.create_table(Atom::from("test_memory".to_string() + index.to_string().as_str()),
                                                     KVTableMeta::new(KVDBTableType::MemOrdTab,
                                                                      true,
@@ -501,7 +504,8 @@ fn bench_multi_commit_log(b: &mut Bencher) {
                     .transaction(Atom::from("test memory table"),
                                  true,
                                  500,
-                                 500);
+                                 500)
+                    .unwrap();
 
                 //操作指定数量的表
                 for table_name in table_names_copy {
@@ -601,7 +605,7 @@ fn bench_log_table(b: &mut Bencher) {
                 println!("!!!!!!startup db failed, reason: {:?}", e);
             },
             Ok(db) => {
-                let tr = db.transaction(Atom::from("test_log"), true, 500, 500);
+                let tr = db.transaction(Atom::from("test_log"), true, 500, 500).unwrap();
                 if let Err(e) = tr.create_table(Atom::from("test_log"),
                                                 KVTableMeta::new(KVDBTableType::LogOrdTab,
                                                                  true,
@@ -637,7 +641,8 @@ fn bench_log_table(b: &mut Bencher) {
                     .transaction(Atom::from("test log table"),
                                  true,
                                  500,
-                                 500);
+                                 500)
+                    .unwrap();
 
                 let _ = tr.upsert(vec![TableKV {
                     table: table_name_copy,
@@ -737,7 +742,7 @@ fn bench_multi_log_table(b: &mut Bencher) {
             },
             Ok(db) => {
                 for index in 0..10 {
-                    let tr = db.transaction(Atom::from("test_log"), true, 500, 500);
+                    let tr = db.transaction(Atom::from("test_log"), true, 500, 500).unwrap();
                     if let Err(e) = tr.create_table(Atom::from("test_log".to_string() + index.to_string().as_str()),
                                                     KVTableMeta::new(KVDBTableType::LogOrdTab,
                                                                      true,
@@ -778,7 +783,7 @@ fn bench_multi_log_table(b: &mut Bencher) {
                     .transaction(Atom::from("test log table"),
                                  true,
                                  500,
-                                 500);
+                                 500).unwrap();
 
                 for table_name in table_names_copy {
                     let _ = tr.upsert(vec![TableKV {

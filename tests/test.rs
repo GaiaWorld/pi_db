@@ -52,7 +52,7 @@ fn test_memory_table() {
                 println!("!!!!!!db table size: {:?}", db.table_size().await);
 
                 let table_name = Atom::from("test_memory");
-                let tr = db.transaction(table_name.clone(), true, 500, 500);
+                let tr = db.transaction(table_name.clone(), true, 500, 500).unwrap();
                 if let Err(e) = tr.create_table(table_name.clone(),
                                                 KVTableMeta::new(KVDBTableType::MemOrdTab,
                                                                  false,
@@ -80,7 +80,7 @@ fn test_memory_table() {
                 rt_copy.wait_timeout(1500).await;
                 println!("");
 
-                let tr = db.transaction(Atom::from("test memory table"), true, 500, 500);
+                let tr = db.transaction(Atom::from("test memory table"), true, 500, 500).unwrap();
                 let r = tr.query(vec![
                     TableKV {
                         table: table_name.clone(),
@@ -357,7 +357,7 @@ fn test_commit_log() {
                 println!("!!!!!!db table size: {:?}", db.table_size().await);
 
                 let table_name = Atom::from("test_memory");
-                let tr = db.transaction(table_name.clone(), true, 500, 500);
+                let tr = db.transaction(table_name.clone(), true, 500, 500).unwrap();
                 if let Err(e) = tr.create_table(table_name.clone(),
                                                 KVTableMeta::new(KVDBTableType::MemOrdTab,
                                                                  true,
@@ -385,7 +385,7 @@ fn test_commit_log() {
                 rt_copy.wait_timeout(1500).await;
                 println!("");
 
-                let tr = db.transaction(Atom::from("test memory table"), true, 500, 500);
+                let tr = db.transaction(Atom::from("test memory table"), true, 500, 500).unwrap();
                 let r = tr.query(vec![
                     TableKV {
                         table: table_name.clone(),
@@ -664,7 +664,7 @@ fn test_log_table() {
                 println!("!!!!!!db table size: {:?}", db.table_size().await);
 
                 let table_name = Atom::from("test_log");
-                let tr = db.transaction(table_name.clone(), true, 500, 500);
+                let tr = db.transaction(table_name.clone(), true, 500, 500).unwrap();
                 if let Err(e) = tr.create_table(table_name.clone(),
                                                 KVTableMeta::new(KVDBTableType::LogOrdTab,
                                                                  true,
@@ -692,7 +692,7 @@ fn test_log_table() {
                 rt_copy.wait_timeout(1500).await;
                 println!("");
 
-                let tr = db.transaction(Atom::from("test log table"), true, 500, 500);
+                let tr = db.transaction(Atom::from("test log table"), true, 500, 500).unwrap();
 
                 if let Some(mut r) = tr.values(
                     table_name.clone(),

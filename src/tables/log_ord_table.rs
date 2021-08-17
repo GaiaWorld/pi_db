@@ -1,7 +1,7 @@
 use std::mem;
-use std::sync::Arc;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
 use std::collections::hash_map::Entry as HashMapEntry;
 
 use parking_lot::Mutex;
@@ -137,12 +137,14 @@ impl<
             Ok(log_file) => {
                 //打开日志文件成功
                 let waits = AsyncMutex::new(VecDeque::new());
+                let waits_size = AtomicUsize::new(0);
                 let inner = InnerLogOrderedTable {
                     name: name.clone(),
                     root,
                     prepare,
                     rt,
                     waits,
+                    waits_size,
                     waits_limit,
                     wait_timeout,
                     log_file,
@@ -210,7 +212,8 @@ struct InnerLogOrderedTable<
     prepare:        Mutex<XHashMap<Guid, XHashMap<Binary, KVActionLog>>>,                                                   //有序日志表的预提交表
     rt:             MultiTaskRuntime<()>,                                                                                   //异步运行时
     waits:          AsyncMutex<VecDeque<(LogOrdTabTr<C, Log>, XHashMap<Binary, KVActionLog>, <LogOrdTabTr<C, Log> as Transaction2Pc>::CommitConfirm)>>,                                                                                         //等待异步写日志文件的已提交的有序日志事务列表
-    waits_limit:    usize,                                                                                                  //等待异步写日志文件的已提交的有序日志事务数量限制
+    waits_size:     AtomicUsize,                                                                                            //等待异步写日志文件的已提交的有序日志事务的键值对大小
+    waits_limit:    usize,                                                                                                  //等待异步写日志文件的已提交的有序日志事务大小限制
     wait_timeout:   usize,                                                                                                  //等待异步写日志文件的超时时长，单位毫秒
     log_file:       LogFile,                                                                                                //日志文件
 }
@@ -454,11 +457,25 @@ impl<
                 //持久化的有序日志表事务，则异步将表的修改写入日志文件后，再确认提交成功
                 let table_copy = tr.0.table.clone();
                 let _ = self.0.table.0.rt.spawn(self.0.table.0.rt.alloc(), async move {
+                    let mut size = 0;
+                    for (key, action) in &actions {
+                        match action {
+                            KVActionLog::Write(Some(value)) => {
+                                size += key.len() + value.len();
+                            },
+                            KVActionLog::Write(None) => {
+                                size += key.len();
+                            },
+                            KVActionLog::Read => (),
+                        }
+                    }
                     table_copy.0.waits.lock().await.push_back((tr, actions, confirm)); //注册待确认的已提交事务
 
-                    let waits_len = table_copy.0.waits.lock().await.len();
-                    if waits_len >= table_copy.0.waits_limit {
-                        //如果当前已注册的待确认的已提交事务数量已达限制，则立即整理
+                    let last_waits_size = table_copy.0.waits_size.fetch_add(size, Ordering::SeqCst); //更新待确认的已提交事务的大小计数
+                    if last_waits_size + size >= table_copy.0.waits_limit {
+                        //如果当前已注册的待确认的已提交事务大小已达限制，则立即整理
+                        table_copy.0.waits_size.store(0, Ordering::Relaxed); //重置待确认的已提交事务的大小计数
+
                         match collect_waits(&table_copy,
                                             None).await {
                             Err((collect_time, statistics)) => {
@@ -468,7 +485,7 @@ impl<
                                     statistics);
                             },
                             Ok((collect_time, statistics)) => {
-                                debug!("Collect log ordered table ok, table: {:?}, time: {:?}, statistics: {:?}, reason: out of size",
+                                info!("Collect log ordered table ok, table: {:?}, time: {:?}, statistics: {:?}, reason: out of size",
                                     table_copy.name().as_str(),
                                     collect_time,
                                     statistics);

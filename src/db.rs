@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::collections::VecDeque;
 use std::io::{Error, Result as IOResult, ErrorKind};
-use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+use std::sync::{Arc, atomic::{AtomicBool, AtomicU64, Ordering}};
 
 use futures::{future::{FutureExt, BoxFuture}, stream::BoxStream, StreamExt};
 use bytes::BufMut;
@@ -48,6 +48,31 @@ const DEFAULT_DB_TABLES_META_DIR: &str = ".tables_meta";
 const DEFAULT_DB_TABLES_DIR: &str = ".tables";
 
 ///
+/// 数据库未启动状态
+///
+const DB_UNSTARTUP_STATUS: u64 = 0;
+
+///
+/// 数据库正在初始化状态
+///
+const DB_INITING_STATUS: u64 = 1;
+
+///
+/// 数据库已初始化状态
+///
+const DB_INITED_STATUS: u64 = 2;
+
+///
+/// 数据库正在关闭状态
+///
+const DB_CLOSEING_STATUS: u64 = 3;
+
+///
+/// 数据库已关闭状态
+///
+const DB_CLOSED_STATUS: u64 = 4;
+
+///
 /// 键值对数据库管理器构建器
 ///
 pub struct KVDBManagerBuilder<
@@ -61,6 +86,9 @@ pub struct KVDBManagerBuilder<
     tables_path:        PathBuf,                            //数据库表文件所在目录
 }
 
+/*
+* 键值对数据库管理器构建器同步方法
+*/
 impl<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>,
@@ -81,7 +109,15 @@ impl<
             tables_path,
         }
     }
+}
 
+/*
+* 键值对数据库管理器构建器异步方法
+*/
+impl<
+    C: Clone + Send + 'static,
+    Log: AsyncCommitLog<C = C, Cid = Guid>,
+> KVDBManagerBuilder<C, Log> {
     /// 异步启动键值对数据库，并返回键值对数据库的管理器
     pub async fn startup(self) -> IOResult<KVDBManager<C, Log>> {
         if !self.tables_meta_path.exists() {
@@ -101,6 +137,7 @@ impl<
         let tables_meta_path = self.tables_meta_path;
         let tables_path = self.tables_path;
         let tables = Arc::new(RwLock::new(XHashMap::default()));
+        let status = AtomicU64::new(DB_INITING_STATUS);
         let inner = InnerKVDBManager {
             rt,
             tr_mgr,
@@ -108,6 +145,7 @@ impl<
             tables_meta_path,
             tables_path,
             tables,
+            status,
         };
         let db_mgr = KVDBManager(Arc::new(inner));
 
@@ -122,8 +160,8 @@ impl<
                            None,
                            2 * 1024 * 1024,
                            true,
-                           8,
-                           1000).await;
+                           2 * 1024 * 1024,
+                           60 * 1000).await;
         db_mgr.0.tables.write().await.insert(meta_table_name.clone(), KVDBTable::MetaTab(meta_table));
 
         //根据元信息表的元信息，加载其它表，加载操作使用的事务，不需要预提交和提交
@@ -131,7 +169,8 @@ impl<
             .transaction(Atom::from("Startup db"),
                          true,
                          1000,
-                         1000);
+                         1000)
+            .unwrap();
         let mut meta_iterator = tr
             .values(meta_table_name.clone(),
                     None,
@@ -148,10 +187,12 @@ impl<
 
             if let Err(e) = tr.create_table(table_name.clone(), table_meta.clone()).await {
                 //加载指定的表失败，则立即返回错误原因
+                db_mgr.0.status.store(DB_UNSTARTUP_STATUS, Ordering::SeqCst);
                 return Err(Error::new(ErrorKind::Other, format!("Load table failed, tables_path: {:?}, table: {:?}, meta: {:?}, reason: {:?}", db_mgr.tables_path(), table_name, table_meta, e)));
             }
         }
 
+        db_mgr.0.status.store(DB_INITED_STATUS, Ordering::SeqCst); //设置数据库状态为已初始化
         Ok(db_mgr)
     }
 }
@@ -209,7 +250,13 @@ impl<
                        source: Atom,
                        is_writable: bool,
                        prepare_timeout: u64,
-                       commit_timeout: u64) -> KVDBTransaction<C, Log> {
+                       commit_timeout: u64) -> Option<KVDBTransaction<C, Log>> {
+        let status = self.0.status.load(Ordering::Relaxed);
+        if status != DB_INITING_STATUS && status != DB_INITED_STATUS {
+            //当前数据库状态不允许创建键值对数据库的根事务，则立即返回空
+            return None;
+        }
+
         let tid = SpinLock::new(None);
         let cid = SpinLock::new(None);
         let status = SpinLock::new(Transaction2PcStatus::Start);
@@ -231,7 +278,20 @@ impl<
             db_mgr,
         };
 
-        KVDBTransaction::RootTr(RootTransaction(Arc::new(inner)))
+        Some(KVDBTransaction::RootTr(RootTransaction(Arc::new(inner))))
+    }
+
+    ///
+    /// 关闭数据库，立即禁止创建数据库事务
+    ///
+    pub fn close(&self) {
+        if self.0.tr_mgr.transaction_len() == 0 {
+            //如果当前事务管理器没有任何正在执行的事务，则设置数据库状态为已关闭
+            self.0.status.store(DB_CLOSED_STATUS, Ordering::SeqCst);
+        } else {
+            //如果当前事务管理器还有任何正在执行的事务，则设置数据库状态为正在状态
+            self.0.status.store(DB_CLOSEING_STATUS, Ordering::SeqCst);
+        }
     }
 }
 
@@ -340,6 +400,7 @@ struct InnerKVDBManager<
     tables_meta_path:   PathBuf,                                        //数据库的元信息表文件所在目录的路径
     tables_path:        PathBuf,                                        //数据库表文件所在目录的路径
     tables:             Arc<RwLock<XHashMap<Atom, KVDBTable<C, Log>>>>, //数据表
+    status:             AtomicU64,                                      //数据库状态
 }
 
 ///
@@ -1447,7 +1508,7 @@ impl<
                                          None,
                                          2 * 1024 * 1024,
                                          true,
-                                         1024,
+                                         2 * 1024 * 1024,
                                          60 * 1000).await;
 
                 //注册创建的有序内存表
