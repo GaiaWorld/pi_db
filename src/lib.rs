@@ -4,6 +4,7 @@
 use std::ops::Deref;
 use std::fmt::Debug;
 use std::hash::Hash;
+use std::convert::TryInto;
 use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
 
 use futures::{future::BoxFuture,
@@ -16,7 +17,6 @@ use guid::Guid;
 use sinfo::EnumType;
 use r#async::rt::multi_thread::MultiTaskRuntime;
 use async_transaction::{AsyncCommitLog, TransactionError, ErrorLevel};
-use std::convert::TryInto;
 
 pub mod db;
 pub mod tables;
@@ -185,9 +185,11 @@ impl From<Binary> for KVTableMeta {
     //将二进制数据反序列化为键值对表的元信息
     fn from(src: Binary) -> Self {
         let mut buf = src.as_ref();
+        let mut offset = 0;
 
         //读取键值对表的类型
         let table_type = KVDBTableType::from(buf.get_u8());
+        offset += 1;
 
         let persistence = if buf.get_u8() == 0 {
             //读取键值对表不需要持久化的标记
@@ -196,17 +198,21 @@ impl From<Binary> for KVTableMeta {
             //读取键值对表需要持久化的标记
             true
         };
+        offset += 1;
 
         //读取键值对表的关键字类型
-        let key_len = buf.get_u16_le();
-        let taked = buf.take(key_len as usize);
-        buf.advance(key_len as usize);
-        let mut read_buffer = ReadBuffer::new(taked.into_inner(), 0);
+        let key_len = buf.get_u16_le() as usize;
+        offset += 2;
+        let mut read_buffer = ReadBuffer::new(&buf[0..key_len], 0);
+        buf.advance(key_len); //移动缓冲区指针
+        offset += key_len;
         let key = EnumType::decode(&mut read_buffer).unwrap();
 
-        let value_len = buf.get_u16_le();
-        let taked = buf.take(value_len as usize);
-        let mut read_buffer = ReadBuffer::new(taked.into_inner(), 0);
+        let value_len = buf.get_u16_le() as usize;
+        offset += 2;
+        let mut read_buffer = ReadBuffer::new(&buf[0..value_len], 0);
+        buf.advance(value_len);
+        offset += value_len;
         let value = EnumType::decode(&mut read_buffer).unwrap();
 
         KVTableMeta {

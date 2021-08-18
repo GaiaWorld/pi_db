@@ -1,10 +1,14 @@
+use std::time::Instant;
+use std::convert::TryInto;
 use std::path::{Path, PathBuf};
 use std::collections::VecDeque;
-use std::io::{Error, Result as IOResult, ErrorKind};
+use std::io::{Error, Result as IOResult, ErrorKind, Read};
 use std::sync::{Arc, atomic::{AtomicBool, AtomicU64, Ordering}};
 
 use futures::{future::{FutureExt, BoxFuture}, stream::BoxStream, StreamExt};
-use bytes::BufMut;
+use crossbeam_channel::bounded;
+use bytes::{Buf, BufMut};
+use log::info;
 
 use atom::Atom;
 use guid::Guid;
@@ -36,6 +40,7 @@ use crate::{Binary,
                                      MemOrdTabTr},
                      log_ord_table::{LogOrderedTable,
                                      LogOrdTabTr}}};
+use crate::db::KVDBTable::MetaTab;
 
 ///
 /// 默认的数据库表元信息目录名
@@ -192,7 +197,28 @@ impl<
             }
         }
 
+        //如果有未确认的提交日志，则尝试修复数据库表数据
+        let now = Instant::now();
+        match db_mgr.try_repair().await {
+            Err(e) => {
+                //有未确认的提交日志，且尝试修复数据库表数据失败，则立即返回错误原因
+                return Err(e);
+            },
+            Ok((repaired_log_len, repaired_bytes_len)) => {
+                //尝试修复数据库表数据成功
+                if repaired_log_len > 0 {
+                    //未确认的提交日志
+                    info!("Repair db ok, logs: {}, bytes: {}, time: {:?}",
+                        repaired_log_len,
+                        repaired_bytes_len,
+                        now.elapsed());
+                }
+            }
+        }
+
         db_mgr.0.status.store(DB_INITED_STATUS, Ordering::SeqCst); //设置数据库状态为已初始化
+        info!("Startup db ok, tables: {}", db_mgr.table_size().await);
+
         Ok(db_mgr)
     }
 }
@@ -386,6 +412,134 @@ impl<
                 Some(table.len())
             },
         }
+    }
+
+    // 尝试幂等的重播未确认的提交日志，并修复数据库表数据
+    // 注意如果在只有单个线程的运行时修复或并发修复，则可能会发生阻塞
+    pub(crate) async fn try_repair(&self) -> IOResult<(usize, usize)> {
+        //构建重播回调
+        let db_mgr = self.clone();
+
+        let replay_callback = move |commit_uid: Guid, prepare_output: Vec<u8>| -> IOResult<()> {
+            //异步执行重播
+            let db_mgr_copy = db_mgr.clone();
+            let commit_uid_copy = commit_uid.clone();
+            let meta_table_name = Atom::from(DEFAULT_DB_TABLES_META_DIR);
+            let (sender, receiver) = bounded(1);
+
+            let boxed = async move {
+                let bytes_len = prepare_output.len(); //获取日志缓冲区长度
+                let mut offset = 0; //日志缓冲区偏移
+                let bytes = prepare_output.as_slice();
+                let uid = u128::from_le_bytes(bytes[0..16].try_into().unwrap()); //获取事务唯一id
+                let transaciton_uid = Guid(uid);
+                offset += 16; //移动缓冲区指针
+
+                if let Some(tr) =
+                db_mgr_copy.transaction(Atom::from("Repair db"),
+                                        true,
+                                        5000,
+                                        5000) {
+                    //创建数据库事务成功，则迭代日志缓冲区中，本次未确认的提交日志中执行写操作的表和相关键值对
+                    //迭代完成后，则可以恢复本次未确认的提交日志对表的内存键值对的修改，并生成对应的键值对操作记录
+                    while offset < bytes_len {
+                        //获取表名、操作的键值对数量和新的日志缓冲区偏移
+                        let (table, kvs_len, new_offset) =
+                            <MetaTable<C, Log> as KVTable>::get_init_table_prepare_output(&prepare_output, offset);
+
+                        //获取操作的表键值列表和新的日志缓冲区偏移
+                        let (writes, new_offset)
+                            = <MetaTable<C, Log> as KVTable>::get_all_key_value_from_table_prepare_output(&prepare_output, &table, kvs_len, new_offset);
+
+                        if table == meta_table_name {
+                            //未确认的提交日志操作的表是元信息表，则创建或删除表
+                            for write in writes {
+                                if let Some(value) = write.value {
+                                    //有值，则创建表
+                                    let table_name = Atom::from(write.key.as_ref());
+                                    let table_meta = KVTableMeta::from(value);
+
+                                    if let Err(e) = tr.create_table(table_name.clone(), table_meta.clone()).await {
+                                        //重播的创建表失败，则立即返回错误原因
+                                        sender.send(Err(Error::new(ErrorKind::Other, format!("Repair tables meta failed, transaction_uid: {:?}, commit_uid: {:?}, table_name: {:?}, table_meta: {:?}, reason: {:?}", transaciton_uid, commit_uid_copy, table_name, table_meta, e))));
+                                        return;
+                                    }
+                                } else {
+                                    //无值，则删除表
+                                    let table_name = Atom::from(write.key.as_ref());
+
+                                    if let Err(e) = tr.remove_table(table_name.clone()).await {
+                                        //重播的移除表失败，则立即返回错误原因
+                                        sender.send(Err(Error::new(ErrorKind::Other, format!("Repair tables meta failed, transaction_uid: {:?}, commit_uid: {:?}, table_name: {:?}, reason: {:?}", transaciton_uid, commit_uid_copy, table_name, e))));
+                                        return;
+                                    }
+                                }
+                            }
+                        } else {
+                            //未确认的提交日志操作的表是其它表，则执行本次未确认的提交日志中指定表的键值对写操作
+                            for write in writes {
+                                if write.exist_value() {
+                                    //有值，则执行插入或更新操作
+                                    if let Err(e) = tr.upsert(vec![write]).await {
+                                        //重播的插入或更新操作失败，则立即返回错误原因
+                                        sender.send(Err(Error::new(ErrorKind::Other, format!("Repair db failed, transaction_uid: {:?}, commit_uid: {:?}, reason: {:?}", transaciton_uid, commit_uid_copy, e))));
+                                        return;
+                                    }
+                                } else {
+                                    //无值，则执行删除操作
+                                    if let Err(e) = tr.delete(vec![write]).await {
+                                        //重播的删除操作失败，则立即返回错误原因
+                                        sender.send(Err(Error::new(ErrorKind::Other, format!("Repair db failed, transaction_uid: {:?}, commit_uid: {:?}, reason: {:?}", transaciton_uid, commit_uid_copy, e))));
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+
+                        //更新日志缓冲区偏移
+                        offset = new_offset;
+                    }
+
+                    //指定本次重播事务的事务唯一id后执行预提交修复
+                    if let Err(e) = tr.prepare_repair(transaciton_uid.clone()).await {
+                        //预提交重播事务失败，则立即返回错误原因
+                        sender.send(Err(Error::new(ErrorKind::Other, format!("Repair db failed, transaction_uid: {:?}, commit_uid: {:?}, reason: {:?}", transaciton_uid, commit_uid_copy, e))));
+                        return;
+                    }
+
+                    //指定本次重播事务的事务唯一id和事务提交唯一id后执行提交修复
+                    if let Err(e) = tr
+                        .commit_repair(transaciton_uid.clone(),
+                                       commit_uid_copy.clone(),
+                                       prepare_output).await {
+                        //提交重播事务失败，则立即返回错误原因
+                        sender.send(Err(Error::new(ErrorKind::Other, format!("Repair db failed, transaction_uid: {:?}, commit_uid: {:?}, reason: {:?}", transaciton_uid, commit_uid_copy, e))));
+                        return;
+                    }
+
+                    //返回成功重播一条未确认的提交日志
+                    sender.send(Ok(()));
+                } else {
+                    //创建数据库事务失败，则立即返回错误原因
+                    sender.send(Err(Error::new(ErrorKind::Other, format!("Repair db failed, transaction_uid: {:?}, commit_uid: {:?}, reason: get db transaction error", transaciton_uid, commit_uid_copy))));
+                }
+            }.boxed();
+            db_mgr.0.rt.spawn(db_mgr.0.rt.alloc(), boxed);
+
+            //注意单个线程的运行时重播或并发重播，则可能会发生阻塞
+            match receiver.recv() {
+                Err(e) => {
+                    //同步通道异常，则立即返回错误原因
+                    Err(Error::new(ErrorKind::Other, format!("Repair db failed, commit_uid: {:?}, reason: {:?}", commit_uid, e)))
+                },
+                Ok(result) => {
+                    //同步阻塞的等待异步重播完成，则立即返回重播结果
+                    result
+                },
+            }
+        };
+
+        self.0.tr_mgr.replay_commit_log(replay_callback).await
     }
 }
 
@@ -1071,7 +1225,8 @@ impl<
     }
 
     /// 在键值对数据库事务的根事务内，异步提交本次事务对键值对数据库的所有修改
-    pub async fn commit_modified(&self, prepare_output: Vec<u8>) -> Result<(), KVTableTrError> {
+    pub async fn commit_modified(&self,
+                                 prepare_output: Vec<u8>) -> Result<(), KVTableTrError> {
         match self {
             KVDBTransaction::RootTr(tr) => {
                 tr.commit_modified(prepare_output).await
@@ -1087,6 +1242,32 @@ impl<
                 tr.rollback_modified().await
             },
             _ => panic!("Rollback modified db failed, reason: invalid root transaction"),
+        }
+    }
+
+    /// 在键值对数据库事务的根事务内，异步预提交本次事务对键值对数据库的所有修复修改，不返回预提交的输出
+    async fn prepare_repair(&self,
+                            transaction_uid: Guid)
+                           -> Result<(), KVTableTrError> {
+        match self {
+            KVDBTransaction::RootTr(tr) => {
+                tr.prepare_repair(transaction_uid).await
+            },
+            _ => panic!("Repair prepare modified db failed, reason: invalid root transaction"),
+        }
+    }
+
+    /// 键值对数据库事务的根事务内，异步提交本次事务对键值对数据库的所有修复修改
+    async fn commit_repair(&self,
+                           transaction_uid: Guid,
+                           commit_uid: Guid,
+                           prepare_output: Vec<u8>)
+        -> Result<(), KVTableTrError> {
+        match self {
+            KVDBTransaction::RootTr(tr) => {
+                tr.commit_repair(transaction_uid, commit_uid, prepare_output).await
+            },
+            _ => panic!("Repair commit modified db failed, reason: invalid root transaction"),
         }
     }
 }
@@ -1425,7 +1606,7 @@ impl<
 > RootTransaction<C, Log> {
     /// 异步获取表的元信息
     #[inline]
-    pub async fn table_meta(&self, table: Atom) -> Option<KVTableMeta> {
+    async fn table_meta(&self, table: Atom) -> Option<KVTableMeta> {
         let meta_table = Atom::from(DEFAULT_DB_TABLES_META_DIR);
         let result = self.query(vec![TableKV::new(meta_table.clone(),
                                                   Binary::new(table.as_bytes().to_vec()),
@@ -1440,7 +1621,7 @@ impl<
 
     /// 异步创建表，表名可以是用文件分隔符分隔的路径，但必须是相对路径，且不允许使用".."
     #[inline]
-    pub async fn create_table(&self,
+    async fn create_table(&self,
                               name: Atom,
                               meta: KVTableMeta) -> IOResult<()> {
         //检查待创建的指定名称的表是否存在
@@ -1547,7 +1728,7 @@ impl<
 
     /// 异步移除表
     #[inline]
-    pub async fn remove_table(&self, table: Atom) -> IOResult<()> {
+    async fn remove_table(&self, table: Atom) -> IOResult<()> {
         let mut tables = self.0.db_mgr.0.tables.write().await;
 
         //移除表
@@ -1584,7 +1765,7 @@ impl<
 
     /// 异步查询多个表和键的值的结果集
     #[inline]
-    pub async fn query(&self,
+    async fn query(&self,
                        table_kv_list: Vec<TableKV>) -> Vec<Option<Binary>> {
         let mut result = Vec::new();
 
@@ -1632,7 +1813,7 @@ impl<
 
     /// 异步插入或更新指定多个表和键的值
     #[inline]
-    pub async fn upsert(&self,
+    async fn upsert(&self,
                         table_kv_list: Vec<TableKV>) -> Result<(), KVTableTrError> {
         for table_kv in table_kv_list {
             if let Some(table) = self.0.db_mgr.0.tables.read().await.get(&table_kv.table) {
@@ -1695,7 +1876,7 @@ impl<
 
     /// 异步删除指定多个表和键的值，并返回删除值的结果集
     #[inline]
-    pub async fn delete(&self,
+    async fn delete(&self,
                         table_kv_list: Vec<TableKV>)
                         -> Result<Vec<Option<Binary>>, KVTableTrError> {
         let mut result = Vec::new();
@@ -1773,7 +1954,7 @@ impl<
 
     /// 获取从指定表和关键字开始，从前向后或从后向前的关键字异步流
     #[inline]
-    pub async fn keys<'a>(&self,
+    async fn keys<'a>(&self,
                           table_name: Atom,
                           key: Option<Binary>,
                           descending: bool)
@@ -1815,7 +1996,7 @@ impl<
 
     /// 获取从指定表和关键字开始，从前向后或从后向前的键值对异步流
     #[inline]
-    pub async fn values<'a>(&self,
+    async fn values<'a>(&self,
                             table_name: Atom,
                             key: Option<Binary>,
                             descending: bool) -> Option<BoxStream<'a, (Binary, Binary)>> {
@@ -1856,7 +2037,7 @@ impl<
 
     /// 锁住指定表的指定关键字
     #[inline]
-    pub async fn lock_key(&self,
+    async fn lock_key(&self,
                           table_name: Atom,
                           key: Binary) -> Result<(), KVTableTrError> {
         if let Some(table) = self.0.db_mgr.0.tables.read().await.get(&table_name) {
@@ -1896,7 +2077,7 @@ impl<
 
     /// 解锁指定表的指定关键字
     #[inline]
-    pub async fn unlock_key(&self,
+    async fn unlock_key(&self,
                             table_name: Atom,
                             key: Binary) -> Result<(), KVTableTrError> {
         if let Some(table) = self.0.db_mgr.0.tables.read().await.get(&table_name) {
@@ -1936,7 +2117,7 @@ impl<
 
     /// 异步预提交本次事务对键值对数据库的所有修改，成功返回预提交的输出
     #[inline]
-    pub async fn prepare_modified(&self) -> Result<Vec<u8>, KVTableTrError> {
+    async fn prepare_modified(&self) -> Result<Vec<u8>, KVTableTrError> {
         if self.get_status() != Transaction2PcStatus::Rollbacked {
             //本次事务的当前状态只要不为回滚成功，则先初始化键值对数据库的根事务
             if let Err(e) = self
@@ -1990,7 +2171,7 @@ impl<
 
     /// 异步提交本次事务对键值对数据库的所有修改
     #[inline]
-    pub async fn commit_modified(&self, prepare_output: Vec<u8>) -> Result<(), KVTableTrError> {
+    async fn commit_modified(&self, prepare_output: Vec<u8>) -> Result<(), KVTableTrError> {
         //为本次事务的异步提交确认，创建提交确认回调
         let commit_confirm = KVDBCommitConfirm::new(self.0.db_mgr.0.rt.clone(),
                                                     self.0.db_mgr.0.tr_mgr.commit_logger(),
@@ -2026,7 +2207,7 @@ impl<
     /// 异步回滚本次事务对键值对数据库的所有修改，事务严重错误无法回滚
     ///
     #[inline]
-    pub async fn rollback_modified(&self) -> Result<(), KVTableTrError> {
+    async fn rollback_modified(&self) -> Result<(), KVTableTrError> {
         //回滚键值对数据库的根事务
         if let Err(e) = self
             .0
@@ -2040,6 +2221,71 @@ impl<
         }
 
         Ok(())
+    }
+
+    /// 异步预提交本次事务对键值对数据库的所有修复修改，不返回预提交的输出
+    async fn prepare_repair(&self,
+                            transaction_uid: Guid)
+                            -> Result<(), KVTableTrError> {
+        let mut childs = self.to_children();
+        while let Some(child) = childs.next() {
+            match child {
+                KVDBTransaction::MetaTabTr(tr) => {
+                    tr.prepare_repair(transaction_uid.clone());
+                },
+                KVDBTransaction::MemOrdTabTr(tr) => {
+                    tr.prepare_repair(transaction_uid.clone());
+                },
+                KVDBTransaction::LogOrdTabTr(tr) => {
+                    tr.prepare_repair(transaction_uid.clone());
+                },
+                KVDBTransaction::RootTr(_) => {
+                    //忽略根事务，并继续执行下一个子事务的预提交修复
+                    continue;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// 异步提交本次事务对键值对数据库的所有修复修改
+    #[inline]
+    async fn commit_repair(&self,
+                           transaction_uid: Guid,
+                           commit_uid: Guid,
+                           prepare_output: Vec<u8>) -> Result<(), KVTableTrError> {
+        //为本次事务的异步提交确认，创建提交确认回调
+        let commit_confirm = KVDBCommitConfirm::new(self.0.db_mgr.0.rt.clone(),
+                                                    self.0.db_mgr.0.tr_mgr.commit_logger(),
+                                                    transaction_uid.clone(),
+                                                    Some(commit_uid.clone()),
+                                                    self.persistent_children_len());
+
+        //重播提交键值对数据库的根事务
+        match self
+            .0
+            .db_mgr
+            .0
+            .tr_mgr
+            .replay_commit(KVDBTransaction::RootTr(self.clone()),
+                           transaction_uid,
+                           commit_uid,
+                           prepare_output,
+                           commit_confirm)
+            .await {
+            Err(e) => Err(e),
+            Ok(_) => {
+                //重播提交键值对数据库的根事务成功，则完成本次键值对数据库重播事务
+                self
+                    .0
+                    .db_mgr
+                    .0
+                    .tr_mgr
+                    .finish(KVDBTransaction::RootTr(self.clone()));
+                Ok(())
+            }
+        }
     }
 }
 

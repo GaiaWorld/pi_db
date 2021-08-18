@@ -156,7 +156,7 @@ impl<
                 let now = Instant::now();
                 let mut loader = LogOrderedTableLoader::new(table.clone());
                 if let Err(e) = table.0.log_file.load(&mut loader,
-                                      Some(path.as_ref().to_path_buf()),
+                                      None,
                                       load_buf_len,
                                       is_checksum).await {
                     //加载指定的日志文件失败，则立即抛出异常
@@ -805,6 +805,38 @@ impl<
         }
 
         Ok(())
+    }
+
+    // 预提交所有修复修改
+    // 在表的当前根节点上执行键值对操作中的所有写操作
+    // 将有序日志表事务的键值对操作记录移动到对应的有序日志表的预提交表，一般只用于修复有序日志表
+    pub(crate) fn prepare_repair(&self, transaction_uid: Guid) {
+        //获取事务的当前操作记录，并重置事务的当前操作记录
+        let actions = mem::replace(&mut *self.0.actions.lock(), XHashMap::default());
+
+        //在事务对应的表的根节点，执行操作记录中的所有写操作
+        for (key, action) in &actions {
+            match action {
+                KVActionLog::Write(Some(value)) => {
+                    //执行插入或更新指定关键字的值的操作
+                    self
+                        .0
+                        .table
+                        .0
+                        .root
+                        .lock()
+                        .upsert(key.clone(), value.clone(), false);
+                },
+                KVActionLog::Write(None) => {
+                    //执行删除指定关键字的值的操作
+                    self.0.table.0.root.lock().delete(key, false);
+                },
+                KVActionLog::Read => (), //忽略读操作
+            }
+        }
+
+        //将事务的当前操作记录，写入表的预提交表
+        self.0.table.0.prepare.lock().insert(transaction_uid, actions);
     }
 }
 

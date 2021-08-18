@@ -984,3 +984,179 @@ fn test_log_table() {
     thread::sleep(Duration::from_millis(1000000000));
 }
 
+#[test]
+fn test_db_repair() {
+    use std::thread;
+    use std::time::Duration;
+
+    env_logger::init();
+
+    let builder = MultiTaskRuntimeBuilder::default();
+    let rt = builder.build();
+    let rt_copy = rt.clone();
+
+    rt.spawn(rt.alloc(), async move {
+        let guid_gen = GuidGen::new(run_nanos(), 0);
+        let commit_logger_builder = CommitLoggerBuilder::new(rt_copy.clone(), "./.commit_log");
+        let commit_logger = commit_logger_builder
+            .build()
+            .await
+            .unwrap();
+
+        let tr_mgr = Transaction2PcManager::new(rt_copy.clone(),
+                                                guid_gen,
+                                                commit_logger);
+
+        let mut builder = KVDBManagerBuilder::new(rt_copy.clone(), tr_mgr, "./db");
+        match builder.startup().await {
+            Err(e) => {
+                panic!(e);
+            },
+            Ok(db) => {
+                println!("!!!!!!db table size: {:?}", db.table_size().await);
+
+                let table_name0 = Atom::from("test_log0");
+                let table_name1 = Atom::from("test_log1");
+                let tr = db.transaction(Atom::from("test db repair"), true, 500, 500).unwrap();
+                if let Err(e) = tr.create_table(table_name0.clone(),
+                                                KVTableMeta::new(KVDBTableType::LogOrdTab,
+                                                                 true,
+                                                                 EnumType::U8,
+                                                                 EnumType::Usize)).await {
+                    //创建有序内存表失败
+                    println!("!!!!!!create log ordered table failed, reason: {:?}", e);
+                }
+                if let Err(e) = tr.create_table(table_name1.clone(),
+                                                KVTableMeta::new(KVDBTableType::LogOrdTab,
+                                                                 true,
+                                                                 EnumType::U8,
+                                                                 EnumType::Usize)).await {
+                    //创建有序内存表失败
+                    println!("!!!!!!create log ordered table failed, reason: {:?}", e);
+                }
+                let output = tr.prepare_modified().await.unwrap();
+                let _ = tr.commit_modified(output).await;
+
+                println!("!!!!!!db table size: {:?}", db.table_size().await);
+
+                //操作数据库事务
+                rt_copy.wait_timeout(5000).await;
+                println!("");
+
+                let tr = db.transaction(Atom::from("test log table"), true, 500, 500).unwrap();
+
+                if let Some(mut r) = tr.values(
+                    table_name0.clone(),
+                    None,
+                    false
+                ).await {
+                    while let Some((key, value)) = r.next().await {
+                        println!("!!!!!!table: {:?}, next key: {:?}, value: {:?}",
+                                 table_name0.clone(),
+                                 u8::from_le_bytes(key.as_ref().try_into().unwrap()),
+                                 usize::from_le_bytes(value.as_ref().try_into().unwrap()));
+                    }
+                }
+                if let Some(mut r) = tr.values(
+                    table_name1.clone(),
+                    None,
+                    false
+                ).await {
+                    while let Some((key, value)) = r.next().await {
+                        println!("!!!!!!table: {:?}, next key: {:?}, value: {:?}",
+                                 table_name1.clone(),
+                                 u8::from_le_bytes(key.as_ref().try_into().unwrap()),
+                                 usize::from_le_bytes(value.as_ref().try_into().unwrap()));
+                    }
+                }
+
+                rt_copy.wait_timeout(10000).await;
+                println!("");
+
+                let mut table_kv_list = Vec::new();
+                for index in 0..10u8 {
+                    let vec = tr.query(vec![TableKV {
+                        table: table_name0.clone(),
+                        key: Binary::new(index.to_le_bytes().to_vec()),
+                        value: None
+                    }]).await;
+
+                    if let Some(last_value) = &vec[0] {
+                        //有值，则加1
+                        let last_value = usize::from_le_bytes(last_value.as_ref().try_into().unwrap());
+                        table_kv_list.push(TableKV {
+                            table: table_name0.clone(),
+                            key: Binary::new(index.to_le_bytes().to_vec()),
+                            value: Some(Binary::new((last_value + 1).to_le_bytes().to_vec()))
+                        });
+                    } else {
+                        //无值，则初始化
+                        table_kv_list.push(TableKV {
+                            table: table_name0.clone(),
+                            key: Binary::new(index.to_le_bytes().to_vec()),
+                            value: Some(Binary::new((index as usize * 1000000).to_le_bytes().to_vec()))
+                        });
+                    }
+
+                    let vec = tr.query(vec![TableKV {
+                        table: table_name1.clone(),
+                        key: Binary::new(index.to_le_bytes().to_vec()),
+                        value: None
+                    }]).await;
+
+                    if let Some(last_value) = &vec[0] {
+                        //有值，则加1
+                        let last_value = usize::from_le_bytes(last_value.as_ref().try_into().unwrap());
+                        table_kv_list.push(TableKV {
+                            table: table_name1.clone(),
+                            key: Binary::new(index.to_le_bytes().to_vec()),
+                            value: Some(Binary::new((last_value + 1).to_le_bytes().to_vec()))
+                        });
+                    } else {
+                        //无值，则初始化
+                        table_kv_list.push(TableKV {
+                            table: table_name1.clone(),
+                            key: Binary::new(index.to_le_bytes().to_vec()),
+                            value: Some(Binary::new((index as usize * 1000000).to_le_bytes().to_vec()))
+                        });
+                    }
+                }
+                let r = tr.upsert(table_kv_list).await;
+                println!("!!!!!!batch upsert, result: {:?}", r);
+
+                rt_copy.wait_timeout(1500).await;
+                println!("");
+
+                match tr.prepare_modified().await {
+                    Err(e) => {
+                        println!("prepare failed, reason: {:?}", e);
+                        if let Err(e) = tr.rollback_modified().await {
+                            println!("rollback failed, reason: {:?}", e);
+                        } else {
+                            println!("rollback ok for prepare");
+                        }
+                    },
+                    Ok(output) => {
+                        println!("prepare ok, output: {:?}", output);
+                        match tr.commit_modified(output).await {
+                            Err(e) => {
+                                println!("commit failed, reason: {:?}", e);
+                                if let ErrorLevel::Fatal = &e.level() {
+                                    println!("rollback failed, reason: commit fatal error");
+                                } else {
+                                    println!("rollbakc ok for commit");
+                                }
+                            },
+                            Ok(()) => {
+                                println!("commit ok");
+                            },
+                        }
+                    },
+                }
+            },
+        }
+    });
+
+    thread::sleep(Duration::from_millis(1000000000));
+}
+

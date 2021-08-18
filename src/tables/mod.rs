@@ -1,7 +1,7 @@
 use std::fmt::Debug;
 use std::path::Path;
 
-use bytes::BufMut;
+use bytes::{Buf, BufMut};
 
 use atom::Atom;
 use async_transaction::{AsyncTransaction,
@@ -12,6 +12,7 @@ use async_transaction::{AsyncTransaction,
 
 use crate::{Binary,
             KVAction};
+use std::io::Read;
 
 pub mod meta_table;
 pub mod mem_ord_table;
@@ -89,6 +90,64 @@ pub trait KVTable: Send + Sync + 'static {
             prepare_output.put_u32_le(0); //写入值长度
         }
     }
+
+    /// 获取预提交输出缓冲区的表初始化内容，包括表名和预提交操作的键值对数量，并返回读取后的偏移
+    fn get_init_table_prepare_output(prepare_output: &<<Self as KVTable>::Tr as Transaction2Pc>::PrepareOutput,
+                                     mut offset: usize)
+        -> (Atom, u64, usize) {
+        //获取需要读取的缓冲区
+        let mut bytes: &[u8] = prepare_output.as_ref();
+        bytes.advance(offset); //移动缓冲区指针
+
+        //读取缓冲区数据
+        let table_name_len = bytes.get_u16_le() as usize; //获取表名长度
+        offset += 2;
+        let table_name_string = String::from_utf8(bytes[0..table_name_len].to_vec()).unwrap();
+        let table_name = Atom::from(table_name_string); //获取表名
+        bytes.advance(table_name_len); //移动缓冲区指针
+        offset += table_name_len;
+        let kvs_len = bytes.get_u64_le(); //获取本次事务的预提交操作的键值对数量
+        offset += 8;
+
+        (table_name, kvs_len, offset)
+    }
+
+    /// 获取预提交输出缓冲区中指定数量的表键值列表，并返回读取后的偏移
+    fn get_all_key_value_from_table_prepare_output(prepare_output: &<<Self as KVTable>::Tr as Transaction2Pc>::PrepareOutput,
+                                                   table: &Atom,
+                                                   kvs_len: u64,
+                                                   mut offset: usize)
+        -> (Vec<TableKV>, usize) {
+        //获取需要读取的缓冲区
+        let mut bytes: &[u8] = prepare_output.as_ref();
+        bytes.advance(offset); //移动缓冲区指针
+
+        //读取缓冲区数据
+        let mut tkvs = Vec::with_capacity(kvs_len as usize);
+        for index in 0..kvs_len {
+            let key_len = bytes.get_u16_le() as usize; //获取关键字长度
+            offset += 2;
+            let key = Binary::from_slice(&bytes[0..key_len]); //获取关键字
+            bytes.advance(key_len); //移动缓冲区指针
+            offset += key_len;
+
+            let value_len = bytes.get_u32_le() as usize; //获取值长度
+            offset += 4;
+            if value_len > 0 {
+                //有值
+                let value = Binary::from_slice(&bytes[0..value_len]); //获取值
+                bytes.advance(value_len); //移动缓冲区指针
+                offset += value_len;
+
+                tkvs.push(TableKV::new(table.clone(), key, Some(value)));
+            } else {
+                //无值
+                tkvs.push(TableKV::new(table.clone(), key, None));
+            }
+        }
+
+        (tkvs, offset)
+    }
 }
 
 ///
@@ -105,6 +164,7 @@ unsafe impl Send for TableKV {}
 unsafe impl Sync for TableKV {}
 
 impl TableKV {
+    /// 构建一个表键值
     pub fn new(table: Atom,
                key: Binary,
                value: Option<Binary>) -> Self {
@@ -113,6 +173,11 @@ impl TableKV {
             key,
             value,
         }
+    }
+
+    /// 判断是否有值
+    pub fn exist_value(&self) -> bool {
+        self.value.is_some()
     }
 }
 
