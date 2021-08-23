@@ -378,6 +378,7 @@ impl<
                         .init_table_prepare_output(&mut buf,
                                                    writed_count); //初始化本次表事务的预提交输出缓冲区
 
+                    let init_buf_len = buf.len(); //获取初始化本次表事务的预提交输出缓冲区后，缓冲区的长度
                     for (key, action) in tr.0.actions.lock().iter() {
                         if let Err(e) = tr
                             .check_prepare_conflict(&mut prepare_locked,
@@ -404,7 +405,14 @@ impl<
                             _ => (), //忽略读操作
                         }
                     }
-                    write_buf = Some(buf);
+
+                    if buf.len() <= init_buf_len {
+                        //本次事务没有对本地表的写操作，则设置写操作缓冲区为空
+                        write_buf = None;
+                    } else {
+                        //本次事务有对本地表的写操作，则写操作缓冲区为指定的预提交缓冲区
+                        write_buf = Some(buf);
+                    }
 
                     //获取事务的当前操作记录，并重置事务的当前操作记录
                     let actions = mem::replace(&mut *tr.0.actions.lock(), XHashMap::default());

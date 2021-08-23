@@ -11,9 +11,7 @@ use guid::{GuidGen, Guid};
 use sinfo::EnumType;
 use time::run_nanos;
 use r#async::rt::multi_thread::MultiTaskRuntimeBuilder;
-use async_transaction::{AsyncCommitLog,
-                        ErrorLevel,
-                        manager_2pc::Transaction2PcManager};
+use async_transaction::{AsyncCommitLog, ErrorLevel, manager_2pc::Transaction2PcManager, Transaction2Pc};
 use pi_store::commit_logger::{CommitLoggerBuilder, CommitLogger};
 
 use pi_db::{Binary,
@@ -1010,7 +1008,7 @@ fn test_db_repair() {
         let mut builder = KVDBManagerBuilder::new(rt_copy.clone(), tr_mgr, "./db");
         match builder.startup().await {
             Err(e) => {
-                panic!(e);
+                panic!("!!!!!!startup db failed, reason: {:?}", e);
             },
             Ok(db) => {
                 println!("!!!!!!db table size: {:?}", db.table_size().await);
@@ -1148,7 +1146,7 @@ fn test_db_repair() {
                                 }
                             },
                             Ok(()) => {
-                                println!("commit ok");
+                                println!("commit ok, commit_uid: {:?}", tr.get_commit_uid());
                             },
                         }
                     },

@@ -165,7 +165,7 @@ impl<
                            None,
                            2 * 1024 * 1024,
                            true,
-                           2 * 1024 * 1024,
+                           16 * 1024 * 1024,
                            60 * 1000).await;
         db_mgr.0.tables.write().await.insert(meta_table_name.clone(), KVDBTable::MetaTab(meta_table));
 
@@ -338,6 +338,16 @@ impl<
         self.0.tables.read().await.len()
     }
 
+    /// 异步获取键值对数据库的所有表的名称列表
+    pub async fn tables(&self) -> Vec<Atom> {
+        let mut table_names = Vec::new();
+        for key in self.0.tables.read().await.keys() {
+            table_names.push(key.clone());
+        }
+
+        table_names
+    }
+
     /// 异步获取指定名称的数据表所在目录的路径，返回空表示指定名称的表不存在
     pub async fn table_path(&self, table_name: &Atom) -> Option<PathBuf> {
         match self.0.tables.read().await.get(&table_name) {
@@ -459,7 +469,7 @@ impl<
                                     let table_name = Atom::from(write.key.as_ref());
                                     let table_meta = KVTableMeta::from(value);
 
-                                    if let Err(e) = tr.create_table(table_name.clone(), table_meta.clone()).await {
+                                    if let Err(e) = tr.repair_create_table(table_name.clone(), table_meta.clone()).await {
                                         //重播的创建表失败，则立即返回错误原因
                                         sender.send(Err(Error::new(ErrorKind::Other, format!("Repair tables meta failed, transaction_uid: {:?}, commit_uid: {:?}, table_name: {:?}, table_meta: {:?}, reason: {:?}", transaciton_uid, commit_uid_copy, table_name, table_meta, e))));
                                         return;
@@ -468,7 +478,7 @@ impl<
                                     //无值，则删除表
                                     let table_name = Atom::from(write.key.as_ref());
 
-                                    if let Err(e) = tr.remove_table(table_name.clone()).await {
+                                    if let Err(e) = tr.repair_remove_table(table_name.clone()).await {
                                         //重播的移除表失败，则立即返回错误原因
                                         sender.send(Err(Error::new(ErrorKind::Other, format!("Repair tables meta failed, transaction_uid: {:?}, commit_uid: {:?}, table_name: {:?}, reason: {:?}", transaciton_uid, commit_uid_copy, table_name, e))));
                                         return;
@@ -539,7 +549,12 @@ impl<
             }
         };
 
-        self.0.tr_mgr.replay_commit_log(replay_callback).await
+        //异步重播所有未确认的提交日志
+        let replay_result = self.0.tr_mgr.replay_commit_log(replay_callback).await?;
+
+        //所有未确认的提交日志已完成重播，则立即返回数据库修复成功
+        let _ = self.0.tr_mgr.finish_replay().await?; //通知事务管理器，已完成重播
+        return Ok(replay_result);
     }
 }
 
@@ -1115,11 +1130,33 @@ impl<
         }
     }
 
+    /// 异步修复创建表，需要指定表名和表的元信息
+    pub(crate) async fn repair_create_table(&self,
+                                            name: Atom,
+                                            meta: KVTableMeta) -> IOResult<()> {
+        match self {
+            KVDBTransaction::RootTr(tr) => {
+                tr.repair_create_table(name, meta).await
+            },
+            _ => panic!("Create table failed, reason: invalid root transaction"),
+        }
+    }
+
     /// 异步移除表
     pub async fn remove_table(&self, name: Atom) -> IOResult<()> {
         match self {
             KVDBTransaction::RootTr(tr) => {
                 tr.remove_table(name).await
+            },
+            _ => panic!("Remove table failed, reason: invalid root transaction"),
+        }
+    }
+
+    /// 异步修复移除表
+    pub(crate) async fn repair_remove_table(&self, name: Atom) -> IOResult<()> {
+        match self {
+            KVDBTransaction::RootTr(tr) => {
+                tr.repair_remove_table(name).await
             },
             _ => panic!("Remove table failed, reason: invalid root transaction"),
         }
@@ -1265,7 +1302,9 @@ impl<
         -> Result<(), KVTableTrError> {
         match self {
             KVDBTransaction::RootTr(tr) => {
-                tr.commit_repair(transaction_uid, commit_uid, prepare_output).await
+                tr.commit_repair(transaction_uid,
+                                 commit_uid,
+                                 prepare_output).await
             },
             _ => panic!("Repair commit modified db failed, reason: invalid root transaction"),
         }
@@ -1689,7 +1728,7 @@ impl<
                                          None,
                                          2 * 1024 * 1024,
                                          true,
-                                         2 * 1024 * 1024,
+                                         16 * 1024 * 1024,
                                          60 * 1000).await;
 
                 //注册创建的有序内存表
@@ -1712,6 +1751,76 @@ impl<
             if let KVDBTransaction::MetaTabTr(tr) = meta_table_tr {
                 if let Err(e) = tr.upsert(Binary::new(name.as_bytes().to_vec()),
                                                Binary::from(meta.clone())).await {
+                    //写入表的元信息失败，则立即返回错误原因
+                    return Err(Error::new(ErrorKind::Other,
+                                          format!("Create table failed, name: {:?}, meta: {:?}, reason: {:?}", name, meta, e)));
+                }
+            } else {
+                //不是元信息表事务，则立即返回错误原因
+                return Err(Error::new(ErrorKind::Other,
+                                      format!("Create table failed, name: {:?}, meta: {:?}, reason: invalid meta table transaction", name, meta)));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// 异步修复创建表，表名可以是用文件分隔符分隔的路径，但必须是相对路径，且不允许使用".."
+    #[inline]
+    async fn repair_create_table(&self,
+                                 name: Atom,
+                                 meta: KVTableMeta) -> IOResult<()> {
+        //检查待创建的指定名称的表是否存在
+        let meta_table_name = Atom::from(DEFAULT_DB_TABLES_META_DIR);
+        let mut tables = self.0.db_mgr.0.tables.write().await;
+
+        self.0.persistence.store(true, Ordering::Relaxed); //创建表的操作，一定会创建元信息表事务，而元信息表事务是需要持久化的事务，则根事务也设置为需要持久化
+
+        //待创建的指定名称的表不存在，则创建指定名称的表，并将表的元信息注册到元信息表
+        match meta.table_type {
+            KVDBTableType::MemOrdTab => {
+                //创建一个有序内存表
+                let table = MemoryOrderedTable::new(name.clone(),
+                                                    meta.persistence);
+
+                //注册创建的有序内存表
+                tables.insert(name.clone(), KVDBTable::MemOrdTab(table));
+            },
+            KVDBTableType::LogOrdTab => {
+                //创建一个有序日志表
+                let table_path = self.0.db_mgr.0.tables_path.join(name.as_str()); //通过键值对数据库的表所在目录的路径与表名，生成表所在目录的路径
+                let table =
+                    LogOrderedTable::new(self.0.db_mgr.0.rt.clone(),
+                                         table_path,
+                                         name.clone(),
+                                         512 * 1024 * 1024,
+                                         2 * 1024 * 1024,
+                                         None,
+                                         2 * 1024 * 1024,
+                                         true,
+                                         16 * 1024 * 1024,
+                                         60 * 1000).await;
+
+                //注册创建的有序内存表
+                tables.insert(name.clone(), KVDBTable::LogOrdTab(table));
+            },
+        }
+
+        //注册表的元信息
+        if let Some(meta_table) = tables.get(&meta_table_name) {
+            //元信息表存在，则获取元信息表事务，并查询指定表的元信息
+            let mut childes_map = self.0.childs_map.lock();
+            let meta_table_tr = if let Some(table_tr) = childes_map.get(&meta_table_name) {
+                //元信息表的子事务存在
+                table_tr.clone()
+            } else {
+                //元信息表的子事务不存在，则创建元信息表的事务
+                self.table_transaction(meta_table_name, meta_table, &mut *childes_map)
+            };
+
+            if let KVDBTransaction::MetaTabTr(tr) = meta_table_tr {
+                if let Err(e) = tr.upsert(Binary::new(name.as_bytes().to_vec()),
+                                          Binary::from(meta.clone())).await {
                     //写入表的元信息失败，则立即返回错误原因
                     return Err(Error::new(ErrorKind::Other,
                                           format!("Create table failed, name: {:?}, meta: {:?}, reason: {:?}", name, meta, e)));
@@ -1761,6 +1870,12 @@ impl<
         }
 
         Ok(())
+    }
+
+    /// 异步修复移除表
+    #[inline]
+    async fn repair_remove_table(&self, table: Atom) -> IOResult<()> {
+        self.remove_table(table).await
     }
 
     /// 异步查询多个表和键的值的结果集
@@ -2172,6 +2287,20 @@ impl<
     /// 异步提交本次事务对键值对数据库的所有修改
     #[inline]
     async fn commit_modified(&self, prepare_output: Vec<u8>) -> Result<(), KVTableTrError> {
+        if self.is_writable()
+            && self.is_require_persistence()
+            && prepare_output.is_empty() {
+            //当前事务是可写且需要持久化的事务，但预提交输出为空，则立即完成本次键值对数据库事务
+            //一般只出现在事务中只有创建或删除表操作，且表已创建或已删除
+            self
+                .0
+                .db_mgr
+                .0
+                .tr_mgr
+                .finish(KVDBTransaction::RootTr(self.clone()));
+            return Ok(());
+        }
+
         //为本次事务的异步提交确认，创建提交确认回调
         let commit_confirm = KVDBCommitConfirm::new(self.0.db_mgr.0.rt.clone(),
                                                     self.0.db_mgr.0.tr_mgr.commit_logger(),

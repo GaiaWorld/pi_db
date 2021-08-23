@@ -381,6 +381,7 @@ impl<
             //本次事务的所有子事务已确认提交，则异步的确认本次事务已提交，并立即返回成功
             let confirmer = self.clone();
             let _ = (self.0).0.spawn((self.0).0.alloc(), async move {
+                //事务已确认提交
                 if let Err(e) = (confirmer.0)
                     .1
                     .confirm(cid.clone())
