@@ -39,7 +39,9 @@ use crate::{Binary,
                      mem_ord_table::{MemoryOrderedTable,
                                      MemOrdTabTr},
                      log_ord_table::{LogOrderedTable,
-                                     LogOrdTabTr}}};
+                                     LogOrdTabTr},
+                     log_write_table::{LogWriteTable,
+                                       LogWTabTr}}};
 use crate::db::KVDBTable::MetaTab;
 
 ///
@@ -373,6 +375,13 @@ impl<
                     None
                 }
             },
+            Some(KVDBTable::LogWTab(table)) => {
+                if let Some(path) = table.path() {
+                    Some(path.to_path_buf())
+                } else {
+                    None
+                }
+            },
         }
     }
 
@@ -387,6 +396,9 @@ impl<
                 Some(table.is_persistent())
             },
             Some(KVDBTable::LogOrdTab(table)) => {
+                Some(table.is_persistent())
+            },
+            Some(KVDBTable::LogWTab(table)) => {
                 Some(table.is_persistent())
             },
         }
@@ -405,6 +417,9 @@ impl<
             Some(KVDBTable::LogOrdTab(table)) => {
                 Some(table.is_ordered())
             },
+            Some(KVDBTable::LogWTab(table)) => {
+                Some(table.is_ordered())
+            },
         }
     }
 
@@ -419,6 +434,9 @@ impl<
                 Some(table.len())
             },
             Some(KVDBTable::LogOrdTab(table)) => {
+                Some(table.len())
+            },
+            Some(KVDBTable::LogWTab(table)) => {
                 Some(table.len())
             },
         }
@@ -584,6 +602,7 @@ pub enum KVDBTransaction<
     MetaTabTr(MetaTabTr<C, Log>),       //元信息表事务
     MemOrdTabTr(MemOrdTabTr<C, Log>),   //有序内存表事务
     LogOrdTabTr(LogOrdTabTr<C, Log>),   //有序日志表事务
+    LogWTabTr(LogWTabTr<C, Log>),       //只写日志表事务
 }
 
 unsafe impl<
@@ -616,6 +635,9 @@ impl<
             KVDBTransaction::LogOrdTabTr(tr) => {
                 tr.is_writable()
             },
+            KVDBTransaction::LogWTabTr(tr) => {
+                tr.is_writable()
+            },
         }
     }
 
@@ -632,6 +654,9 @@ impl<
                 tr.is_concurrent_commit()
             },
             KVDBTransaction::LogOrdTabTr(tr) => {
+                tr.is_concurrent_commit()
+            },
+            KVDBTransaction::LogWTabTr(tr) => {
                 tr.is_concurrent_commit()
             },
         }
@@ -652,6 +677,9 @@ impl<
             KVDBTransaction::LogOrdTabTr(tr) => {
                 tr.is_concurrent_rollback()
             },
+            KVDBTransaction::LogWTabTr(tr) => {
+                tr.is_concurrent_rollback()
+            },
         }
     }
 
@@ -667,6 +695,9 @@ impl<
                 tr.get_source()
             },
             KVDBTransaction::LogOrdTabTr(tr) => {
+                tr.get_source()
+            },
+            KVDBTransaction::LogWTabTr(tr) => {
                 tr.get_source()
             },
         }
@@ -687,6 +718,9 @@ impl<
             KVDBTransaction::LogOrdTabTr(tr) => {
                 tr.init()
             },
+            KVDBTransaction::LogWTabTr(tr) => {
+                tr.init()
+            },
         }
     }
 
@@ -703,6 +737,9 @@ impl<
                 tr.rollback()
             },
             KVDBTransaction::LogOrdTabTr(tr) => {
+                tr.rollback()
+            },
+            KVDBTransaction::LogWTabTr(tr) => {
                 tr.rollback()
             },
         }
@@ -736,6 +773,9 @@ impl<
             KVDBTransaction::LogOrdTabTr(tr) => {
                 tr.is_require_persistence()
             },
+            KVDBTransaction::LogWTabTr(tr) => {
+                tr.is_require_persistence()
+            },
         }
     }
 
@@ -751,6 +791,9 @@ impl<
                 tr.is_concurrent_prepare()
             },
             KVDBTransaction::LogOrdTabTr(tr) => {
+                tr.is_concurrent_prepare()
+            },
+            KVDBTransaction::LogWTabTr(tr) => {
                 tr.is_concurrent_prepare()
             },
         }
@@ -770,6 +813,9 @@ impl<
             KVDBTransaction::LogOrdTabTr(tr) => {
                 tr.is_enable_inherit_uid()
             },
+            KVDBTransaction::LogWTabTr(tr) => {
+                tr.is_enable_inherit_uid()
+            },
         }
     }
 
@@ -785,6 +831,9 @@ impl<
                 tr.get_transaction_uid()
             },
             KVDBTransaction::LogOrdTabTr(tr) => {
+                tr.get_transaction_uid()
+            },
+            KVDBTransaction::LogWTabTr(tr) => {
                 tr.get_transaction_uid()
             },
         }
@@ -804,6 +853,9 @@ impl<
             KVDBTransaction::LogOrdTabTr(tr) => {
                 tr.set_transaction_uid(uid);
             },
+            KVDBTransaction::LogWTabTr(tr) => {
+                tr.set_transaction_uid(uid);
+            },
         }
     }
 
@@ -819,6 +871,9 @@ impl<
                 tr.get_prepare_uid()
             },
             KVDBTransaction::LogOrdTabTr(tr) => {
+                tr.get_prepare_uid()
+            },
+            KVDBTransaction::LogWTabTr(tr) => {
                 tr.get_prepare_uid()
             },
         }
@@ -838,6 +893,9 @@ impl<
             KVDBTransaction::LogOrdTabTr(tr) => {
                 tr.set_prepare_uid(uid);
             },
+            KVDBTransaction::LogWTabTr(tr) => {
+                tr.set_prepare_uid(uid);
+            },
         }
     }
 
@@ -853,6 +911,9 @@ impl<
                 tr.get_commit_uid()
             },
             KVDBTransaction::LogOrdTabTr(tr) => {
+                tr.get_commit_uid()
+            },
+            KVDBTransaction::LogWTabTr(tr) => {
                 tr.get_commit_uid()
             },
         }
@@ -872,6 +933,9 @@ impl<
             KVDBTransaction::LogOrdTabTr(tr) => {
                 tr.set_commit_uid(uid);
             },
+            KVDBTransaction::LogWTabTr(tr) => {
+                tr.set_commit_uid(uid);
+            },
         }
     }
 
@@ -889,6 +953,9 @@ impl<
             KVDBTransaction::LogOrdTabTr(tr) => {
                 tr.get_prepare_timeout()
             },
+            KVDBTransaction::LogWTabTr(tr) => {
+                tr.get_prepare_timeout()
+            },
         }
     }
 
@@ -904,6 +971,9 @@ impl<
                 tr.get_commit_timeout()
             },
             KVDBTransaction::LogOrdTabTr(tr) => {
+                tr.get_commit_timeout()
+            },
+            KVDBTransaction::LogWTabTr(tr) => {
                 tr.get_commit_timeout()
             },
         }
@@ -924,6 +994,9 @@ impl<
             KVDBTransaction::LogOrdTabTr(tr) => {
                 tr.prepare()
             },
+            KVDBTransaction::LogWTabTr(tr) => {
+                tr.prepare()
+            },
         }
     }
 
@@ -940,6 +1013,9 @@ impl<
                 tr.commit(confirm)
             },
             KVDBTransaction::LogOrdTabTr(tr) => {
+                tr.commit(confirm)
+            },
+            KVDBTransaction::LogWTabTr(tr) => {
                 tr.commit(confirm)
             },
         }
@@ -967,6 +1043,9 @@ impl<
             KVDBTransaction::LogOrdTabTr(tr) => {
                 tr.is_unit()
             },
+            KVDBTransaction::LogWTabTr(tr) => {
+                tr.is_unit()
+            },
         }
     }
 
@@ -982,6 +1061,9 @@ impl<
                 tr.get_status()
             },
             KVDBTransaction::LogOrdTabTr(tr) => {
+                tr.get_status()
+            },
+            KVDBTransaction::LogWTabTr(tr) => {
                 tr.get_status()
             },
         }
@@ -1001,6 +1083,9 @@ impl<
             KVDBTransaction::LogOrdTabTr(tr) => {
                 tr.set_status(status);
             },
+            KVDBTransaction::LogWTabTr(tr) => {
+                tr.set_status(status);
+            },
         }
     }
 
@@ -1016,6 +1101,9 @@ impl<
                 tr.qos()
             },
             KVDBTransaction::LogOrdTabTr(tr) => {
+                tr.qos()
+            },
+            KVDBTransaction::LogWTabTr(tr) => {
                 tr.qos()
             },
         }
@@ -1063,6 +1151,9 @@ impl<
             KVDBTransaction::LogOrdTabTr(tr) => {
                 tr.is_tree()
             },
+            KVDBTransaction::LogWTabTr(tr) => {
+                tr.is_tree()
+            },
         }
     }
 
@@ -1080,6 +1171,9 @@ impl<
             KVDBTransaction::LogOrdTabTr(tr) => {
                 tr.children_len()
             },
+            KVDBTransaction::LogWTabTr(tr) => {
+                tr.children_len()
+            },
         }
     }
 
@@ -1095,6 +1189,9 @@ impl<
                 tr.to_children()
             },
             KVDBTransaction::LogOrdTabTr(tr) => {
+                tr.to_children()
+            },
+            KVDBTransaction::LogWTabTr(tr) => {
                 tr.to_children()
             },
         }
@@ -1632,6 +1729,19 @@ impl<
 
                 table_tr
             },
+            KVDBTable::LogWTab(tab) => {
+                let tr = tab.transaction(self.get_source(),
+                                         self.is_writable(),
+                                         self.get_prepare_timeout(),
+                                         self.get_commit_timeout());
+                let table_tr = KVDBTransaction::LogWTabTr(tr);
+
+                //注册到键值对数据库的根事务
+                childes_map.insert(name, table_tr.clone());
+                self.0.childs.lock().join(table_tr.clone());
+
+                table_tr
+            },
         }
     }
 }
@@ -1731,8 +1841,26 @@ impl<
                                          16 * 1024 * 1024,
                                          60 * 1000).await;
 
-                //注册创建的有序内存表
+                //注册创建的有序日志表
                 tables.insert(name.clone(), KVDBTable::LogOrdTab(table));
+            },
+            KVDBTableType::LogWTab => {
+                //创建一个只写日志表
+                let table_path = self.0.db_mgr.0.tables_path.join(name.as_str()); //通过键值对数据库的表所在目录的路径与表名，生成表所在目录的路径
+                let table =
+                    LogWriteTable::new(self.0.db_mgr.0.rt.clone(),
+                                         table_path,
+                                         name.clone(),
+                                         512 * 1024 * 1024,
+                                         2 * 1024 * 1024,
+                                         None,
+                                         2 * 1024 * 1024,
+                                         true,
+                                         16 * 1024 * 1024,
+                                         60 * 1000).await;
+
+                //注册创建的只写日志表
+                tables.insert(name.clone(), KVDBTable::LogWTab(table));
             },
         }
 
@@ -1801,8 +1929,26 @@ impl<
                                          16 * 1024 * 1024,
                                          60 * 1000).await;
 
-                //注册创建的有序内存表
+                //注册创建的有序日志表
                 tables.insert(name.clone(), KVDBTable::LogOrdTab(table));
+            },
+            KVDBTableType::LogWTab => {
+                //创建一个只写日志表
+                let table_path = self.0.db_mgr.0.tables_path.join(name.as_str()); //通过键值对数据库的表所在目录的路径与表名，生成表所在目录的路径
+                let table =
+                    LogWriteTable::new(self.0.db_mgr.0.rt.clone(),
+                                       table_path,
+                                       name.clone(),
+                                       512 * 1024 * 1024,
+                                       2 * 1024 * 1024,
+                                       None,
+                                       2 * 1024 * 1024,
+                                       true,
+                                       16 * 1024 * 1024,
+                                       60 * 1000).await;
+
+                //注册创建的只写日志表
+                tables.insert(name.clone(), KVDBTable::LogWTab(table));
             },
         }
 
@@ -1916,6 +2062,11 @@ impl<
                         let value = tr.query(table_kv.key).await;
                         result.push(value);
                     },
+                    KVDBTransaction::LogWTabTr(tr) => {
+                        //查询只写日志表的指定关键字的值
+                        let value = tr.query(table_kv.key).await;
+                        result.push(value);
+                    },
                 }
             } else {
                 //指定名称的表不存在
@@ -1978,6 +2129,16 @@ impl<
                             //有值则插入或更新
                             if let Err(e) = tr.upsert(table_kv.key, value).await {
                                 //插入或更新有序日志表的指定关键字的值错误，则立即返回错误原因
+                                return Err(e);
+                            }
+                        }
+                    },
+                    KVDBTransaction::LogWTabTr(tr) => {
+                        //插入或更新只写日志表的指定关键字的值
+                        if let Some(value) = table_kv.value {
+                            //有值则插入或更新
+                            if let Err(e) = tr.upsert(table_kv.key, value).await {
+                                //插入或更新只写日志表的指定关键字的值错误，则立即返回错误原因
                                 return Err(e);
                             }
                         }
@@ -2057,6 +2218,19 @@ impl<
                             },
                         }
                     },
+                    KVDBTransaction::LogWTabTr(tr) => {
+                        //删除只写日志表的指定关键字的值
+                        match tr.delete(table_kv.key).await {
+                            Err(e) => {
+                                //删除只写日志表的指定关键字的值错误，则立即返回错误原因
+                                return Err(e);
+                            },
+                            Ok(value) => {
+                                //删除只写日志表的指定关键字的值成功
+                                result.push(value);
+                            },
+                        }
+                    },
                 }
             } else {
                 //指定名称的表不存在
@@ -2102,6 +2276,10 @@ impl<
                     //获取有序日志表的关键字的异步流
                     Some(tr.keys(key, descending))
                 },
+                KVDBTransaction::LogWTabTr(tr) => {
+                    //获取只写日志表的关键字的异步流
+                    Some(tr.keys(key, descending))
+                },
             }
         } else {
             //指定名称的表不存在
@@ -2141,6 +2319,10 @@ impl<
                 },
                 KVDBTransaction::LogOrdTabTr(tr) => {
                     //获取有序日志表的键值对异步流
+                    Some(tr.values(key, descending))
+                },
+                KVDBTransaction::LogWTabTr(tr) => {
+                    //获取只写日志表的键值对异步流
                     Some(tr.values(key, descending))
                 },
             }
@@ -2183,6 +2365,10 @@ impl<
                     //锁住有序日志表的指定关键字
                     tr.lock_key(key).await
                 },
+                KVDBTransaction::LogWTabTr(tr) => {
+                    //锁住只写日志表的指定关键字
+                    tr.lock_key(key).await
+                },
             }
         } else {
             //指定名称的表不存在
@@ -2221,6 +2407,10 @@ impl<
                 },
                 KVDBTransaction::LogOrdTabTr(tr) => {
                     //解锁有序日志表的指定关键字
+                    tr.unlock_key(key).await
+                },
+                KVDBTransaction::LogWTabTr(tr) => {
+                    //解锁只写日志表的指定关键字
                     tr.unlock_key(key).await
                 },
             }
@@ -2368,6 +2558,9 @@ impl<
                 KVDBTransaction::LogOrdTabTr(tr) => {
                     tr.prepare_repair(transaction_uid.clone());
                 },
+                KVDBTransaction::LogWTabTr(tr) => {
+                    tr.prepare_repair(transaction_uid.clone());
+                },
                 KVDBTransaction::RootTr(_) => {
                     //忽略根事务，并继续执行下一个子事务的预提交修复
                     continue;
@@ -2449,6 +2642,7 @@ pub enum KVDBTable<
     MetaTab(MetaTable<C, Log>),             //元信息表
     MemOrdTab(MemoryOrderedTable<C, Log>),  //有序内存表
     LogOrdTab(LogOrderedTable<C, Log>),     //有序日志表
+    LogWTab(LogWriteTable<C, Log>),         //只写日志表
 }
 
 unsafe impl<

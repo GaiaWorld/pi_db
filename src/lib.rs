@@ -158,6 +158,7 @@ pub trait KVAction: Send + Sync + 'static {
 pub enum KVDBTableType {
     MemOrdTab = 1,  //有序内存表
     LogOrdTab,      //有序日志表
+    LogWTab,        //只写日志表
 }
 
 impl From<u8> for KVDBTableType {
@@ -165,6 +166,7 @@ impl From<u8> for KVDBTableType {
         match src {
             1 => KVDBTableType::MemOrdTab,
             2 => KVDBTableType::LogOrdTab,
+            3 => KVDBTableType::LogWTab,
             _ => panic!("From u8 to KVDBTableType failed, src: {}, reason: invalid src", src),
         }
     }
