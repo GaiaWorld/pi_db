@@ -1165,7 +1165,7 @@ fn bench_table_conflict(b: &mut Bencher) {
         let (s, r) = unbounded();
 
         let now = Instant::now();
-        for key in 0..100usize {
+        for key in 0..32usize {
             let rt_copy_ = rt_copy.clone();
             let db_copy = db.clone();
             let table_name0 = Atom::from("test_log0");
@@ -1256,7 +1256,7 @@ fn bench_table_conflict(b: &mut Bencher) {
                     }
 
                     count += 1;
-                    if count >= 100 {
+                    if count >= 32 {
                         break;
                     }
                 },
