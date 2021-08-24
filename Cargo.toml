@@ -26,4 +26,5 @@ sinfo = { path = "../pi_lib/sinfo" }
 [dev-dependencies]
 crossbeam-channel = "0.5"
 env_logger = "0.9"
+fastrand = "1.5"
 time = { path = "../pi_lib/time" }

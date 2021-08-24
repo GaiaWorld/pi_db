@@ -413,7 +413,7 @@ impl TransactionError for KVTableTrError {
         where E: Debug + Sized + 'static {
         KVTableTrError {
             level,
-            reason: format!("Memory ordered table transaction error, reason: {:?}", reason),
+            reason: format!("Table transaction error, reason: {:?}", reason),
         }
     }
 }
