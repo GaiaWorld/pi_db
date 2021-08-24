@@ -1103,9 +1103,6 @@ fn test_log_write_table() {
                 rt_copy.wait_timeout(1500).await;
                 println!("");
 
-                rt_copy.wait_timeout(1500).await;
-                println!("");
-
                 let mut table_kv_list = Vec::new();
                 for key in 0..10u8 {
                     table_kv_list.push(TableKV {
