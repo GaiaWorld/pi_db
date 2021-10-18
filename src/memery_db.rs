@@ -501,7 +501,8 @@ impl MemeryTxn {
 
 	//提交
 	pub async fn commit_inner(&mut self) -> CommitResult {
-		let logs = self.tab.0.lock().await.prepare.remove(&self.id);
+		let prepare = &mut self.tab.0.lock().await.prepare;
+		let logs = prepare.get(&self.id);
 		let logs = match logs {
 			Some(rwlog) => {
 				let root_if_eq = self.tab.0.lock().await.root.ptr_eq(&self.old);
@@ -528,9 +529,13 @@ impl MemeryTxn {
 				} else {
 					self.tab.0.lock().await.root = self.root.clone();
 				}
-				rwlog
+
+				prepare.remove(&self.id).unwrap()
 			},
-			None => return Err(String::from("error prepare null"))
+			None => {
+				let _ = prepare.remove(&self.id);
+				return Err(String::from("error prepare null"))
+			}
 		};
 
 		self.tab.0.lock().await.commit_count.sum(1);

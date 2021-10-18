@@ -665,36 +665,42 @@ impl FileMemTxn {
 
 	//提交
 	pub async fn commit_inner(&mut self) -> CommitResult {
-		let mut lock = self.tab.0.lock().await;
-		let logs = lock.prepare.remove(&self.id);
-		let logs = match logs {
-			Some(rwlog) => {
-				let root_if_eq = lock.root.ptr_eq(&self.old);
-				//判断根节点是否相等
-				if !root_if_eq {
-					for (k, rw_v) in rwlog.iter() {
-						match rw_v {
-							RwLog::Read => (),
-							_ => {
-								let k = Bon::new(k.clone());
-								match rw_v {
-									RwLog::Write(None) => {
-										lock.root.delete(&k, false);
-									},
-									RwLog::Write(Some(v)) => {
-										lock.root.upsert(k.clone(), v.clone(), false);
-									},
-									_ => (),
-								}
-							},
+		let logs = {
+			let mut lock = self.tab.0.lock().await;
+			let logs = lock.prepare.get(&self.id);
+			match logs {
+				Some(rwlog) => {
+					let root_if_eq = lock.root.ptr_eq(&self.old);
+					//判断根节点是否相等
+					if !root_if_eq {
+						for (k, rw_v) in rwlog.iter() {
+							match rw_v {
+								RwLog::Read => (),
+								_ => {
+									let k = Bon::new(k.clone());
+									match rw_v {
+										RwLog::Write(None) => {
+											lock.root.delete(&k, false);
+										},
+										RwLog::Write(Some(v)) => {
+											lock.root.upsert(k.clone(), v.clone(), false);
+										},
+										_ => (),
+									}
+								},
+							}
 						}
+					} else {
+						lock.root = self.root.clone();
 					}
-				} else {
-					lock.root = self.root.clone();
+
+					lock.prepare.remove(&self.id).unwrap()
 				}
-				rwlog
+				None => {
+					let _ = prepare.remove(&self.id);
+					return Err(String::from("error prepare null"))
+				}
 			}
-			None => return Err(String::from("error prepare null"))
 		};
 
 		let async_tab = self.tab.1.clone();
