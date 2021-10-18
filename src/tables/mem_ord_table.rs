@@ -362,35 +362,41 @@ impl<
         async move {
             //移除事务在有序内存表的预提交表中的操作记录
             let transaction_uid = tr.get_transaction_uid().unwrap();
-            let mut table_prepare = tr
-                .0
-                .table
-                .0
-                .prepare
-                .lock();
-            let actions = table_prepare.get(&transaction_uid);
 
-            //更新有序内存表的根节点
-            let actions = actions.unwrap();
-            let b = tr.0.table.0.root.lock().ptr_eq(&tr.0.root_ref);
-            if !b {
-                //有序内存表的根节点在当前事务执行过程中已改变
-                for (key, action) in actions.iter() {
-                    match action {
-                        KVActionLog::Write(None) => {
-                            //删除指定关键字
-                            tr.0.table.0.root.lock().delete(key, false);
-                        },
-                        KVActionLog::Write(Some(value)) => {
-                            //插入或更新指定关键字
-                            tr.0.table.0.root.lock().upsert(key.clone(), value.clone(), false);
-                        },
-                        KVActionLog::Read => (), //忽略读操作
+            {
+                let mut table_prepare = tr
+                    .0
+                    .table
+                    .0
+                    .prepare
+                    .lock();
+                let actions = table_prepare.get(&transaction_uid); //获取有序内存表，本次事务预提交成功的相关操作记录
+
+                //更新有序内存表的根节点
+                let actions = actions.unwrap();
+                let b = tr.0.table.0.root.lock().ptr_eq(&tr.0.root_ref);
+                if !b {
+                    //有序内存表的根节点在当前事务执行过程中已改变
+                    for (key, action) in actions.iter() {
+                        match action {
+                            KVActionLog::Write(None) => {
+                                //删除指定关键字
+                                tr.0.table.0.root.lock().delete(key, false);
+                            },
+                            KVActionLog::Write(Some(value)) => {
+                                //插入或更新指定关键字
+                                tr.0.table.0.root.lock().upsert(key.clone(), value.clone(), false);
+                            },
+                            KVActionLog::Read => (), //忽略读操作
+                        }
                     }
+                } else {
+                    //有序内存表的根节点在当前事务执行过程中未改变，则用本次事务修改并提交成功的根节点替换有序内存表的根节点
+                    *tr.0.table.0.root.lock() = tr.0.root_mut.lock().clone();
                 }
-            } else {
-                //有序内存表的根节点在当前事务执行过程中未改变，则用本次事务修改并提交成功的根节点替换有序内存表的根节点
-                *tr.0.table.0.root.lock() = tr.0.root_mut.lock().clone();
+
+                //有序内存表提交完成后，从有序内存表的预提交表中移除当前事务的操作记录
+                let _ = table_prepare.remove(&transaction_uid);
             }
 
             if tr.is_require_persistence() {
@@ -401,7 +407,6 @@ impl<
                 }
             }
 
-            let _ = table_prepare.remove(&transaction_uid); //表提交完成后，从表的预提交表中移除当前事务的操作记录
             Ok(())
         }.boxed()
     }
