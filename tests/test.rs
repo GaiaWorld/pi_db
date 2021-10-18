@@ -1,8 +1,10 @@
 use std::convert::TryInto;
 use std::io::Result as IOResult;
+use std::time::Instant;
 
 use futures::{future::{FutureExt, BoxFuture},
               stream::{StreamExt, BoxStream}};
+use crossbeam_channel::unbounded;
 use bytes::BufMut;
 use env_logger;
 
@@ -317,6 +319,193 @@ fn test_memory_table() {
                             },
                         }
                     },
+                }
+            },
+        }
+    });
+
+    thread::sleep(Duration::from_millis(1000000000));
+}
+
+#[test]
+fn test_memory_table_conflict() {
+    use std::thread;
+    use std::time::Duration;
+
+    let builder = MultiTaskRuntimeBuilder::default();
+    let rt = builder.build();
+    let rt_copy = rt.clone();
+
+    rt.spawn(rt.alloc(), async move {
+        let guid_gen = GuidGen::new(run_nanos(), 0);
+        let commit_logger_builder = CommitLoggerBuilder::new(rt_copy.clone(), "./.commit_log");
+        let commit_logger = commit_logger_builder
+            .build()
+            .await
+            .unwrap();
+
+        let tr_mgr = Transaction2PcManager::new(rt_copy.clone(),
+                                                guid_gen,
+                                                commit_logger);
+
+        let mut builder = KVDBManagerBuilder::new(rt_copy.clone(), tr_mgr, "./db");
+        match builder.startup().await {
+            Err(e) => {
+                panic!(e);
+            },
+            Ok(db) => {
+                println!("!!!!!!db table size: {:?}", db.table_size().await);
+
+                let table_name = Atom::from("test_memory");
+                let tr = db.transaction(table_name.clone(), true, 500, 500).unwrap();
+                if let Err(e) = tr.create_table(table_name.clone(),
+                                                KVTableMeta::new(KVDBTableType::MemOrdTab,
+                                                                 false,
+                                                                 EnumType::U8,
+                                                                 EnumType::Usize)).await {
+                    //创建有序内存表失败
+                    println!("!!!!!!create memory ordered table failed, reason: {:?}", e);
+                }
+                let output = tr.prepare_modified().await.unwrap();
+                let _ = tr.commit_modified(output).await;
+
+                println!("!!!!!!db table size: {:?}", db.table_size().await);
+
+                //查询表信息
+                rt_copy.wait_timeout(1500).await;
+                println!("");
+
+                println!("!!!!!!test_memory is exist: {:?}", db.is_exist(&table_name).await);
+                println!("!!!!!!test_memory is ordered table: {:?}", db.is_ordered_table(&table_name).await);
+                println!("!!!!!!test_memory is persistent table: {:?}", db.is_persistent_table(&table_name).await);
+                println!("!!!!!!test_memory table_dir: {:?}", db.table_path(&table_name).await);
+                println!("!!!!!!test_memory table len: {:?}", db.table_record_size(&table_name).await);
+
+                //操作数据库事务
+                rt_copy.wait_timeout(1500).await;
+                println!("");
+
+                {
+                    let tr = db.transaction(table_name.clone(), true, 500, 500).unwrap();
+
+                    let _r = tr.upsert(vec![
+                        TableKV {
+                            table: table_name.clone(),
+                            key: Binary::new(vec![0]),
+                            value: Some(Binary::new(0usize.to_le_bytes().to_vec()))
+                        }
+                    ]).await;
+
+                    if let Ok(output) = tr.prepare_modified().await {
+                        tr.commit_modified(output).await.is_ok();
+                    }
+                }
+
+                let (sender, receiver) = unbounded();
+                let start = Instant::now();
+                for index in 0..1000 {
+                    let db_copy = db.clone();
+                    let table_name_copy = table_name.clone();
+                    let sender_copy = sender.clone();
+
+                    rt_copy.spawn(rt_copy.alloc(), async move {
+                        let now = Instant::now();
+                        let mut is_ok = false;
+
+                        while now.elapsed().as_millis() <= 5000 {
+                            let tr = db_copy.transaction(Atom::from("test memory table"), true, 500, 500).unwrap();
+                            let r = tr.query(vec![
+                                TableKV {
+                                    table: table_name_copy.clone(),
+                                    key: Binary::new(vec![0]),
+                                    value: None
+                                }
+                            ]).await;
+                            let last_value = usize::from_le_bytes(r[0].as_ref().unwrap().as_ref().try_into().unwrap());
+
+                            let new_value = last_value + 1;
+                            let _r = tr.upsert(vec![
+                                TableKV {
+                                    table: table_name_copy.clone(),
+                                    key: Binary::new(vec![0]),
+                                    value: Some(Binary::new(new_value.to_le_bytes().to_vec()))
+                                }
+                            ]).await;
+
+                            match tr.prepare_modified().await {
+                                Err(_e) => {
+                                    if let Err(e) = tr.rollback_modified().await {
+                                        println!("rollback failed, reason: {:?}", e);
+                                    } else {
+                                        continue;
+                                    }
+                                },
+                                Ok(output) => {
+                                    // println!("!!!!!!index: {}, last: {}, new: {}", index, last_value, new_value);
+                                    match tr.commit_modified(output).await {
+                                        Err(e) => {
+                                            if let ErrorLevel::Fatal = &e.level() {
+                                                println!("rollback failed, reason: commit fatal error");
+                                            } else {
+                                                if let Err(e) = tr.rollback_modified().await {
+                                                    println!("rollback failed, reason: {:?}", e);
+                                                } else {
+                                                    continue;
+                                                }
+                                            }
+                                        },
+                                        Ok(()) => {
+                                            is_ok = true;
+                                            break;
+                                        },
+                                    }
+                                },
+                            }
+                        }
+
+                        if !is_ok {
+                            println!("writed timeout");
+                        }
+
+                        sender_copy.send(());
+                    });
+                }
+
+                let mut count = 0;
+                loop {
+                    match receiver.recv_timeout(Duration::from_millis(10000)) {
+                        Err(e) => {
+                            println!(
+                                "!!!!!!recv timeout, len: {}, timer_len: {}, e: {:?}",
+                                rt_copy.timing_len(),
+                                rt_copy.len(),
+                                e
+                            );
+                            continue;
+                        },
+                        Ok(_result) => {
+                            count += 1;
+                            if count >= 1000 {
+                                println!("!!!!!!time: {:?}, count: {}", start.elapsed(), count);
+                                break;
+                            }
+                        },
+                    }
+                }
+
+                {
+                    let tr = db.transaction(Atom::from("test memory table"), true, 500, 500).unwrap();
+
+                    let r = tr.query(vec![
+                        TableKV {
+                            table: table_name.clone(),
+                            key: Binary::new(vec![0]),
+                            value: None
+                        }
+                    ]).await;
+                    let last_value = usize::from_le_bytes(r[0].as_ref().unwrap().as_ref().try_into().unwrap());
+
+                    assert_eq!(last_value, 1000);
                 }
             },
         }

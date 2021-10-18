@@ -362,7 +362,13 @@ impl<
         async move {
             //移除事务在有序内存表的预提交表中的操作记录
             let transaction_uid = tr.get_transaction_uid().unwrap();
-            let actions = tr.0.table.0.prepare.lock().remove(&transaction_uid);
+            let mut table_prepare = tr
+                .0
+                .table
+                .0
+                .prepare
+                .lock();
+            let actions = table_prepare.get(&transaction_uid);
 
             //更新有序内存表的根节点
             let actions = actions.unwrap();
@@ -390,11 +396,12 @@ impl<
             if tr.is_require_persistence() {
                 //持久化的有序内存表事务，则立即确认提交成功
                 let commit_uid = tr.get_commit_uid().unwrap();
-                if let Err(e) = confirm(transaction_uid, commit_uid, Ok(())) {
+                if let Err(e) = confirm(transaction_uid.clone(), commit_uid, Ok(())) {
                     return Err(e);
                 }
             }
 
+            let _ = table_prepare.remove(&transaction_uid); //表提交完成后，从表的预提交表中移除当前事务的操作记录
             Ok(())
         }.boxed()
     }
@@ -632,8 +639,8 @@ impl<
                     //有序内存表的预提交表中的一个预提交事务与本地预提交事务操作了相同的关键字，且是读操作
                     match action {
                         KVActionLog::Read => {
-                            //本地预提交事务对相同的关键字也执行了读操作，则不存在读写冲突，并立即返回检查成功
-                            return Ok(());
+                            //本地预提交事务对相同的关键字也执行了读操作，则不存在读写冲突，并继续检查预提交表中是否存在读写冲突
+                            continue;
                         },
                         KVActionLog::Write(_) => {
                             //本地预提交事务对相同的关键字执行了写操作，则存在读写冲突
@@ -646,8 +653,8 @@ impl<
                     return Err(<Self as Transaction2Pc>::PrepareError::new_transaction_error(ErrorLevel::Normal, format!("Prepare memory ordered table conflicted, table: {:?}, key: {:?}, source: {:?}, transaction_uid: {:?}, prepare_uid: {:?}, confilicted_transaction_uid: {:?}, reason: writing now", self.0.table.name().as_str(), key, self.0.source, self.get_transaction_uid(), self.get_prepare_uid(), guid)));
                 },
                 None => {
-                    //有序内存表的预提交表中没有任何预提交事务与本地预提交事务操作了相同的关键字，则不存在读写冲突，并立即返回检查成功
-                    return Ok(())
+                    //有序内存表的预提交表中没有任何预提交事务与本地预提交事务操作了相同的关键字，则不存在读写冲突，并继续检查预提交表中是否存在读写冲突
+                    continue;
                 },
             }
         }
