@@ -225,7 +225,7 @@ impl Prepare{
 					let key_str = format!("{:?}", key);
 					return Err(String::from("unexpected meta log type2") + key_str.as_str());
 				}
-				None => return Ok(()),
+				None => continue,
 			}
 		}
 		for (guid, key, log_type) in timeout_tr {
