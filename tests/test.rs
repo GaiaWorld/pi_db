@@ -403,7 +403,7 @@ fn test_memory_table_conflict() {
 
                 let (sender, receiver) = unbounded();
                 let start = Instant::now();
-                for index in 0..1000 {
+                for _ in 0..100000 {
                     let db_copy = db.clone();
                     let table_name_copy = table_name.clone();
                     let sender_copy = sender.clone();
@@ -441,7 +441,6 @@ fn test_memory_table_conflict() {
                                     }
                                 },
                                 Ok(output) => {
-                                    // println!("!!!!!!index: {}, last: {}, new: {}", index, last_value, new_value);
                                     match tr.commit_modified(output).await {
                                         Err(e) => {
                                             if let ErrorLevel::Fatal = &e.level() {
@@ -485,7 +484,7 @@ fn test_memory_table_conflict() {
                         },
                         Ok(_result) => {
                             count += 1;
-                            if count >= 1000 {
+                            if count >= 100000 {
                                 println!("!!!!!!time: {:?}, count: {}", start.elapsed(), count);
                                 break;
                             }
@@ -505,7 +504,7 @@ fn test_memory_table_conflict() {
                     ]).await;
                     let last_value = usize::from_le_bytes(r[0].as_ref().unwrap().as_ref().try_into().unwrap());
 
-                    assert_eq!(last_value, 1000);
+                    assert_eq!(last_value, 100000);
                 }
             },
         }
