@@ -666,8 +666,9 @@ impl FileMemTxn {
 	//提交
 	pub async fn commit_inner(&mut self) -> CommitResult {
 		let logs = {
-			if let Some(rwlog) = self.tab.0.lock().await.prepare.get(&self.id) {
-				let root_if_eq = self.tab.0.lock().await.root.ptr_eq(&self.old);
+			let mut lock = self.tab.0.lock().await;
+			if let Some(rwlog) = lock.prepare.remove(&self.id) {
+				let root_if_eq = lock.root.ptr_eq(&self.old);
 				//判断根节点是否相等
 				if !root_if_eq {
 					for (k, rw_v) in rwlog.iter() {
@@ -677,10 +678,10 @@ impl FileMemTxn {
 								let k = Bon::new(k.clone());
 								match rw_v {
 									RwLog::Write(None) => {
-										self.tab.0.lock().await.root.delete(&k, false);
+										lock.root.delete(&k, false);
 									},
 									RwLog::Write(Some(v)) => {
-										self.tab.0.lock().await.root.upsert(k.clone(), v.clone(), false);
+										lock.root.upsert(k.clone(), v.clone(), false);
 									},
 									_ => (),
 								}
@@ -688,12 +689,10 @@ impl FileMemTxn {
 						}
 					}
 				} else {
-					self.tab.0.lock().await.root = self.root.clone();
+					lock.root = self.root.clone();
 				}
-
-				self.tab.0.lock().await.prepare.remove(&self.id).unwrap()
+				rwlog
 			} else {
-				let _ = self.tab.0.lock().await.prepare.remove(&self.id);
 				return Err(String::from("error prepare null"))
 			}
 		};

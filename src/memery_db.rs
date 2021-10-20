@@ -501,40 +501,39 @@ impl MemeryTxn {
 
 	//提交
 	pub async fn commit_inner(&mut self) -> CommitResult {
-		let prepare = &mut self.tab.0.lock().await.prepare;
-		let logs = prepare.get(&self.id);
-		let logs = match logs {
-			Some(rwlog) => {
-				let root_if_eq = self.tab.0.lock().await.root.ptr_eq(&self.old);
-				//判断根节点是否相等
-				if !root_if_eq {
-					for (k, rw_v) in rwlog.iter() {
-						match rw_v {
-							RwLog::Read => (),
-							_ => {
-								let k = Bon::new(k.clone());
-								match rw_v {
-									RwLog::Write(None) => {
-										self.tab.0.lock().await.root.delete(&k, false);
-									},
-									RwLog::Write(Some(v)) => {
-										self.tab.0.lock().await.root.upsert(k.clone(), v.clone(), false);
-									},
-									_ => (),
-								}
-								()
-							},
+		let logs = {
+			let mut lock = self.tab.0.lock().await;
+			match lock.prepare.remove(&self.id) {
+				Some(rwlog) => {
+					let root_if_eq = lock.root.ptr_eq(&self.old);
+					//判断根节点是否相等
+					if !root_if_eq {
+						for (k, rw_v) in rwlog.iter() {
+							match rw_v {
+								RwLog::Read => (),
+								_ => {
+									let k = Bon::new(k.clone());
+									match rw_v {
+										RwLog::Write(None) => {
+											lock.root.delete(&k, false);
+										},
+										RwLog::Write(Some(v)) => {
+											lock.root.upsert(k.clone(), v.clone(), false);
+										},
+										_ => (),
+									}
+									()
+								},
+							}
 						}
+					} else {
+						lock.root = self.root.clone();
 					}
-				} else {
-					self.tab.0.lock().await.root = self.root.clone();
+					rwlog
+				},
+				None => {
+					return Err(String::from("error prepare null"))
 				}
-
-				prepare.remove(&self.id).unwrap()
-			},
-			None => {
-				let _ = prepare.remove(&self.id);
-				return Err(String::from("error prepare null"))
 			}
 		};
 
