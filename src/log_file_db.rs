@@ -666,40 +666,35 @@ impl FileMemTxn {
 	//提交
 	pub async fn commit_inner(&mut self) -> CommitResult {
 		let logs = {
-			let mut lock = self.tab.0.lock().await;
-			let logs = lock.prepare.get(&self.id);
-			match logs {
-				Some(rwlog) => {
-					let root_if_eq = lock.root.ptr_eq(&self.old);
-					//判断根节点是否相等
-					if !root_if_eq {
-						for (k, rw_v) in rwlog.iter() {
-							match rw_v {
-								RwLog::Read => (),
-								_ => {
-									let k = Bon::new(k.clone());
-									match rw_v {
-										RwLog::Write(None) => {
-											lock.root.delete(&k, false);
-										},
-										RwLog::Write(Some(v)) => {
-											lock.root.upsert(k.clone(), v.clone(), false);
-										},
-										_ => (),
-									}
-								},
-							}
+			if let Some(rwlog) = self.tab.0.lock().await.prepare.get(&self.id) {
+				let root_if_eq = self.tab.0.lock().await.root.ptr_eq(&self.old);
+				//判断根节点是否相等
+				if !root_if_eq {
+					for (k, rw_v) in rwlog.iter() {
+						match rw_v {
+							RwLog::Read => (),
+							_ => {
+								let k = Bon::new(k.clone());
+								match rw_v {
+									RwLog::Write(None) => {
+										self.tab.0.lock().await.root.delete(&k, false);
+									},
+									RwLog::Write(Some(v)) => {
+										self.tab.0.lock().await.root.upsert(k.clone(), v.clone(), false);
+									},
+									_ => (),
+								}
+							},
 						}
-					} else {
-						lock.root = self.root.clone();
 					}
+				} else {
+					self.tab.0.lock().await.root = self.root.clone();
+				}
 
-					lock.prepare.remove(&self.id).unwrap()
-				}
-				None => {
-					let _ = prepare.remove(&self.id);
-					return Err(String::from("error prepare null"))
-				}
+				self.tab.0.lock().await.prepare.remove(&self.id).unwrap()
+			} else {
+				let _ = self.tab.0.lock().await.prepare.remove(&self.id);
+				return Err(String::from("error prepare null"))
 			}
 		};
 
@@ -717,7 +712,7 @@ impl FileMemTxn {
 							delete_keys.push(k);
 						}
 						RwLog::Write(Some(v)) => {
-							insert_pairs.push((k, v));
+							insert_pairs.push((k, v.as_slice()));
 						}
 						_ => {}
 					}
