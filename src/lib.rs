@@ -4,6 +4,7 @@
 use std::ops::Deref;
 use std::fmt::Debug;
 use std::hash::Hash;
+use std::cmp::Ordering as CmpOrdering;
 use std::convert::TryInto;
 use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
 
@@ -24,7 +25,7 @@ pub mod tables;
 ///
 /// 二进制数据
 ///
-#[derive(Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Hash)]
 pub struct Binary(Arc<Vec<u8>>);
 
 unsafe impl Send for Binary {}
@@ -75,6 +76,30 @@ impl From<KVTableMeta> for Binary {
     }
 }
 
+impl Ord for Binary {
+    fn cmp(&self, other: &Binary) -> CmpOrdering {
+        self.partial_cmp(other).unwrap()
+    }
+}
+
+impl PartialOrd for Binary {
+    fn partial_cmp(&self, other: &Binary) -> Option<CmpOrdering> {
+        ReadBuffer::new(self.0.as_slice(), 0)
+            .partial_cmp(&ReadBuffer::new(other.0.as_slice(), 0))
+    }
+}
+
+impl Eq for Binary {}
+
+impl PartialEq for Binary {
+    fn eq(&self, other: &Binary) -> bool {
+        match self.partial_cmp(other){
+            Some(CmpOrdering::Equal) => true,
+            _ => false
+        }
+    }
+}
+
 impl Default for Binary {
     fn default() -> Self {
         Binary(Arc::new(Vec::default()))
@@ -105,6 +130,11 @@ impl Binary {
     /// 获取二进制数据长度
     pub fn len(&self) -> usize {
         self.0.len()
+    }
+
+    /// 将二进制数据转换为共享二进制
+    pub fn to_shared(&self) -> Arc<Vec<u8>> {
+        self.0.clone()
     }
 }
 
