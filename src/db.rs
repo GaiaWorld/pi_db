@@ -495,7 +495,16 @@ impl<
                             for write in writes {
                                 if let Some(value) = write.value {
                                     //有值，则创建表
-                                    let table_name = Atom::from(write.key.as_ref());
+                                    let table_name = match binary_to_table(&write.key) {
+                                        Err(e) => {
+                                            //反序列化表名失败
+                                            panic!("From binary to table name failed, reason: {:?}", e);
+                                        },
+                                        Ok(table_name) => {
+                                            //反序列化表名成功
+                                            table_name
+                                        }
+                                    };
                                     let table_meta = KVTableMeta::from(value);
 
                                     if let Err(e) = tr.repair_create_table(table_name.clone(), table_meta.clone()).await {
