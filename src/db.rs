@@ -11,6 +11,7 @@ use bytes::{Buf, BufMut};
 use log::info;
 
 use atom::Atom;
+use bon::{WriteBuffer, Encode};
 use guid::Guid;
 use r#async::{lock::{spin_lock::SpinLock,
                      rw_lock::RwLock},
@@ -1758,7 +1759,7 @@ impl<
     async fn table_meta(&self, table: Atom) -> Option<KVTableMeta> {
         let meta_table = Atom::from(DEFAULT_DB_TABLES_META_DIR);
         let result = self.query(vec![TableKV::new(meta_table.clone(),
-                                                  Binary::new(table.as_bytes().to_vec()),
+                                                  table_to_binary(&table),
                                                   None)]).await;
         if let Some(binary) = &result[0] {
             //指定名称的表，已注册元信息
@@ -1771,8 +1772,8 @@ impl<
     /// 异步创建表，表名可以是用文件分隔符分隔的路径，但必须是相对路径，且不允许使用".."
     #[inline]
     async fn create_table(&self,
-                              name: Atom,
-                              meta: KVTableMeta) -> IOResult<()> {
+                          name: Atom,
+                          meta: KVTableMeta) -> IOResult<()> {
         //检查待创建的指定名称的表是否存在
         let meta_table_name = Atom::from(DEFAULT_DB_TABLES_META_DIR);
         let mut tables = self.0.db_mgr.0.tables.write().await;
@@ -1792,7 +1793,7 @@ impl<
                 };
 
                 if let KVDBTransaction::MetaTabTr(tr) = meta_table_tr {
-                    if let Some(value) = tr.query(Binary::new(name.as_bytes().to_vec())).await {
+                    if let Some(value) = tr.query(table_to_binary(&name)).await {
                         //指定名称的表的元信息存在
                         let table_meta = KVTableMeta::from(value);
                         if table_meta == meta {
@@ -1877,7 +1878,7 @@ impl<
             };
 
             if let KVDBTransaction::MetaTabTr(tr) = meta_table_tr {
-                if let Err(e) = tr.upsert(Binary::new(name.as_bytes().to_vec()),
+                if let Err(e) = tr.upsert(table_to_binary(&name),
                                                Binary::from(meta.clone())).await {
                     //写入表的元信息失败，则立即返回错误原因
                     return Err(Error::new(ErrorKind::Other,
@@ -1965,7 +1966,7 @@ impl<
             };
 
             if let KVDBTransaction::MetaTabTr(tr) = meta_table_tr {
-                if let Err(e) = tr.upsert(Binary::new(name.as_bytes().to_vec()),
+                if let Err(e) = tr.upsert(table_to_binary(&name),
                                           Binary::from(meta.clone())).await {
                     //写入表的元信息失败，则立即返回错误原因
                     return Err(Error::new(ErrorKind::Other,
@@ -2003,7 +2004,7 @@ impl<
             };
 
             if let KVDBTransaction::MetaTabTr(tr) = meta_table_tr {
-                if let Err(e) = tr.delete(Binary::new(table.as_bytes().to_vec())).await {
+                if let Err(e) = tr.delete(table_to_binary(&table)).await {
                     //删除表的元信息失败，则立即返回错误原因
                     return Err(Error::new(ErrorKind::Other,
                                           format!("Remove table failed, name: {:?}, reason: {:?}", table, e)));
@@ -2027,7 +2028,7 @@ impl<
     /// 异步查询多个表和键的值的结果集
     #[inline]
     async fn query(&self,
-                       table_kv_list: Vec<TableKV>) -> Vec<Option<Binary>> {
+                   table_kv_list: Vec<TableKV>) -> Vec<Option<Binary>> {
         let mut result = Vec::new();
 
         for table_kv in table_kv_list {
@@ -2244,10 +2245,9 @@ impl<
     /// 获取从指定表和关键字开始，从前向后或从后向前的关键字异步流
     #[inline]
     async fn keys<'a>(&self,
-                          table_name: Atom,
-                          key: Option<Binary>,
-                          descending: bool)
-                          -> Option<BoxStream<'a, Binary>> {
+                      table_name: Atom,
+                      key: Option<Binary>,
+                      descending: bool) -> Option<BoxStream<'a, Binary>> {
         if let Some(table) = self.0.db_mgr.0.tables.read().await.get(&table_name) {
             //指定名称的表存在，则获取表事务，并开始获取关键字的异步流
             let mut childes_map = self.0.childs_map.lock();
@@ -2290,9 +2290,9 @@ impl<
     /// 获取从指定表和关键字开始，从前向后或从后向前的键值对异步流
     #[inline]
     async fn values<'a>(&self,
-                            table_name: Atom,
-                            key: Option<Binary>,
-                            descending: bool) -> Option<BoxStream<'a, (Binary, Binary)>> {
+                        table_name: Atom,
+                        key: Option<Binary>,
+                        descending: bool) -> Option<BoxStream<'a, (Binary, Binary)>> {
         if let Some(table) = self.0.db_mgr.0.tables.read().await.get(&table_name) {
             //指定名称的表存在，则获取表事务，并开始获取键值对异步流
             let mut childes_map = self.0.childs_map.lock();
@@ -2335,8 +2335,8 @@ impl<
     /// 锁住指定表的指定关键字
     #[inline]
     async fn lock_key(&self,
-                          table_name: Atom,
-                          key: Binary) -> Result<(), KVTableTrError> {
+                      table_name: Atom,
+                      key: Binary) -> Result<(), KVTableTrError> {
         if let Some(table) = self.0.db_mgr.0.tables.read().await.get(&table_name) {
             //指定名称的表存在，则获取表事务，并开始锁住指定表的指定关键字
             let mut childes_map = self.0.childs_map.lock();
@@ -2379,8 +2379,8 @@ impl<
     /// 解锁指定表的指定关键字
     #[inline]
     async fn unlock_key(&self,
-                            table_name: Atom,
-                            key: Binary) -> Result<(), KVTableTrError> {
+                        table_name: Atom,
+                        key: Binary) -> Result<(), KVTableTrError> {
         if let Some(table) = self.0.db_mgr.0.tables.read().await.get(&table_name) {
             //指定名称的表存在，则获取表事务，并开始解锁指定表的指定关键字
             let mut childes_map = self.0.childs_map.lock();
@@ -2653,3 +2653,10 @@ unsafe impl<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>,
 > Sync for KVDBTable<C, Log> {}
+
+// 将表名序列化为二进制数据
+fn table_to_binary(table_name: &Atom) -> Binary {
+    let mut buffer = WriteBuffer::new();
+    table_name.encode(&mut buffer);
+    Binary::new(buffer.bytes)
+}
