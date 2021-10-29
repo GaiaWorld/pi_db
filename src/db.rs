@@ -11,7 +11,7 @@ use bytes::{Buf, BufMut};
 use log::info;
 
 use atom::Atom;
-use bon::{WriteBuffer, Encode};
+use bon::{WriteBuffer, ReadBuffer, Encode, Decode, ReadBonErr};
 use guid::Guid;
 use r#async::{lock::{spin_lock::SpinLock,
                      rw_lock::RwLock},
@@ -186,7 +186,17 @@ impl<
             .await
             .unwrap();
         while let Some((key, value)) = meta_iterator.next().await {
-            let table_name = Atom::from(key.as_ref());
+            let table_name = match binary_to_table(&key) {
+                Err(e) => {
+                    //反序列化表名失败
+                    return Err(Error::new(ErrorKind::Other, format!("From binary to table name failed, reason: {:?}", e)));
+                },
+                Ok(table_name) => {
+                    //反序列化表名成功
+                    table_name
+                }
+            };
+
             if table_name == meta_table_name {
                 //忽略元信息表
                 continue;
@@ -2659,4 +2669,10 @@ fn table_to_binary(table_name: &Atom) -> Binary {
     let mut buffer = WriteBuffer::new();
     table_name.encode(&mut buffer);
     Binary::new(buffer.bytes)
+}
+
+// 将二进制数据反序列化为表名
+fn binary_to_table(bin: &Binary) -> Result<Atom, ReadBonErr> {
+    let mut buffer = ReadBuffer::new(bin, 0);
+    Atom::decode(&mut buffer)
 }
