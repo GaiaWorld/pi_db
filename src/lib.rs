@@ -273,8 +273,8 @@ impl KVTableMeta {
     /// 构建一个兼容旧的元信息的键值对表的元信息
     pub fn with_compatibled(table_type: KVDBTableType,
                             persistence: bool,
-                            bin: &Binary) -> Result<Self, ReadBonErr> {
-        let mut buffer = ReadBuffer::new(bin.0.as_slice(), 0);
+                            bin: &[u8]) -> Result<Self, ReadBonErr> {
+        let mut buffer = ReadBuffer::new(bin, 0);
         let key = EnumType::decode(&mut buffer)?;
         let value = EnumType::decode(&mut buffer)?;
 
