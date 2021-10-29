@@ -13,7 +13,7 @@ use futures::{future::BoxFuture,
 use bytes::{Buf, BufMut};
 use log::warn;
 
-use bon::{WriteBuffer, ReadBuffer, Encode, Decode};
+use bon::{WriteBuffer, ReadBuffer, Encode, Decode, ReadBonErr};
 use guid::Guid;
 use sinfo::EnumType;
 use r#async::rt::multi_thread::MultiTaskRuntime;
@@ -268,6 +268,17 @@ impl KVTableMeta {
             key,
             value,
         }
+    }
+
+    /// 构建一个兼容旧的元信息的键值对表的元信息
+    pub fn with_compatibled(table_type: KVDBTableType,
+                            persistence: bool,
+                            bin: &Binary) -> Result<Self, ReadBonErr> {
+        let mut buffer = ReadBuffer::new(bin.0.as_slice(), 0);
+        let key = EnumType::decode(&mut buffer)?;
+        let value = EnumType::decode(&mut buffer)?;
+
+        Ok(Self::new(table_type, persistence, key, value))
     }
 
     /// 获取键值对表的类型
