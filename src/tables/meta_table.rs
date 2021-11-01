@@ -447,30 +447,33 @@ impl<
                 let actions = table_prepare.get(&transaction_uid); //获取元信息表，本次事务预提交成功的相关操作记录
 
                 //更新元信息表的根节点
-                let actions = actions.unwrap();
-                let b = tr.0.table.0.root.lock().ptr_eq(&tr.0.root_ref);
-                if !b {
-                    //元信息表的根节点在当前事务执行过程中已改变
-                    for (key, action) in actions.iter() {
-                        match action {
-                            KVActionLog::Write(None) => {
-                                //删除指定关键字
-                                tr.0.table.0.root.lock().delete(key, false);
-                            },
-                            KVActionLog::Write(Some(value)) => {
-                                //插入或更新指定关键字
-                                tr.0.table.0.root.lock().upsert(key.clone(), value.clone(), false);
-                            },
-                            KVActionLog::Read => (), //忽略读操作
+                if let Some(actions) = actions {
+                    let b = tr.0.table.0.root.lock().ptr_eq(&tr.0.root_ref);
+                    if !b {
+                        //元信息表的根节点在当前事务执行过程中已改变
+                        for (key, action) in actions.iter() {
+                            match action {
+                                KVActionLog::Write(None) => {
+                                    //删除指定关键字
+                                    tr.0.table.0.root.lock().delete(key, false);
+                                },
+                                KVActionLog::Write(Some(value)) => {
+                                    //插入或更新指定关键字
+                                    tr.0.table.0.root.lock().upsert(key.clone(), value.clone(), false);
+                                },
+                                KVActionLog::Read => (), //忽略读操作
+                            }
                         }
+                    } else {
+                        //元信息表的根节点在当前事务执行过程中未改变，则用本次事务修改并提交成功的根节点替换元信息表的根节点
+                        *tr.0.table.0.root.lock() = tr.0.root_mut.lock().clone();
                     }
-                } else {
-                    //元信息表的根节点在当前事务执行过程中未改变，则用本次事务修改并提交成功的根节点替换元信息表的根节点
-                    *tr.0.table.0.root.lock() = tr.0.root_mut.lock().clone();
-                }
 
-                //元信息表提交完成后，从元信息表的预提交表中移除当前事务的操作记录
-                table_prepare.remove(&transaction_uid).unwrap()
+                    //元信息表提交完成后，从元信息表的预提交表中移除当前事务的操作记录
+                    table_prepare.remove(&transaction_uid).unwrap()
+                } else {
+                    XHashMap::default()
+                }
             };
 
             if tr.is_require_persistence() {
