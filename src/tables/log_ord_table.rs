@@ -1023,6 +1023,10 @@ async fn collect_waits<
 
                     keys_len += 1;
                     bytes_len += key.len();
+
+                    if wait_tr.get_commit_uid().is_none() {
+                        println!("!!!!!!collect waits, delete, key: {:?}", key);
+                    }
                 },
                 KVActionLog::Write(Some(value)) => {
                     //插入或更新了有序日志表中指定关键字的值
@@ -1035,6 +1039,10 @@ async fn collect_waits<
 
                     keys_len += 1;
                     bytes_len += key.len() + value.len();
+
+                    if wait_tr.get_commit_uid().is_none() {
+                        println!("!!!!!!collect waits, modify, key: {:?}, value: {:?}", key, value);
+                    }
                 },
                 KVActionLog::Read => (), //忽略读操作
             }
