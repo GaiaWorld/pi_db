@@ -2508,6 +2508,16 @@ impl<
                 .tr_mgr
                 .finish(KVDBTransaction::RootTr(self.clone()));
             return Ok(());
+        } else if !self.is_require_persistence() {
+            //当前事务是不需要持久化的事务，则立即完成本次键值对数据库事务
+            //一般只出现在事务中的所有表子事务只有只读操作，即使表子事务是可持久化的
+            self
+                .0
+                .db_mgr
+                .0
+                .tr_mgr
+                .finish(KVDBTransaction::RootTr(self.clone()));
+            return Ok(());
         }
 
         //为本次事务的异步提交确认，创建提交确认回调
