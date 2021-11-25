@@ -2508,8 +2508,8 @@ impl<
                 .tr_mgr
                 .finish(KVDBTransaction::RootTr(self.clone()));
             return Ok(());
-        } else if !self.is_require_persistence() {
-            //当前事务是不需要持久化的事务，则立即完成本次键值对数据库事务
+        } else if !self.is_require_persistence() || prepare_output.is_empty() {
+            //当前事务是不需要持久化的事务，或预提交输出为空，则立即完成本次键值对数据库事务
             //一般只出现在事务中的所有表子事务只有只读操作，即使表子事务是可持久化的
             self
                 .0
