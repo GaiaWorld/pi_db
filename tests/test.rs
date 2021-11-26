@@ -1247,17 +1247,17 @@ fn test_log_table_read_only_while_writing() {
                 rt_copy.wait_timeout(1500).await;
                 println!("");
 
-                // let r = tr.query(vec![
-                //     TableKV {
-                //         table: table_name.clone(),
-                //         key: Binary::new(vec![0]),
-                //         value: None
-                //     }
-                // ]).await;
-                // println!("!!!!!!query result: {:?}", r);
-                //
-                // rt_copy.wait_timeout(1500).await;
-                // println!("");
+                let r = tr.query(vec![
+                    TableKV {
+                        table: table_name.clone(),
+                        key: Binary::new(vec![0]),
+                        value: None
+                    }
+                ]).await;
+                println!("!!!!!!query result: {:?}", r);
+
+                rt_copy.wait_timeout(1500).await;
+                println!("");
 
                 match tr.prepare_modified().await {
                     Err(e) => {
