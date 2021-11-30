@@ -1,7 +1,7 @@
 use std::mem;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+use std::sync::{Arc, atomic::{AtomicBool, AtomicUsize, Ordering}};
 use std::collections::hash_map::Entry as HashMapEntry;
 
 use parking_lot::Mutex;
@@ -93,10 +93,12 @@ impl<
     fn transaction(&self,
                    source: Atom,
                    is_writable: bool,
+                   is_persistent: bool,
                    prepare_timeout: u64,
                    commit_timeout: u64) -> Self::Tr {
         MetaTabTr::new(source,
                        is_writable,
+                       is_persistent,
                        prepare_timeout,
                        commit_timeout,
                        self.clone())
@@ -303,7 +305,11 @@ impl<
     type CommitConfirm = KVDBCommitConfirm<C, Log>;
 
     fn is_require_persistence(&self) -> bool {
-        true
+        self.0.persistence.load(Ordering::Relaxed)
+    }
+
+    fn require_persistence(&self) {
+        self.0.persistence.store(true, Ordering::Relaxed);
     }
 
     fn is_concurrent_prepare(&self) -> bool {
@@ -719,6 +725,7 @@ impl<
     #[inline]
     fn new(source: Atom,
            is_writable: bool,
+           is_persistent: bool,
            prepare_timeout: u64,
            commit_timeout: u64,
            table: MetaTable<C, Log>) -> Self {
@@ -730,6 +737,7 @@ impl<
             cid: SpinLock::new(None),
             status: SpinLock::new(Transaction2PcStatus::default()),
             writable: is_writable,
+            persistence: AtomicBool::new(is_persistent),
             prepare_timeout,
             commit_timeout,
             root_mut: SpinLock::new(root_ref.clone()),
@@ -873,6 +881,7 @@ struct InnerMetaTabTr<
     cid:                SpinLock<Option<Guid>>,                                                     //事务提交唯一id
     status:             SpinLock<Transaction2PcStatus>,                                             //事务状态
     writable:           bool,                                                                       //事务是否可写
+    persistence:        AtomicBool,                                                                 //事务是否持久化
     prepare_timeout:    u64,                                                                        //事务预提交超时时长，单位毫秒
     commit_timeout:     u64,                                                                        //事务提交超时时长，单位毫秒
     root_mut:           SpinLock<OrdMap<Tree<Binary, Binary>>>,                                     //元信息表的根节点的可写复制

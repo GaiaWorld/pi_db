@@ -2,6 +2,7 @@ use std::mem;
 use std::sync::Arc;
 use std::path::Path;
 use std::marker::PhantomData;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use parking_lot::Mutex;
 use futures::{future::{FutureExt, BoxFuture}, stream::{StreamExt, BoxStream}};
@@ -80,11 +81,12 @@ impl<
     fn transaction(&self,
                    source: Atom,
                    is_writable: bool,
+                   is_persistent: bool,
                    prepare_timeout: u64,
                    commit_timeout: u64) -> Self::Tr {
         MemOrdTabTr::new(source,
                          is_writable,
-                         self.0.persistence,
+                         is_persistent,
                          prepare_timeout,
                          commit_timeout,
                          self.clone())
@@ -210,7 +212,11 @@ impl<
     type CommitConfirm = KVDBCommitConfirm<C, Log>;
 
     fn is_require_persistence(&self) -> bool {
-        self.0.persistence
+        self.0.persistence.load(Ordering::Relaxed)
+    }
+
+    fn require_persistence(&self) {
+        self.0.persistence.store(true, Ordering::Relaxed);
     }
 
     fn is_concurrent_prepare(&self) -> bool {
@@ -621,7 +627,7 @@ impl<
             cid: SpinLock::new(None),
             status: SpinLock::new(Transaction2PcStatus::default()),
             writable: is_writable,
-            persistence: is_persistence,
+            persistence: AtomicBool::new(is_persistence),
             prepare_timeout,
             commit_timeout,
             root_mut: SpinLock::new(root_ref.clone()),
@@ -765,7 +771,7 @@ struct InnerMemOrdTabTr<
     cid:                SpinLock<Option<Guid>>,                     //事务提交唯一id
     status:             SpinLock<Transaction2PcStatus>,             //事务状态
     writable:           bool,                                       //事务是否可写
-    persistence:        bool,                                       //事务是否持久化
+    persistence:        AtomicBool,                                 //事务是否持久化
     prepare_timeout:    u64,                                        //事务预提交超时时长，单位毫秒
     commit_timeout:     u64,                                        //事务提交超时时长，单位毫秒
     root_mut:           SpinLock<OrdMap<Tree<Binary, Binary>>>,     //有序内存表的根节点的可写复制

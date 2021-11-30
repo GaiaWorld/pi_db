@@ -799,6 +799,26 @@ impl<
         }
     }
 
+    fn require_persistence(&self) {
+        match self {
+            KVDBTransaction::RootTr(tr) => {
+                tr.require_persistence();
+            },
+            KVDBTransaction::MetaTabTr(tr) => {
+                tr.require_persistence();
+            },
+            KVDBTransaction::MemOrdTabTr(tr) => {
+                tr.require_persistence();
+            },
+            KVDBTransaction::LogOrdTabTr(tr) => {
+                tr.require_persistence();
+            },
+            KVDBTransaction::LogWTabTr(tr) => {
+                tr.require_persistence();
+            },
+        }
+    }
+
     fn is_concurrent_prepare(&self) -> bool {
         match self {
             KVDBTransaction::RootTr(tr) => {
@@ -1548,6 +1568,10 @@ impl<
         self.0.persistence.load(Ordering::Relaxed)
     }
 
+    fn require_persistence(&self) {
+        self.0.persistence.store(true, Ordering::Relaxed);
+    }
+
     // 键值对数据库的预提交基本都是内存操作，不需要并发
     fn is_concurrent_prepare(&self) -> bool {
         false
@@ -1705,6 +1729,7 @@ impl<
     fn table_transaction(&self,
                          name: Atom,
                          table: &KVDBTable<C, Log>,
+                         is_persistent: bool,
                          childes_map: &mut XHashMap<Atom, KVDBTransaction<C, Log>>)
                          -> KVDBTransaction<C, Log> {
         match table {
@@ -1712,6 +1737,7 @@ impl<
                 //创建元信息表的表事务，并作为子事务注册到根事务上
                 let tr = tab.transaction(self.get_source(),
                                          self.is_writable(),
+                                         is_persistent,
                                          self.get_prepare_timeout(),
                                          self.get_commit_timeout());
                 let table_tr = KVDBTransaction::MetaTabTr(tr);
@@ -1726,6 +1752,7 @@ impl<
                 //创建有序内存表的表事务，并作为子事务注册到根事务上
                 let tr = tab.transaction(self.get_source(),
                                          self.is_writable(),
+                                         is_persistent,
                                          self.get_prepare_timeout(),
                                          self.get_commit_timeout());
                 let table_tr = KVDBTransaction::MemOrdTabTr(tr);
@@ -1739,6 +1766,7 @@ impl<
             KVDBTable::LogOrdTab(tab) => {
                 let tr = tab.transaction(self.get_source(),
                                          self.is_writable(),
+                                         is_persistent,
                                          self.get_prepare_timeout(),
                                          self.get_commit_timeout());
                 let table_tr = KVDBTransaction::LogOrdTabTr(tr);
@@ -1752,6 +1780,7 @@ impl<
             KVDBTable::LogWTab(tab) => {
                 let tr = tab.transaction(self.get_source(),
                                          self.is_writable(),
+                                         is_persistent,
                                          self.get_prepare_timeout(),
                                          self.get_commit_timeout());
                 let table_tr = KVDBTransaction::LogWTabTr(tr);
@@ -1797,7 +1826,7 @@ impl<
         let meta_table_name = Atom::from(DEFAULT_DB_TABLES_META_DIR);
         let mut tables = self.0.db_mgr.0.tables.write().await;
 
-        self.0.persistence.store(true, Ordering::Relaxed); //创建表的操作，一定会创建元信息表事务，而元信息表事务是需要持久化的事务，则根事务也设置为需要持久化
+        self.require_persistence(); //创建表的操作，一定会创建元信息表事务，而元信息表事务是需要持久化的事务，则根事务也设置为需要持久化
         if tables.contains_key(&name) {
             //指定名称的表已存在
             if let Some(meta_table) = tables.get(&meta_table_name) {
@@ -1808,7 +1837,7 @@ impl<
                     table_tr.clone()
                 } else {
                     //元信息表的子事务不存在，则创建元信息表的事务
-                    self.table_transaction(meta_table_name, meta_table, &mut *childes_map)
+                    self.table_transaction(meta_table_name, meta_table, false, &mut *childes_map)
                 };
 
                 if let KVDBTransaction::MetaTabTr(tr) = meta_table_tr {
@@ -1886,14 +1915,14 @@ impl<
 
         //注册表的元信息
         if let Some(meta_table) = tables.get(&meta_table_name) {
-            //元信息表存在，则获取元信息表事务，并查询指定表的元信息
             let mut childes_map = self.0.childs_map.lock();
             let meta_table_tr = if let Some(table_tr) = childes_map.get(&meta_table_name) {
-                //元信息表的子事务存在
+                //元信息表的子事务存在，则设置子事务为需要持久化
+                table_tr.require_persistence();
                 table_tr.clone()
             } else {
                 //元信息表的子事务不存在，则创建元信息表的事务
-                self.table_transaction(meta_table_name, meta_table, &mut *childes_map)
+                self.table_transaction(meta_table_name, meta_table, true, &mut *childes_map)
             };
 
             if let KVDBTransaction::MetaTabTr(tr) = meta_table_tr {
@@ -1974,14 +2003,14 @@ impl<
 
         //注册表的元信息
         if let Some(meta_table) = tables.get(&meta_table_name) {
-            //元信息表存在，则获取元信息表事务，并查询指定表的元信息
             let mut childes_map = self.0.childs_map.lock();
             let meta_table_tr = if let Some(table_tr) = childes_map.get(&meta_table_name) {
-                //元信息表的子事务存在
+                //元信息表的子事务存在，则设置子事务为需要持久化
+                table_tr.require_persistence();
                 table_tr.clone()
             } else {
                 //元信息表的子事务不存在，则创建元信息表的事务
-                self.table_transaction(meta_table_name, meta_table, &mut *childes_map)
+                self.table_transaction(meta_table_name, meta_table, true, &mut *childes_map)
             };
 
             if let KVDBTransaction::MetaTabTr(tr) = meta_table_tr {
@@ -2015,11 +2044,12 @@ impl<
             //元信息表存在，则获取元信息表事务，并查询指定表的元信息
             let mut childes_map = self.0.childs_map.lock();
             let meta_table_tr = if let Some(table_tr) = childes_map.get(&meta_table_name) {
-                //元信息表的子事务存在
+                //元信息表的子事务存在，则设置子事务为需要持久化
+                table_tr.require_persistence();
                 table_tr.clone()
             } else {
                 //元信息表的子事务不存在，则创建元信息表的事务
-                self.table_transaction(meta_table_name, meta_table, &mut *childes_map)
+                self.table_transaction(meta_table_name, meta_table, true, &mut *childes_map)
             };
 
             if let KVDBTransaction::MetaTabTr(tr) = meta_table_tr {
@@ -2059,7 +2089,7 @@ impl<
                     table_tr.clone()
                 } else {
                     //指定名称的表的子事务不存在，则创建指定表的事务
-                    self.table_transaction(table_kv.table, table, &mut *childes_map)
+                    self.table_transaction(table_kv.table, table, false, &mut *childes_map)
                 };
 
                 match table_tr {
@@ -2106,11 +2136,12 @@ impl<
                 //指定名称的表存在，则获取表事务，并开始插入或更新表的指定关键字的值
                 let mut childes_map = self.0.childs_map.lock();
                 let table_tr = if let Some(table_tr) = childes_map.get(&table_kv.table) {
-                    //指定名称的表的子事务存在
+                    //指定名称的表的子事务存在，则设置子事务为需要持久化
+                    table_tr.require_persistence();
                     table_tr.clone()
                 } else {
                     //指定名称的表的子事务不存在，则创建指定表的事务
-                    self.table_transaction(table_kv.table, table, &mut *childes_map)
+                    self.table_transaction(table_kv.table, table, true, &mut *childes_map)
                 };
 
                 if table_tr.is_require_persistence() {
@@ -2182,11 +2213,12 @@ impl<
                 //指定名称的表存在，则获取表事务，并开始删除表的指定关键字的值
                 let mut childes_map = self.0.childs_map.lock();
                 let table_tr = if let Some(table_tr) = childes_map.get(&table_kv.table) {
-                    //指定名称的表的子事务存在
+                    //指定名称的表的子事务存在，则设置子事务为需要持久化
+                    table_tr.require_persistence();
                     table_tr.clone()
                 } else {
                     //指定名称的表的子事务不存在，则创建指定表的事务
-                    self.table_transaction(table_kv.table, table, &mut *childes_map)
+                    self.table_transaction(table_kv.table, table, true, &mut *childes_map)
                 };
 
                 if table_tr.is_require_persistence() {
@@ -2275,7 +2307,7 @@ impl<
                 table_tr.clone()
             } else {
                 //指定名称的表的子事务不存在，则创建指定表的事务
-                self.table_transaction(table_name, table, &mut *childes_map)
+                self.table_transaction(table_name, table, false, &mut *childes_map)
             };
 
             match table_tr {
@@ -2320,7 +2352,7 @@ impl<
                 table_tr.clone()
             } else {
                 //指定名称的表的子事务不存在，则创建指定表的事务
-                self.table_transaction(table_name, table, &mut *childes_map)
+                self.table_transaction(table_name, table, false, &mut *childes_map)
             };
 
             match table_tr {
@@ -2364,7 +2396,7 @@ impl<
                 table_tr.clone()
             } else {
                 //指定名称的表的子事务不存在，则创建指定表的事务
-                self.table_transaction(table_name, table, &mut *childes_map)
+                self.table_transaction(table_name, table, false, &mut *childes_map)
             };
 
             match table_tr {
@@ -2408,7 +2440,7 @@ impl<
                 table_tr.clone()
             } else {
                 //指定名称的表的子事务不存在，则创建指定表的事务
-                self.table_transaction(table_name, table, &mut *childes_map)
+                self.table_transaction(table_name, table, false, &mut *childes_map)
             };
 
             match table_tr {
@@ -2501,16 +2533,6 @@ impl<
             && prepare_output.is_empty() {
             //当前事务是可写且需要持久化的事务，但预提交输出为空，则立即完成本次键值对数据库事务
             //一般只出现在事务中只有创建或删除表操作，且表已创建或已删除
-            self
-                .0
-                .db_mgr
-                .0
-                .tr_mgr
-                .finish(KVDBTransaction::RootTr(self.clone()));
-            return Ok(());
-        } else if !self.is_require_persistence() {
-            //当前事务是不需要持久化的事务，则立即完成本次键值对数据库事务
-            //一般只出现在事务中的所有表子事务只有只读操作，即使表子事务是可持久化的
             self
                 .0
                 .db_mgr

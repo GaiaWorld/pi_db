@@ -51,6 +51,7 @@ pub trait KVTable: Send + Sync + 'static {
     fn transaction(&self,
                    source: Atom,
                    is_writable: bool,
+                   is_persistent: bool,
                    prepare_timeout: u64,
                    commit_timeout: u64)
                    -> Self::Tr;
