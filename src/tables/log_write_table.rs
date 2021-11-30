@@ -1,7 +1,7 @@
 use std::mem;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+use std::sync::{Arc, atomic::{AtomicBool, AtomicUsize, Ordering}};
 use std::collections::hash_map::Entry as HashMapEntry;
 
 use parking_lot::Mutex;
@@ -93,10 +93,12 @@ impl<
     fn transaction(&self,
                    source: Atom,
                    is_writable: bool,
+                   is_persistent: bool,
                    prepare_timeout: u64,
                    commit_timeout: u64) -> Self::Tr {
         LogWTabTr::new(source,
                        is_writable,
+                       is_persistent,
                        prepare_timeout,
                        commit_timeout,
                        self.clone())
@@ -303,7 +305,11 @@ impl<
     type CommitConfirm = KVDBCommitConfirm<C, Log>;
 
     fn is_require_persistence(&self) -> bool {
-        true
+        self.0.persistence.load(Ordering::Relaxed)
+    }
+
+    fn require_persistence(&self) {
+        self.0.persistence.store(true, Ordering::Relaxed);
     }
 
     fn is_concurrent_prepare(&self) -> bool {
@@ -365,11 +371,11 @@ impl<
                     let mut writed_count = 0;
                     for (_key, action) in tr.0.actions.lock().iter() {
                         match action {
-                            KVActionLog::Write(_) => {
-                                //对指定关键字进行了写操作，则增加本次事务写操作计数
+                            KVActionLog::Write(Some(_)) => {
+                                //对指定关键字进行了插入或更新操作，则增加本次事务写操作计数
                                 writed_count += 1;
                             }
-                            KVActionLog::Read => (), //忽略指定关键字的读操作计数
+                            _ => (), //忽略指定关键字的读或删除操作的计数
                         }
                     }
                     tr
@@ -388,21 +394,12 @@ impl<
                             return Err(e);
                         }
 
-                        if let Err(e) = tr
-                            .check_root_conflict(key) {
-                            //尝试表的预提交失败，则立即返回错误原因
-                            return Err(e);
-                        }
-
                         //指定关键字的操作预提交成功，则将写操作写入预提交缓冲区
                         match action {
-                            KVActionLog::Write(None) => {
-                                tr.0.table.append_key_value_to_table_prepare_output(&mut buf, key, None);
-                            },
                             KVActionLog::Write(Some(value)) => {
                                 tr.0.table.append_key_value_to_table_prepare_output(&mut buf, key, Some(value));
                             },
-                            _ => (), //忽略读操作
+                            _ => (), //忽略读和删除操作
                         }
                     }
 
@@ -436,30 +433,45 @@ impl<
         async move {
             //移除事务在只写日志表的预提交表中的操作记录
             let transaction_uid = tr.get_transaction_uid().unwrap();
-            let actions = tr.0.table.0.prepare.lock().remove(&transaction_uid); //获取只写日志表，本次事务预提交成功的相关操作记录
 
-            //更新只写日志表的根节点
-            let actions = actions.unwrap();
-            let b = tr.0.table.0.root.lock().ptr_eq(&tr.0.root_ref);
-            if !b {
-                //只写日志表的根节点在当前事务执行过程中已改变
-                for (key, action) in actions.iter() {
-                    match action {
-                        KVActionLog::Write(None) => {
-                            //删除指定关键字
-                            tr.0.table.0.root.lock().delete(key, false);
-                        },
-                        KVActionLog::Write(Some(value)) => {
-                            //插入或更新指定关键字
-                            tr.0.table.0.root.lock().upsert(key.clone(), value.clone(), false);
-                        },
-                        KVActionLog::Read => (), //忽略读操作
+            let actions = {
+                let mut table_prepare = tr
+                    .0
+                    .table
+                    .0
+                    .prepare
+                    .lock();
+                let actions = table_prepare.get(&transaction_uid); //获取只写日志表，本次事务预提交成功的相关操作记录
+
+                //更新只写日志表的根节点
+                if let Some(actions) = actions {
+                    let b = tr.0.table.0.root.lock().ptr_eq(&tr.0.root_ref);
+                    if !b {
+                        //只写日志表的根节点在当前事务执行过程中已改变
+                        for (key, action) in actions.iter() {
+                            match action {
+                                KVActionLog::Write(None) => {
+                                    //删除指定关键字
+                                    tr.0.table.0.root.lock().delete(key, false);
+                                },
+                                KVActionLog::Write(Some(value)) => {
+                                    //插入或更新指定关键字
+                                    tr.0.table.0.root.lock().upsert(key.clone(), value.clone(), false);
+                                },
+                                KVActionLog::Read => (), //忽略读操作
+                            }
+                        }
+                    } else {
+                        //只写日志表的根节点在当前事务执行过程中未改变，则用本次事务修改并提交成功的根节点替换只写日志表的根节点
+                        *tr.0.table.0.root.lock() = tr.0.root_mut.lock().clone();
                     }
+
+                    //只写日志表提交完成后，从只写日志表的预提交表中移除当前事务的操作记录
+                    table_prepare.remove(&transaction_uid).unwrap()
+                } else {
+                    XHashMap::default()
                 }
-            } else {
-                //只写日志表的根节点在当前事务执行过程中未改变，则用本次事务修改并提交成功的根节点替换只写日志表的根节点
-                *tr.0.table.0.root.lock() = tr.0.root_mut.lock().clone();
-            }
+            };
 
             if tr.is_require_persistence() {
                 //持久化的只写日志表事务，则异步将表的修改写入日志文件后，再确认提交成功
@@ -601,11 +613,8 @@ impl<
         let tr = self.clone();
 
         async move {
-            //记录对指定关键字的最新插入或更新操作
+            //只记录对指定关键字的最新插入或更新操作，不更新表的内存数据
             let _ = tr.0.actions.lock().insert(key.clone(), KVActionLog::Write(Some(value.clone())));
-
-            //插入或更新指定的键值对
-            let _ = tr.0.root_mut.lock().upsert(key, value, false);
 
             Ok(())
         }.boxed()
@@ -666,6 +675,7 @@ impl<
     #[inline]
     fn new(source: Atom,
            is_writable: bool,
+           is_persistent: bool,
            prepare_timeout: u64,
            commit_timeout: u64,
            table: LogWriteTable<C, Log>) -> Self {
@@ -677,6 +687,7 @@ impl<
             cid: SpinLock::new(None),
             status: SpinLock::new(Transaction2PcStatus::default()),
             writable: is_writable,
+            persistence: AtomicBool::new(is_persistent),
             prepare_timeout,
             commit_timeout,
             root_mut: SpinLock::new(root_ref.clone()),
@@ -701,7 +712,7 @@ impl<
                     match action {
                         KVActionLog::Read => {
                             //本地预提交事务对相同的关键字也执行了读操作，则不存在读写冲突，并立即返回检查成功
-                            return Ok(());
+                            continue;
                         },
                         KVActionLog::Write(_) => {
                             //本地预提交事务对相同的关键字执行了写操作，则存在读写冲突
@@ -715,7 +726,7 @@ impl<
                 },
                 None => {
                     //只写日志表的预提交表中没有任何预提交事务与本地预提交事务操作了相同的关键字，则不存在读写冲突，并立即返回检查成功
-                    return Ok(())
+                    continue;
                 },
             }
         }
@@ -820,6 +831,7 @@ struct InnerLogWTabTr<
     cid:                SpinLock<Option<Guid>>,                                                     //事务提交唯一id
     status:             SpinLock<Transaction2PcStatus>,                                             //事务状态
     writable:           bool,                                                                       //事务是否可写
+    persistence:        AtomicBool,                                                                 //事务是否持久化
     prepare_timeout:    u64,                                                                        //事务预提交超时时长，单位毫秒
     commit_timeout:     u64,                                                                        //事务提交超时时长，单位毫秒
     root_mut:           SpinLock<OrdMap<Tree<Binary, Binary>>>,                                     //只写日志表的根节点的可写复制
