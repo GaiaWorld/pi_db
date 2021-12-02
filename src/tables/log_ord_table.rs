@@ -281,13 +281,11 @@ impl<
                 -> BoxFuture<Result<<Self as AsyncTransaction>::Output, <Self as AsyncTransaction>::Error>> {
         let tr = self.clone();
 
-        println!("!!!!!!rollback start, uid: {:?}, table: {:?}", tr.get_transaction_uid(), tr.0.table.name());
         async move {
             //移除事务在有序日志表的预提交表中的操作记录
             let transaction_uid = tr.get_transaction_uid().unwrap();
             let _ = tr.0.table.0.prepare.lock().remove(&transaction_uid);
 
-            println!("!!!!!!rollback ok, uid: {:?}, table: {:?}", tr.get_transaction_uid(), tr.0.table.name());
             Ok(())
         }.boxed()
     }
