@@ -48,7 +48,7 @@ use crate::db::KVDBTable::MetaTab;
 ///
 /// 默认的数据库表元信息目录名
 ///
-const DEFAULT_DB_TABLES_META_DIR: &str = ".tables_meta";
+pub(crate) const DEFAULT_DB_TABLES_META_DIR: &str = ".tables_meta";
 
 ///
 /// 默认的数据库表所在目录名
@@ -2706,14 +2706,14 @@ unsafe impl<
 > Sync for KVDBTable<C, Log> {}
 
 // 将表名序列化为二进制数据
-fn table_to_binary(table_name: &Atom) -> Binary {
+pub(crate) fn table_to_binary(table_name: &Atom) -> Binary {
     let mut buffer = WriteBuffer::new();
     table_name.encode(&mut buffer);
     Binary::new(buffer.bytes)
 }
 
 // 将二进制数据反序列化为表名
-fn binary_to_table(bin: &Binary) -> Result<Atom, ReadBonErr> {
+pub(crate) fn binary_to_table(bin: &Binary) -> Result<Atom, ReadBonErr> {
     let mut buffer = ReadBuffer::new(bin, 0);
     Atom::decode(&mut buffer)
 }

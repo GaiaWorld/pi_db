@@ -21,6 +21,7 @@ use async_transaction::{AsyncCommitLog, TransactionError, ErrorLevel};
 
 pub mod db;
 pub mod tables;
+pub mod inspector;
 
 ///
 /// 二进制数据
