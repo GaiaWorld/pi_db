@@ -147,7 +147,7 @@ impl CommitLogInspector {
                                                   write.table,
                                                   false,
                                                   write.key.as_ref().to_vec(),
-                                                  write.value.unwrap().as_ref().to_vec())));
+                                                  vec![0])));
                         }
                     }
                 }
