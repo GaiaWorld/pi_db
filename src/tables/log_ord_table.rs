@@ -189,7 +189,7 @@ impl<
                                     statistics);
                             },
                             Ok((collect_time, statistics)) => {
-                                info!("Collect log ordered table ok, table: {:?}, time: {:?}, statistics: {:?}, reason: out of time",
+                                debug!("Collect log ordered table ok, table: {:?}, time: {:?}, statistics: {:?}, reason: out of time",
                                     table_copy.name().as_str(),
                                     collect_time,
                                     statistics);
