@@ -526,6 +526,13 @@ impl<
                         } else {
                             //未确认的提交日志操作的表是其它表，则执行本次未确认的提交日志中指定表的键值对写操作
                             for write in writes {
+                                if write.table.as_str() == "config/db/Record.DramaNumberRecord" && binary_to_i32(&write.key).unwrap() == 112800000 {
+                                    if write.value.is_none() {
+                                        println!("!!!!!!tid: {:?}, cid: {:?}, remove", transaciton_uid, commit_uid_copy);
+                                    } else {
+                                        println!("!!!!!!tid: {:?}, cid: {:?}, insert", transaciton_uid, commit_uid_copy);
+                                    }
+                                }
                                 if write.exist_value() {
                                     //有值，则执行插入或更新操作
                                     if let Err(e) = tr.upsert(vec![write]).await {
@@ -2716,4 +2723,9 @@ pub(crate) fn table_to_binary(table_name: &Atom) -> Binary {
 pub(crate) fn binary_to_table(bin: &Binary) -> Result<Atom, ReadBonErr> {
     let mut buffer = ReadBuffer::new(bin, 0);
     Atom::decode(&mut buffer)
+}
+
+fn binary_to_i32(bin: &Binary) -> Result<i32, ReadBonErr> {
+    let mut buffer = ReadBuffer::new(bin, 0);
+    i32::decode(&mut buffer)
 }
