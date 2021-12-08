@@ -1034,9 +1034,6 @@ async fn collect_waits<
                     bytes_len += key.len();
                 },
                 KVActionLog::Write(Some(value)) => {
-                    if table.name().as_str() == "config/db/Record.DramaNumberRecord" {
-                        println!("!!!!!!append log, key: {}, value: {:?}", binary_to_i32(key).unwrap(), value);
-                    }
                     //插入或更新了有序日志表中指定关键字的值
                     log_uid = table
                         .0
@@ -1089,10 +1086,4 @@ async fn collect_waits<
 
         Ok((now.elapsed(), (trs_len, keys_len, bytes_len)))
     }
-}
-
-use bon::{ReadBuffer, ReadBonErr, Decode};
-fn binary_to_i32(bin: &Binary) -> Result<i32, ReadBonErr> {
-    let mut buffer = ReadBuffer::new(bin, 0);
-    i32::decode(&mut buffer)
 }
