@@ -908,7 +908,7 @@ impl<
         use bon::Decode;
 
         //不在已删除关键字表中且不在有序日志表的内存表中的关键字，才允许被加载
-        let b = self
+        let b = !self
             .removed
             .contains_key(key)
             &&
