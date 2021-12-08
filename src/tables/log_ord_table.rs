@@ -905,10 +905,8 @@ impl<
     Log: AsyncCommitLog<C = C, Cid = Guid>,
 > PairLoader for LogOrderedTableLoader<C, Log> {
     fn is_require(&self, _log_file: Option<&PathBuf>, key: &Vec<u8>) -> bool {
-        use bon::Decode;
-
         //不在已删除关键字表中且不在有序日志表的内存表中的关键字，才允许被加载
-        let b = !self
+        !self
             .removed
             .contains_key(key)
             &&
@@ -918,15 +916,7 @@ impl<
                 .root
                 .lock()
                 .get(&Binary::new(key.clone()))
-                .is_none();
-
-        if _log_file.as_ref().unwrap().to_str().unwrap().contains("config/db/Record.DramaNumberRecord") {
-            let mut buffer = bon::ReadBuffer::new(key.as_slice(), 0);
-            let decoded = i32::decode(&mut buffer).unwrap();
-            println!("!!!!!!is require load: {}, key: {}", b, decoded);
-        }
-
-        b
+                .is_none()
     }
 
     fn load(&mut self,
@@ -934,19 +924,6 @@ impl<
             _method: LogMethod,
             key: Vec<u8>,
             value: Option<Vec<u8>>) {
-        use bon::Decode;
-
-        if log_file.as_ref().unwrap().to_str().unwrap().contains("config/db/Record.DramaNumberRecord") {
-            let mut buffer = bon::ReadBuffer::new(key.as_slice(), 0);
-            let decoded = i32::decode(&mut buffer).unwrap();
-
-            if value.is_none() {
-                println!("!!!!!!remove, key: {}", decoded);
-            } else {
-                println!("!!!!!!insert, key: {}, value: {:?}", decoded, value);
-            }
-        }
-
         if let Some(value) = value {
             //插入或更新指定关键字的值
             if let Some(path) = log_file {
