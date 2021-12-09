@@ -140,6 +140,7 @@ impl<
                 //打开日志文件成功
                 let waits = AsyncMutex::new(VecDeque::new());
                 let waits_size = AtomicUsize::new(0);
+                let collecting = AtomicBool::new(false);
                 let inner = InnerMetaTable {
                     name: name.clone(),
                     root,
@@ -149,6 +150,7 @@ impl<
                     waits_size,
                     waits_limit,
                     wait_timeout,
+                    collecting,
                     log_file,
                 };
 
@@ -217,6 +219,7 @@ struct InnerMetaTable<
     waits_size:     AtomicUsize,                                                                                            //等待异步写日志文件的已提交的有序日志事务的键值对大小
     waits_limit:    usize,                                                                                                  //等待异步写日志文件的已提交的元信息事务大小限制
     wait_timeout:   usize,                                                                                                  //等待异步写日志文件的超时时长，单位毫秒
+    collecting:     AtomicBool,                                                                                             //是否正在整理等待异步写日志文件的已提交的元信息事务列表
     log_file:       LogFile,                                                                                                //日志文件
 }
 
@@ -1004,6 +1007,15 @@ async fn collect_waits<
         table.0.rt.wait_timeout(timeout).await;
     }
 
+    //检查是否正在异步整理，如果并未开始异步整理，则设置为正在异步整理，并继续异步整理
+    if let Err(_) = table.0.collecting.compare_exchange(false,
+                                                        true,
+                                                        Ordering::Acquire,
+                                                        Ordering::Relaxed) {
+        //正在异步整理，则忽略本次异步整理
+        return Ok((Instant::now().elapsed(), (0, 0, 0)));
+    }
+
     //将元信息表中等待写入日志文件的事务，写入日志文件
     let mut waits = VecDeque::new();
     let mut log_uid = 0;
@@ -1064,6 +1076,7 @@ async fn collect_waits<
                       DEFAULT_LOG_FILE_COMMIT_DELAY_TIMEOUT)
         .await {
         //写入日志文件失败，则立即中止本次整理
+        table.0.collecting.store(false, Ordering::Release); //设置为已整理结束
         error!("Collect meta table failed, table: {:?}, transactions: {}, keys: {}, bytes: {}, reason: {:?}",
             table.name().as_str(),
             trs_len,
@@ -1086,6 +1099,7 @@ async fn collect_waits<
                     e);
             }
         }
+        table.0.collecting.store(false, Ordering::Release); //设置为已整理结束
 
         Ok((now.elapsed(), (trs_len, keys_len, bytes_len)))
     }
