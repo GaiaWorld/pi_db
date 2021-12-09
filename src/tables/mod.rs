@@ -12,7 +12,6 @@ use async_transaction::{AsyncTransaction,
 
 use crate::{Binary,
             KVAction};
-use std::io::Read;
 
 pub mod meta_table;
 pub mod mem_ord_table;

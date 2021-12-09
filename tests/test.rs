@@ -23,7 +23,7 @@ use pi_db::{Binary,
             KVTableMeta,
             db::KVDBManagerBuilder,
             tables::TableKV,
-            inspector::CommitLogInspector};
+            inspector::{CommitLogInspector, LogTableInspector}};
 
 #[test]
 fn test_memory_table() {
@@ -2054,6 +2054,31 @@ fn test_commit_log_inspector() {
                     let value = usize::from_le_bytes(result.5.as_slice().try_into().unwrap());
                     println!("Inspect next, tid: {}, cid: {}, table: {}, method: {}, key: {}, value: {}", result.0, result.1, result.2, result.3, key, value);
                 }
+            }
+            println!("Inspect finish");
+        }
+    });
+
+    thread::sleep(Duration::from_millis(1000000000));
+}
+
+// 先执行test_multi_tables_repair，并等待写入表文件
+#[test]
+fn test_log_table_inspector() {
+    use std::thread;
+    use std::time::Duration;
+
+    let builder = MultiTaskRuntimeBuilder::default();
+    let rt = builder.build();
+
+    let rt_copy = rt.clone();
+    rt.spawn(rt.alloc(), async move {
+        let inspector = LogTableInspector::new(rt_copy, "./db/.tables/test_log0").unwrap();
+        if inspector.begin() {
+            while let Some(result) = inspector.next() {
+                let key = binary_to_usize(&Binary::new(result.2)).unwrap();
+                let value = usize::from_le_bytes(result.3.as_slice().try_into().unwrap());
+                println!("Inspect next, file: {}, method: {}, key: {}, value: {}", result.0, result.1, key, value);
             }
             println!("Inspect finish");
         }

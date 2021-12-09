@@ -341,9 +341,18 @@ impl<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>
 > KVDBManager<C, Log> {
+    /// 获取指定名称的表
+    pub(crate) async fn get_table(&self, table_name: &Atom) -> Option<KVDBTable<C, Log>> {
+        if let Some(table) = self.0.tables.read().await.get(table_name) {
+            Some(table.clone())
+        } else {
+            None
+        }
+    }
+
     /// 异步判断指定名称的表是否存在
     pub async fn is_exist(&self, table_name: &Atom) -> bool {
-        self.0.tables.read().await.contains_key(&table_name)
+        self.0.tables.read().await.contains_key(table_name)
     }
 
     /// 异步获取键值对数据库的表数量
