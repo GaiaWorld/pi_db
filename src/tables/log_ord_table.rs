@@ -1066,41 +1066,41 @@ async fn collect_waits<
             trs_len += 1;
             waits.push_back((wait_tr, confirm));
         }
-    }
 
-    if let Err(e) = table
-        .0
-        .log_file
-        .delay_commit(log_uid,
-                      false,
-                      DEFAULT_LOG_FILE_COMMIT_DELAY_TIMEOUT)
-        .await {
-        //写入日志文件失败，则立即中止本次整理
-        table.0.collecting.store(false, Ordering::Release); //设置为已整理结束
-        error!("Collect log ordered table failed, table: {:?}, transactions: {}, keys: {}, bytes: {}, reason: {:?}",
+        if let Err(e) = table
+            .0
+            .log_file
+            .delay_commit(log_uid,
+                          false,
+                          DEFAULT_LOG_FILE_COMMIT_DELAY_TIMEOUT)
+            .await {
+            //写入日志文件失败，则立即中止本次整理
+            table.0.collecting.store(false, Ordering::Release); //设置为已整理结束
+            error!("Collect log ordered table failed, table: {:?}, transactions: {}, keys: {}, bytes: {}, reason: {:?}",
             table.name().as_str(),
             trs_len,
             keys_len,
             bytes_len,
             e);
 
-        Err((now.elapsed(), (trs_len, keys_len, bytes_len)))
-    } else {
-        //写入日志文件成功，则调用指定事务的确认提交回调，并继续写入下一个事务
-        for (wait_tr, confirm) in waits {
-            if let Err(e) = confirm(wait_tr.get_transaction_uid().unwrap(),
-                                    wait_tr.get_commit_uid().unwrap(),
-                                    Ok(())) {
-                error!("Collect log ordered table failed, table: {:?}, transactions: {}, keys: {}, bytes: {}, reason: {:?}",
+            return Err((now.elapsed(), (trs_len, keys_len, bytes_len)));
+        }
+    }
+
+    //写入日志文件成功，则调用指定事务的确认提交回调，并继续写入下一个事务
+    for (wait_tr, confirm) in waits {
+        if let Err(e) = confirm(wait_tr.get_transaction_uid().unwrap(),
+                                wait_tr.get_commit_uid().unwrap(),
+                                Ok(())) {
+            error!("Collect log ordered table failed, table: {:?}, transactions: {}, keys: {}, bytes: {}, reason: {:?}",
                     table.name().as_str(),
                     trs_len,
                     keys_len,
                     bytes_len,
                     e);
-            }
         }
-        table.0.collecting.store(false, Ordering::Release); //设置为已整理结束
-
-        Ok((now.elapsed(), (trs_len, keys_len, bytes_len)))
     }
+    table.0.collecting.store(false, Ordering::Release); //设置为已整理结束
+
+    Ok((now.elapsed(), (trs_len, keys_len, bytes_len)))
 }
