@@ -308,17 +308,14 @@ impl LogTableInspector {
         let response_sender = self.response_sender.clone();
         self.rt.spawn(self.rt.alloc(), async move {
             let mut loader = LogTableLoader {
-                statistics: XHashMap::default(),
-                removed: XHashMap::default(),
-                inserted: XHashMap::default(),
                 request_receiver: request_receiver.clone(),
                 response_sender: response_sender.clone(),
             };
 
-            if let Err(e) = log_file.load(&mut loader,
-                                          None,
-                                          8192,
-                                          true).await {
+            if let Err(e) = log_file.load_before(&mut loader,
+                                                 None,
+                                                 8192,
+                                                 true).await {
                 //加载指定的日志文件失败，则立即抛出异常
                 panic!("Load log ordered table failed, path: {:?}, reason: {:?}",
                        log_file.path(),
@@ -331,8 +328,8 @@ impl LogTableInspector {
                                     Ordering::Acquire,
                                     Ordering::Relaxed);
             match request_receiver.recv() {
-                Err(e) => {
-                    panic!("Inspect next failed, reason: {:?}", e);
+                Err(_e) => {
+                    response_sender.send(None);
                 },
                 Ok(_) => {
                     //响应侦听已结束
@@ -376,23 +373,13 @@ impl LogTableInspector {
 
 // 日志表的加载器
 struct LogTableLoader {
-    statistics:         XHashMap<PathBuf, (u64, u64)>,                      //加载统计信息，包括关键字数量和键值对的字节数
-    removed:            XHashMap<Vec<u8>, ()>,                              //已删除关键字表
-    inserted:           XHashMap<Vec<u8>, ()>,                              //已插入关键字表
     request_receiver:   Receiver<()>,                                       //请求接收器
     response_sender:    Sender<Option<(String, bool, Vec<u8>, Vec<u8>)>>,   //响应发送器
 }
 
 impl PairLoader for LogTableLoader {
-    fn is_require(&self, _log_file: Option<&PathBuf>, key: &Vec<u8>) -> bool {
-        //不在已删除关键字表中且不在已插入关键字表中的关键字，才允许被加载
-        !self
-            .removed
-            .contains_key(key)
-            &&
-            !self
-                .inserted
-                .contains_key(key)
+    fn is_require(&self, _log_file: Option<&PathBuf>, _key: &Vec<u8>) -> bool {
+        true
     }
 
     fn load(&mut self,
@@ -407,26 +394,10 @@ impl PairLoader for LogTableLoader {
             }
 
             let path = if let Some(path) = log_file {
-                match self.statistics.entry(path.clone()) {
-                    HashMapEntry::Occupied(mut o) => {
-                        //指定日志文件的统计信息存在，则继续统计
-                        let statistics = o.get_mut();
-                        statistics.0 += 1;
-                        statistics.1 += (key.len() + value.len()) as u64;
-                    },
-                    HashMapEntry::Vacant(v) => {
-                        //指定日志文件的统计信息不存在，则初始化统计
-                        v.insert((1, (key.len() + value.len()) as u64));
-                    },
-                }
-
                 path.to_str().unwrap().to_string()
             } else {
                 "".to_string()
             };
-
-            //加入已插入关键字表中
-            self.inserted.insert(key.clone(), ());
 
             //响应日志表的插入日志
             self.response_sender.send(Some((path,
@@ -443,9 +414,6 @@ impl PairLoader for LogTableLoader {
             } else {
                 "".to_string()
             };
-
-            //删除指定关键字的值，则不需要加载到有序日志表的内存表中，并记录到已删除关键字表中
-            self.removed.insert(key.clone(), ());
 
             //响应日志表的删除日志
             self.response_sender.send(Some((path,
