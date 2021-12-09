@@ -213,7 +213,7 @@ struct InnerMetaTable<
     root:           Mutex<OrdMap<Tree<Binary, Binary>>>,                                                                    //元信息表的根节点
     prepare:        Mutex<XHashMap<Guid, XHashMap<Binary, KVActionLog>>>,                                                   //元信息表的预提交表
     rt:             MultiTaskRuntime<()>,                                                                                   //异步运行时
-    waits:          AsyncMutex<VecDeque<(MetaTabTr<C, Log>, XHashMap<Binary, KVActionLog>, <MetaTabTr<C, Log> as Transaction2Pc>::CommitConfirm)>>,                                                                                         //等待异步写日志文件的已提交的元信息事务列表
+    waits:          AsyncMutex<VecDeque<(MetaTabTr<C, Log>, XHashMap<Binary, KVActionLog>, <MetaTabTr<C, Log> as Transaction2Pc>::CommitConfirm)>>,                                                                                                                        //等待异步写日志文件的已提交的元信息事务列表
     waits_size:     AtomicUsize,                                                                                            //等待异步写日志文件的已提交的有序日志事务的键值对大小
     waits_limit:    usize,                                                                                                  //等待异步写日志文件的已提交的元信息事务大小限制
     wait_timeout:   usize,                                                                                                  //等待异步写日志文件的超时时长，单位毫秒
@@ -1012,45 +1012,48 @@ async fn collect_waits<
     let mut bytes_len = 0;
 
     let now = Instant::now();
-    while let Some((wait_tr, actions, confirm)) = table
-        .0
-        .waits
-        .lock()
-        .await
-        .pop_front() {
+    {
+        //在锁保护下迭代当前元信息表的等待异步写日志文件的已提交的元信息事务列表
+        let mut locked = table
+            .0
+            .waits
+            .lock()
+            .await;
 
-        for (key, actions) in actions.iter() {
-            match actions {
-                KVActionLog::Write(None) => {
-                    //删除了元信息表中指定关键字的值
-                    log_uid = table
-                        .0
-                        .log_file
-                        .append(LogMethod::Remove,
-                                key.as_ref(),
-                                &[]);
+        while let Some((wait_tr, actions, confirm)) = locked.pop_front() {
+            for (key, actions) in actions.iter() {
+                match actions {
+                    KVActionLog::Write(None) => {
+                        //删除了元信息表中指定关键字的值
+                        log_uid = table
+                            .0
+                            .log_file
+                            .append(LogMethod::Remove,
+                                    key.as_ref(),
+                                    &[]);
 
-                    keys_len += 1;
-                    bytes_len += key.len();
-                },
-                KVActionLog::Write(Some(value)) => {
-                    //插入或更新了元信息表中指定关键字的值
-                    log_uid = table
-                        .0
-                        .log_file
-                        .append(LogMethod::PlainAppend,
-                                key.as_ref(),
-                                value.as_ref());
+                        keys_len += 1;
+                        bytes_len += key.len();
+                    },
+                    KVActionLog::Write(Some(value)) => {
+                        //插入或更新了元信息表中指定关键字的值
+                        log_uid = table
+                            .0
+                            .log_file
+                            .append(LogMethod::PlainAppend,
+                                    key.as_ref(),
+                                    value.as_ref());
 
-                    keys_len += 1;
-                    bytes_len += key.len() + value.len();
-                },
-                KVActionLog::Read => (), //忽略读操作
+                        keys_len += 1;
+                        bytes_len += key.len() + value.len();
+                    },
+                    KVActionLog::Read => (), //忽略读操作
+                }
             }
-        }
 
-        trs_len += 1;
-        waits.push_back((wait_tr, confirm));
+            trs_len += 1;
+            waits.push_back((wait_tr, confirm));
+        }
     }
 
     if let Err(e) = table

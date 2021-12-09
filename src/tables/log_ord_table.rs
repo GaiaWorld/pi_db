@@ -1012,45 +1012,48 @@ async fn collect_waits<
     let mut bytes_len = 0;
 
     let now = Instant::now();
-    while let Some((wait_tr, actions, confirm)) = table
-        .0
-        .waits
-        .lock()
-        .await
-        .pop_front() {
+    {
+        //在锁保护下迭代当前有序日志表的等待异步写日志文件的已提交的有序日志事务列表
+        let mut locked = table
+            .0
+            .waits
+            .lock()
+            .await;
 
-        for (key, actions) in actions.iter() {
-            match actions {
-                KVActionLog::Write(None) => {
-                    //删除了有序日志表中指定关键字的值
-                    log_uid = table
-                        .0
-                        .log_file
-                        .append(LogMethod::Remove,
-                                key.as_ref(),
-                                &[]);
+        while let Some((wait_tr, actions, confirm)) = locked.pop_front() {
+            for (key, actions) in actions.iter() {
+                match actions {
+                    KVActionLog::Write(None) => {
+                        //删除了有序日志表中指定关键字的值
+                        log_uid = table
+                            .0
+                            .log_file
+                            .append(LogMethod::Remove,
+                                    key.as_ref(),
+                                    &[]);
 
-                    keys_len += 1;
-                    bytes_len += key.len();
-                },
-                KVActionLog::Write(Some(value)) => {
-                    //插入或更新了有序日志表中指定关键字的值
-                    log_uid = table
-                        .0
-                        .log_file
-                        .append(LogMethod::PlainAppend,
-                                key.as_ref(),
-                                value.as_ref());
+                        keys_len += 1;
+                        bytes_len += key.len();
+                    },
+                    KVActionLog::Write(Some(value)) => {
+                        //插入或更新了有序日志表中指定关键字的值
+                        log_uid = table
+                            .0
+                            .log_file
+                            .append(LogMethod::PlainAppend,
+                                    key.as_ref(),
+                                    value.as_ref());
 
-                    keys_len += 1;
-                    bytes_len += key.len() + value.len();
-                },
-                KVActionLog::Read => (), //忽略读操作
+                        keys_len += 1;
+                        bytes_len += key.len() + value.len();
+                    },
+                    KVActionLog::Read => (), //忽略读操作
+                }
             }
-        }
 
-        trs_len += 1;
-        waits.push_back((wait_tr, confirm));
+            trs_len += 1;
+            waits.push_back((wait_tr, confirm));
+        }
     }
 
     if let Err(e) = table
