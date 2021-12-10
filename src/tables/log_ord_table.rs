@@ -812,7 +812,7 @@ impl<
                         },
                     }
                 },
-                Some(root_value) => {
+                Some(_) => {
                     //事务的当前操作记录中的关键字，在当前表中已存在
                     match self.0.root_ref.get(&key) {
                         None => {
@@ -821,14 +821,8 @@ impl<
                             //并继续其它关键字的操作记录的预提交
                             ()
                         },
-                        Some(copy_value) if Binary::binary_equal(&root_value, &copy_value) => {
-                            //事务的当前操作记录中的关键字，在事务创建时的表中也存在，且值相同
-                            //表示此关键字在当前事务执行过程中未改变，且值也未改变，则此关键字的操作记录允许预提交
-                            //并继续其它关键字的操作记录的预提交
-                            ()
-                        },
                         _ => {
-                            //事务的当前操作记录中的关键字，在事务创建时的表中也存在，但值不相同
+                            //事务的当前操作记录中的关键字，在事务创建时的表中也存在
                             //表示此关键字在当前事务执行过程中未改变，但值已改变，则此关键字的操作记录不允许预提交
                             //并立即返回当前事务预提交冲突
                             return Err(<Self as Transaction2Pc>::PrepareError::new_transaction_error(ErrorLevel::Normal, format!("Prepare log ordered table conflicted, table: {:?}, key: {:?}, source: {:?}, transaction_uid: {:?}, prepare_uid: {:?}, reason: the value is updated in table while the transaction is running", self.0.table.name().as_str(), key, self.0.source, self.get_transaction_uid(), self.get_prepare_uid())));
