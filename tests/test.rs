@@ -364,7 +364,7 @@ fn test_memory_table_conflict() {
                 if let Err(e) = tr.create_table(table_name.clone(),
                                                 KVTableMeta::new(KVDBTableType::MemOrdTab,
                                                                  false,
-                                                                 EnumType::U8,
+                                                                 EnumType::Usize,
                                                                  EnumType::Usize)).await {
                     //创建有序内存表失败
                     println!("!!!!!!create memory ordered table failed, reason: {:?}", e);
@@ -394,7 +394,7 @@ fn test_memory_table_conflict() {
                     let _r = tr.upsert(vec![
                         TableKV {
                             table: table_name.clone(),
-                            key: Binary::new(vec![0]),
+                            key: usize_to_binary(0),
                             value: Some(Binary::new(0usize.to_le_bytes().to_vec()))
                         }
                     ]).await;
@@ -406,7 +406,8 @@ fn test_memory_table_conflict() {
 
                 let (sender, receiver) = unbounded();
                 let start = Instant::now();
-                for _ in 0..100000 {
+                for _ in 0..1000 {
+                    let rt_copy_ = rt_copy.clone();
                     let db_copy = db.clone();
                     let table_name_copy = table_name.clone();
                     let sender_copy = sender.clone();
@@ -415,12 +416,12 @@ fn test_memory_table_conflict() {
                         let now = Instant::now();
                         let mut is_ok = false;
 
-                        while now.elapsed().as_millis() <= 5000 {
+                        while now.elapsed().as_millis() <= 60000 {
                             let tr = db_copy.transaction(Atom::from("test memory table"), true, 500, 500).unwrap();
                             let r = tr.query(vec![
                                 TableKV {
                                     table: table_name_copy.clone(),
-                                    key: Binary::new(vec![0]),
+                                    key: usize_to_binary(0),
                                     value: None
                                 }
                             ]).await;
@@ -430,7 +431,7 @@ fn test_memory_table_conflict() {
                             let _r = tr.upsert(vec![
                                 TableKV {
                                     table: table_name_copy.clone(),
-                                    key: Binary::new(vec![0]),
+                                    key: usize_to_binary(0),
                                     value: Some(Binary::new(new_value.to_le_bytes().to_vec()))
                                 }
                             ]).await;
@@ -440,6 +441,7 @@ fn test_memory_table_conflict() {
                                     if let Err(e) = tr.rollback_modified().await {
                                         println!("rollback failed, reason: {:?}", e);
                                     } else {
+                                        rt_copy_.wait_timeout(0);
                                         continue;
                                     }
                                 },
@@ -452,6 +454,7 @@ fn test_memory_table_conflict() {
                                                 if let Err(e) = tr.rollback_modified().await {
                                                     println!("rollback failed, reason: {:?}", e);
                                                 } else {
+                                                    rt_copy_.wait_timeout(0);
                                                     continue;
                                                 }
                                             }
@@ -487,7 +490,7 @@ fn test_memory_table_conflict() {
                         },
                         Ok(_result) => {
                             count += 1;
-                            if count >= 100000 {
+                            if count >= 1000 {
                                 println!("!!!!!!time: {:?}, count: {}", start.elapsed(), count);
                                 break;
                             }
@@ -507,7 +510,7 @@ fn test_memory_table_conflict() {
                     ]).await;
                     let last_value = usize::from_le_bytes(r[0].as_ref().unwrap().as_ref().try_into().unwrap());
 
-                    assert_eq!(last_value, 100000);
+                    assert_eq!(last_value, 1000);
                 }
             },
         }
@@ -1329,7 +1332,7 @@ fn test_log_table_conflict() {
                 if let Err(e) = tr.create_table(table_name.clone(),
                                                 KVTableMeta::new(KVDBTableType::LogOrdTab,
                                                                  true,
-                                                                 EnumType::U8,
+                                                                 EnumType::Usize,
                                                                  EnumType::Usize)).await {
                     //创建有序内存表失败
                     println!("!!!!!!create log ordered table failed, reason: {:?}", e);
@@ -1359,7 +1362,7 @@ fn test_log_table_conflict() {
                     let _r = tr.upsert(vec![
                         TableKV {
                             table: table_name.clone(),
-                            key: Binary::new(vec![0]),
+                            key: usize_to_binary(0),
                             value: Some(Binary::new(0usize.to_le_bytes().to_vec()))
                         }
                     ]).await;
@@ -1386,7 +1389,7 @@ fn test_log_table_conflict() {
                             let r = tr.query(vec![
                                 TableKV {
                                     table: table_name_copy.clone(),
-                                    key: Binary::new(vec![0]),
+                                    key: usize_to_binary(0),
                                     value: None
                                 }
                             ]).await;
@@ -1396,7 +1399,7 @@ fn test_log_table_conflict() {
                             let _r = tr.upsert(vec![
                                 TableKV {
                                     table: table_name_copy.clone(),
-                                    key: Binary::new(vec![0]),
+                                    key: usize_to_binary(0),
                                     value: Some(Binary::new(new_value.to_le_bytes().to_vec()))
                                 }
                             ]).await;
@@ -1469,7 +1472,7 @@ fn test_log_table_conflict() {
                     let r = tr.query(vec![
                         TableKV {
                             table: table_name.clone(),
-                            key: Binary::new(vec![0]),
+                            key: usize_to_binary(0),
                             value: None
                         }
                     ]).await;
@@ -2085,6 +2088,252 @@ fn test_log_table_inspector() {
     });
 
     thread::sleep(Duration::from_millis(1000000000));
+}
+
+// 分阶段写多个表，并在最后写入后，不等待同步直接关闭进程，在重启时修复，并检查修复数据是否成功
+// 也可以使用test_commit_log_inspector或test_log_table_inspector进行侦听
+#[test]
+fn test_multi_tables_write_and_repair() {
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    env_logger::init();
+
+    let builder = MultiTaskRuntimeBuilder::default();
+    let rt = builder.build();
+    let rt_copy = rt.clone();
+
+    //异步构建数据库管理器
+    let (sender, receiver) = bounded(1);
+    rt.spawn(rt.alloc(), async move {
+        let guid_gen = GuidGen::new(run_nanos(), 0);
+        let commit_logger_builder = CommitLoggerBuilder::new(rt_copy.clone(), "./.commit_log");
+        let commit_logger = commit_logger_builder
+            .log_file_limit(1024)
+            .build()
+            .await
+            .unwrap();
+
+        let tr_mgr = Transaction2PcManager::new(rt_copy.clone(),
+                                                guid_gen,
+                                                commit_logger);
+
+        let builder = KVDBManagerBuilder::new(rt_copy.clone(), tr_mgr, "./db");
+        match builder.startup().await {
+            Err(e) => {
+                println!("!!!!!!startup db failed, reason: {:?}", e);
+            },
+            Ok(db) => {
+                for index in 0..10 {
+                    let tr = db.transaction(Atom::from("test_log"), true, 500, 500).unwrap();
+                    if let Err(e) = tr.create_table(Atom::from("test_log".to_string() + index.to_string().as_str()),
+                                                    KVTableMeta::new(KVDBTableType::LogOrdTab,
+                                                                     true,
+                                                                     EnumType::Usize,
+                                                                     EnumType::Usize)).await {
+                        //创建有序日志表失败
+                        println!("!!!!!!create log ordered table failed, reason: {:?}", e);
+                    }
+                    let output = tr.prepare_modified().await.unwrap();
+                    let _ = tr.commit_modified(output).await;
+                }
+                println!("!!!!!!db table size: {:?}", db.table_size().await);
+
+                sender.send(db);
+            },
+        }
+    });
+
+    let db = receiver.recv().unwrap();
+    let mut table_names = Vec::new();
+    for index in 0..10 {
+        table_names.push(Atom::from("test_log".to_string() + index.to_string().as_str()));
+    }
+
+    let db_copy = db.clone();
+    let table_names_copy = table_names.clone();
+    let (sender, receiver) = bounded(1);
+    rt.spawn(rt.alloc(), async move  {
+        for table_name in &table_names_copy {
+            let tr = db_copy.transaction(table_name.clone(), true, 500, 500).unwrap();
+
+            //检查所有有序日志表
+            let mut values = tr.values(table_name.clone(), None, false).await.unwrap();
+            while let Some((key, value)) = values.next().await {
+                let val = usize::from_le_bytes(value.as_ref().try_into().unwrap());
+                println!("!!!!!!table: {}, key: {}, value: {}", table_name.as_str(), binary_to_usize(&key).unwrap(), val);
+            }
+
+            if let Ok(output) = tr.prepare_modified().await {
+                tr.commit_modified(output).await.unwrap();
+            }
+        }
+
+        sender.send(());
+    });
+
+    receiver.recv().unwrap();
+    println!("!!!!!!ready write...");
+    thread::sleep(Duration::from_millis(5000));
+    println!("!!!!!!start write");
+
+    let (sender, receiver) = unbounded();
+    let start = Instant::now();
+    for _ in 0..100 {
+        for index in 0..10 {
+            let rt_copy = rt.clone();
+            let db_copy = db.clone();
+            let table_names_copy = table_names.clone();
+            let sender_copy = sender.clone();
+
+            rt.spawn(rt.alloc(), async move {
+                let mut result = true;
+                let now = Instant::now();
+                while now.elapsed().as_millis() < 5000 {
+                    let tr = db_copy.transaction(Atom::from("Test multi table repair"), true, 500, 500).unwrap();
+
+                    for table_name in &table_names_copy {
+                        let key = usize_to_binary(index);
+                        let r = tr.query(vec![TableKV::new(table_name.clone(), key.clone(), None)]).await;
+                        let new_last_value = if r[0].is_none() {
+                            0
+                        } else {
+                            let last_value = usize::from_le_bytes(r[0].as_ref().unwrap().as_ref().try_into().unwrap());
+                            last_value + 1
+                        };
+
+                        tr.upsert(vec![TableKV::new(table_name.clone(), key, Some(Binary::new(new_last_value.to_le_bytes().to_vec())))]).await.unwrap();
+                    }
+
+                    match tr.prepare_modified().await {
+                        Err(e) => {
+                            if let ErrorLevel::Normal = e.level() {
+                                tr.rollback_modified().await.unwrap();
+                            }
+                            rt_copy.wait_timeout(0).await;
+                            continue;
+                        },
+                        Ok(output) => {
+                            tr.commit_modified(output).await;
+                            result = false;
+                            break;
+                        },
+                    }
+                }
+
+                sender_copy.send(result);
+            });
+        }
+    }
+
+    let mut count = 0;
+    let mut err_count = 0;
+    loop {
+        match receiver.recv_timeout(Duration::from_millis(10000)) {
+            Err(e) => {
+                println!(
+                    "!!!!!!recv timeout, len: {}, timer_len: {}, e: {:?}",
+                    rt.timing_len(),
+                    rt.len(),
+                    e
+                );
+                continue;
+            },
+            Ok(result) => {
+                if result {
+                    err_count += 1;
+                } else {
+                    count += 1;
+                }
+
+                if count + err_count >= 1000 {
+                    println!("!!!!!!time: {:?}, ok: {}, error: {}", start.elapsed(), count, err_count);
+                    break;
+                }
+            },
+        }
+    }
+
+    println!("!!!!!!ready sync...");
+    thread::sleep(Duration::from_millis(60000));
+    println!("!!!!!!sync finish");
+
+    let (sender, receiver) = unbounded();
+    let start = Instant::now();
+    for _ in 0..1 {
+        for index in 0..10 {
+            let rt_copy = rt.clone();
+            let db_copy = db.clone();
+            let table_names_copy = table_names.clone();
+            let sender_copy = sender.clone();
+
+            rt.spawn(rt.alloc(), async move {
+                let mut result = true;
+                let now = Instant::now();
+                while now.elapsed().as_millis() < 5000 {
+                    let tr = db_copy.transaction(Atom::from("Test multi table repair"), true, 500, 500).unwrap();
+
+                    for table_name in &table_names_copy {
+                        let key = usize_to_binary(index);
+                        let r = tr.query(vec![TableKV::new(table_name.clone(), key.clone(), None)]).await;
+                        let new_last_value = if r[0].is_none() {
+                            0
+                        } else {
+                            let last_value = usize::from_le_bytes(r[0].as_ref().unwrap().as_ref().try_into().unwrap());
+                            last_value + 1
+                        };
+
+                        tr.upsert(vec![TableKV::new(table_name.clone(), key, Some(Binary::new(new_last_value.to_le_bytes().to_vec())))]).await.unwrap();
+                    }
+
+                    match tr.prepare_modified().await {
+                        Err(e) => {
+                            if let ErrorLevel::Normal = e.level() {
+                                tr.rollback_modified().await.unwrap();
+                            }
+                            rt_copy.wait_timeout(0).await;
+                            continue;
+                        },
+                        Ok(output) => {
+                            tr.commit_modified(output).await;
+                            result = false;
+                            break;
+                        },
+                    }
+                }
+
+                sender_copy.send(result);
+            });
+        }
+    }
+
+    let mut count = 0;
+    let mut err_count = 0;
+    loop {
+        match receiver.recv_timeout(Duration::from_millis(10000)) {
+            Err(e) => {
+                println!(
+                    "!!!!!!recv timeout, len: {}, timer_len: {}, e: {:?}",
+                    rt.timing_len(),
+                    rt.len(),
+                    e
+                );
+                continue;
+            },
+            Ok(result) => {
+                if result {
+                    err_count += 1;
+                } else {
+                    count += 1;
+                }
+
+                if count + err_count >= 10 {
+                    println!("!!!!!!time: {:?}, ok: {}, error: {}", start.elapsed(), count, err_count);
+                    break;
+                }
+            },
+        }
+    }
 }
 
 // 将u8序列化为二进制数据

@@ -457,25 +457,29 @@ impl<
 
                 //更新元信息表的根节点
                 if let Some(actions) = actions {
-                    let b = tr.0.table.0.root.lock().ptr_eq(&tr.0.root_ref);
-                    if !b {
-                        //元信息表的根节点在当前事务执行过程中已改变
-                        for (key, action) in actions.iter() {
-                            match action {
-                                KVActionLog::Write(None) => {
-                                    //删除指定关键字
-                                    tr.0.table.0.root.lock().delete(key, false);
-                                },
-                                KVActionLog::Write(Some(value)) => {
-                                    //插入或更新指定关键字
-                                    tr.0.table.0.root.lock().upsert(key.clone(), value.clone(), false);
-                                },
-                                KVActionLog::Read => (), //忽略读操作
+                    {
+                        let mut locked = tr.0.table.0.root.lock();
+                        if !locked.ptr_eq(&tr.0.root_ref) {
+                            //元信息表的根节点在当前事务执行过程中已改变，
+                            //一般是因为其它事务更新了与当前事务无关的关键字，
+                            //则将当前事务的修改直接作用在当前元信息表中
+                            for (key, action) in actions.iter() {
+                                match action {
+                                    KVActionLog::Write(None) => {
+                                        //删除指定关键字
+                                        let _ = locked.delete(key, false);
+                                    },
+                                    KVActionLog::Write(Some(value)) => {
+                                        //插入或更新指定关键字
+                                        let _ = locked.upsert(key.clone(), value.clone(), false);
+                                    },
+                                    KVActionLog::Read => (), //忽略读操作
+                                }
                             }
+                        } else {
+                            //元信息表的根节点在当前事务执行过程中未改变，则用本次事务修改并提交成功的根节点替换元信息表的根节点
+                            *locked = tr.0.root_mut.lock().clone();
                         }
-                    } else {
-                        //元信息表的根节点在当前事务执行过程中未改变，则用本次事务修改并提交成功的根节点替换元信息表的根节点
-                        *tr.0.table.0.root.lock() = tr.0.root_mut.lock().clone();
                     }
 
                     //元信息表提交完成后，从元信息表的预提交表中移除当前事务的操作记录
@@ -788,8 +792,7 @@ impl<
     }
 
     // 检查元信息表的根节点冲突
-    fn check_root_conflict(&self, key: &Binary)
-                           -> Result<(), KVTableTrError> {
+    fn check_root_conflict(&self, key: &Binary) -> Result<(), KVTableTrError> {
         let b = self.0.table.0.root.lock().ptr_eq(&self.0.root_ref);
         if !b {
             //元信息表的根节点在当前事务执行过程中已改变
@@ -815,20 +818,14 @@ impl<
                 Some(root_value) => {
                     //事务的当前操作记录中的关键字，在当前表中已存在
                     match self.0.root_ref.get(&key) {
-                        None => {
-                            //事务的当前操作记录中的关键字，在事务创建时的表中不存在
-                            //表示此关键字是在当前事务内被删除，则此关键字的操作记录允许预提交
-                            //并继续其它关键字的操作记录的预提交
-                            ()
-                        },
-                        Some(copy_value) if Binary::binary_equal(&root_value, &copy_value) => {
-                            //事务的当前操作记录中的关键字，在事务创建时的表中也存在，且值相同
+                        Some(copy_value) if Binary::binary_equal(root_value, copy_value) => {
+                            //事务的当前操作记录中的关键字，在事务创建时的表中也存在，且值引用相同
                             //表示此关键字在当前事务执行过程中未改变，且值也未改变，则此关键字的操作记录允许预提交
                             //并继续其它关键字的操作记录的预提交
                             ()
                         },
                         _ => {
-                            //事务的当前操作记录中的关键字，在事务创建时的表中也存在，但值不相同
+                            //事务的当前操作记录中的关键字，与事务创建时的表中的关键字不匹配
                             //表示此关键字在当前事务执行过程中未改变，但值已改变，则此关键字的操作记录不允许预提交
                             //并立即返回当前事务预提交冲突
                             return Err(<Self as Transaction2Pc>::PrepareError::new_transaction_error(ErrorLevel::Normal, format!("Prepare meta table conflicted, table: {:?}, key: {:?}, source: {:?}, transaction_uid: {:?}, prepare_uid: {:?}, reason: the value is updated in table while the transaction is running", self.0.table.name().as_str(), key, self.0.source, self.get_transaction_uid(), self.get_prepare_uid())));
