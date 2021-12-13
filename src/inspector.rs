@@ -312,10 +312,10 @@ impl LogTableInspector {
                 response_sender: response_sender.clone(),
             };
 
-            if let Err(e) = log_file.load_before(&mut loader,
-                                                 None,
-                                                 8192,
-                                                 true).await {
+            if let Err(e) = log_file.load(&mut loader,
+                                          None,
+                                          8192,
+                                          true).await {
                 //加载指定的日志文件失败，则立即抛出异常
                 panic!("Load log ordered table failed, path: {:?}, reason: {:?}",
                        log_file.path(),
