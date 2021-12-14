@@ -1048,13 +1048,6 @@ async fn collect_waits<
                         bytes_len += key.len();
                     },
                     KVActionLog::Write(Some(value)) => {
-                        if table.name().as_str() == "config/db/Record.DramaNumberRecord" {
-                            let key = binary_to_usize(key).unwrap();
-                            if key == 112800000 {
-                                error!("collect sync, tid: {:?}, cid: {:?}, key: {}, value: {:?}", wait_tr.get_transaction_uid(), wait_tr.get_commit_uid(), key, value.as_ref());
-                            }
-                        }
-
                         //插入或更新了有序日志表中指定关键字的值
                         log_uid = table
                             .0
@@ -1110,10 +1103,4 @@ async fn collect_waits<
     table.0.collecting.store(false, Ordering::Release); //设置为已整理结束
 
     Ok((now.elapsed(), (trs_len, keys_len, bytes_len)))
-}
-
-use bon::{Decode, ReadBuffer, ReadBonErr};
-fn binary_to_usize(bin: &Binary) -> Result<usize, ReadBonErr> {
-    let mut buffer = ReadBuffer::new(bin, 0);
-    usize::decode(&mut buffer)
 }
