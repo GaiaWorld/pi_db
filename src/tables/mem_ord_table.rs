@@ -91,6 +91,20 @@ impl<
                          commit_timeout,
                          self.clone())
     }
+
+    fn ready_collect(&self) -> BoxFuture<Result<(), Self::Error>> {
+        async move {
+            //有序内存表，忽略准备整理
+            Ok(())
+        }.boxed()
+    }
+
+    fn collect(&self) -> BoxFuture<Result<(), Self::Error>> {
+        async move {
+            //有序内存表，忽略整理
+            Ok(())
+        }.boxed()
+    }
 }
 
 impl<

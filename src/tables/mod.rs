@@ -1,6 +1,7 @@
 use std::fmt::Debug;
 use std::path::Path;
 
+use futures::future::BoxFuture;
 use bytes::{Buf, BufMut};
 
 use atom::Atom;
@@ -54,6 +55,12 @@ pub trait KVTable: Send + Sync + 'static {
                    prepare_timeout: u64,
                    commit_timeout: u64)
                    -> Self::Tr;
+
+    /// 准备表整理，返回成功则可以开始表整理
+    fn ready_collect(&self) -> BoxFuture<Result<(), Self::Error>>;
+
+    /// 表整理
+    fn collect(&self) -> BoxFuture<Result<(), Self::Error>>;
 
     /// 初始化指定的预提交输出缓冲区，并将本次表事务的预提交操作的键值对数量写入预提交输出缓冲区中
     fn init_table_prepare_output(&self,

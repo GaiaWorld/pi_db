@@ -103,6 +103,55 @@ impl<
                        commit_timeout,
                        self.clone())
     }
+
+    fn ready_collect(&self) -> BoxFuture<Result<(), Self::Error>> {
+        let table = self.clone();
+
+        async move {
+            let now = Instant::now();
+            match table.0.log_file.split().await {
+                Err(e) => {
+                    //强制创建新的元信息表可写日志文件失败，则立即返回元信息表准备整理错误
+                    return Err(KVTableTrError::new_transaction_error(ErrorLevel::Normal, format!("Ready collect meta table failed, path: {:?}, table: {:?}, reason: {:?}", table.0.log_file.path(), table.0.name.as_str(), e)));
+                },
+                Ok(writed_log_index) => {
+                    //强制创建新的元信息表可写日志文件成功
+                    info!("Ready collect meta table ok, time: {:?}, path: {:?}, table: {:?}, writed_log_index: {}",
+                        now.elapsed(),
+                        table.0.log_file.path(),
+                        table.0.name.as_str(),
+                        writed_log_index);
+                    Ok(())
+                },
+            }
+        }.boxed()
+    }
+
+    fn collect(&self) -> BoxFuture<Result<(), Self::Error>> {
+        let table = self.clone();
+
+        async move {
+            let now = Instant::now();
+            match table.0.log_file.collect(1024 * 1024,
+                                           32 * 1024,
+                                           false).await {
+                Err(e) => {
+                    //整理元信息表的只读日志文件失败，则立即返回元信息表整理错误
+                    return Err(KVTableTrError::new_transaction_error(ErrorLevel::Normal, format!("Collect meta table failed, path: {:?}, table: {:?}, reason: {:?}", table.0.log_file.path(), table.0.name.as_str(), e)));
+                },
+                Ok((size, len)) => {
+                    //整理元信息表的只读日志文件成功
+                    info!("Collect meta table ok, time: {:?}, path: {:?}, table: {:?}, file_size: {}, file_len: {}",
+                        now.elapsed(),
+                        table.0.log_file.path(),
+                        table.0.name.as_str(),
+                        size,
+                        len);
+                    Ok(())
+                },
+            }
+        }.boxed()
+    }
 }
 
 impl<

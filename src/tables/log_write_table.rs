@@ -103,6 +103,55 @@ impl<
                        commit_timeout,
                        self.clone())
     }
+
+    fn ready_collect(&self) -> BoxFuture<Result<(), Self::Error>> {
+        let table = self.clone();
+
+        async move {
+            let now = Instant::now();
+            match table.0.log_file.split().await {
+                Err(e) => {
+                    //强制创建新的只写日志表可写日志文件失败，则立即返回只写日志表准备整理错误
+                    return Err(KVTableTrError::new_transaction_error(ErrorLevel::Normal, format!("Ready collect only writable table failed, path: {:?}, table: {:?}, reason: {:?}", table.0.log_file.path(), table.0.name.as_str(), e)));
+                },
+                Ok(writed_log_index) => {
+                    //强制创建新的只写日志表可写日志文件成功
+                    info!("Ready collect only writable table ok, time: {:?}, path: {:?}, table: {:?}, writed_log_index: {}",
+                        now.elapsed(),
+                        table.0.log_file.path(),
+                        table.0.name.as_str(),
+                        writed_log_index);
+                    Ok(())
+                },
+            }
+        }.boxed()
+    }
+
+    fn collect(&self) -> BoxFuture<Result<(), Self::Error>> {
+        let table = self.clone();
+
+        async move {
+            let now = Instant::now();
+            match table.0.log_file.collect(1024 * 1024,
+                                           32 * 1024,
+                                           false).await {
+                Err(e) => {
+                    //整理只写日志表的只读日志文件失败，则立即返回只写日志表整理错误
+                    return Err(KVTableTrError::new_transaction_error(ErrorLevel::Normal, format!("Collect only writable table failed, path: {:?}, table: {:?}, reason: {:?}", table.0.log_file.path(), table.0.name.as_str(), e)));
+                },
+                Ok((size, len)) => {
+                    //整理只写日志表的只读日志文件成功
+                    info!("Collect only writable table ok, time: {:?}, path: {:?}, table: {:?}, file_size: {}, file_len: {}",
+                        now.elapsed(),
+                        table.0.log_file.path(),
+                        table.0.name.as_str(),
+                        size,
+                        len);
+                    Ok(())
+                },
+            }
+        }.boxed()
+    }
 }
 
 impl<
@@ -131,7 +180,7 @@ impl<
                             init_log_file_index).await {
             Err(e) => {
                 //打开日志文件失败，则立即抛出异常
-                panic!("Open log ordered table failed, table: {:?}, path: {:?}, reason: {:?}",
+                panic!("Open only writable table failed, table: {:?}, path: {:?}, reason: {:?}",
                        name.as_str(),
                        path.as_ref(),
                        e);
@@ -164,12 +213,12 @@ impl<
                                                       load_buf_len,
                                                       is_checksum).await {
                     //加载指定的日志文件失败，则立即抛出异常
-                    panic!("Load log ordered table failed, table: {:?}, path: {:?}, reason: {:?}",
+                    panic!("Load only writable table failed, table: {:?}, path: {:?}, reason: {:?}",
                            name.as_str(),
                            path.as_ref(),
                            e);
                 }
-                info!("Load log ordered table ok, table: {:?}, path: {:?}, files: {}, keys: {}, bytes: {}, time: {:?}",
+                info!("Load only writable table ok, table: {:?}, path: {:?}, files: {}, keys: {}, bytes: {}, time: {:?}",
                     name.as_str(),
                     path.as_ref(),
                     loader.log_files_len(),
@@ -185,13 +234,13 @@ impl<
                         match collect_waits(table_ref,
                                             Some(table_copy.0.wait_timeout)).await {
                             Err((collect_time, statistics)) => {
-                                error!("Collect log ordered table failed, table: {:?}, time: {:?}, statistics: {:?}, reason: out of time",
+                                error!("Collect only writable table failed, table: {:?}, time: {:?}, statistics: {:?}, reason: out of time",
                                     table_copy.name().as_str(),
                                     collect_time,
                                     statistics);
                             },
                             Ok((collect_time, statistics)) => {
-                                debug!("Collect log ordered table ok, table: {:?}, time: {:?}, statistics: {:?}, reason: out of time",
+                                debug!("Collect only writable table ok, table: {:?}, time: {:?}, statistics: {:?}, reason: out of time",
                                     table_copy.name().as_str(),
                                     collect_time,
                                     statistics);
@@ -512,13 +561,13 @@ impl<
                         match collect_waits(&table_copy,
                                             None).await {
                             Err((collect_time, statistics)) => {
-                                error!("Collect log ordered table failed, table: {:?}, time: {:?}, statistics: {:?}, reason: out of size",
+                                error!("Collect only writable table failed, table: {:?}, time: {:?}, statistics: {:?}, reason: out of size",
                                     table_copy.name().as_str(),
                                     collect_time,
                                     statistics);
                             },
                             Ok((collect_time, statistics)) => {
-                                info!("Collect log ordered table ok, table: {:?}, time: {:?}, statistics: {:?}, reason: out of size",
+                                info!("Collect only writable table ok, table: {:?}, time: {:?}, statistics: {:?}, reason: out of size",
                                     table_copy.name().as_str(),
                                     collect_time,
                                     statistics);
@@ -729,13 +778,13 @@ impl<
                         },
                         KVActionLog::Write(_) => {
                             //本地预提交事务对相同的关键字执行了写操作，则存在读写冲突
-                            return Err(<Self as Transaction2Pc>::PrepareError::new_transaction_error(ErrorLevel::Normal, format!("Prepare log ordered table conflicted, table: {:?}, key: {:?}, source: {:?}, transaction_uid: {:?}, prepare_uid: {:?}, confilicted_transaction_uid: {:?}, reason: require write key but reading now", self.0.table.name().as_str(), key, self.0.source, self.get_transaction_uid(), self.get_prepare_uid(), guid)));
+                            return Err(<Self as Transaction2Pc>::PrepareError::new_transaction_error(ErrorLevel::Normal, format!("Prepare only writable table conflicted, table: {:?}, key: {:?}, source: {:?}, transaction_uid: {:?}, prepare_uid: {:?}, confilicted_transaction_uid: {:?}, reason: require write key but reading now", self.0.table.name().as_str(), key, self.0.source, self.get_transaction_uid(), self.get_prepare_uid(), guid)));
                         },
                     }
                 },
                 Some(KVActionLog::Write(_)) => {
                     //只写日志表的预提交表中的一个预提交事务与本地预提交事务操作了相同的关键字，且是写操作，则存在读写冲突
-                    return Err(<Self as Transaction2Pc>::PrepareError::new_transaction_error(ErrorLevel::Normal, format!("Prepare log ordered table conflicted, table: {:?}, key: {:?}, source: {:?}, transaction_uid: {:?}, prepare_uid: {:?}, confilicted_transaction_uid: {:?}, reason: writing now", self.0.table.name().as_str(), key, self.0.source, self.get_transaction_uid(), self.get_prepare_uid(), guid)));
+                    return Err(<Self as Transaction2Pc>::PrepareError::new_transaction_error(ErrorLevel::Normal, format!("Prepare only writable table conflicted, table: {:?}, key: {:?}, source: {:?}, transaction_uid: {:?}, prepare_uid: {:?}, confilicted_transaction_uid: {:?}, reason: writing now", self.0.table.name().as_str(), key, self.0.source, self.get_transaction_uid(), self.get_prepare_uid(), guid)));
                 },
                 None => {
                     //只写日志表的预提交表中没有任何预提交事务与本地预提交事务操作了相同的关键字，则不存在读写冲突，并立即返回检查成功
@@ -767,7 +816,7 @@ impl<
                             //事务的当前操作记录中的关键字，在事务创建时的表中已存在
                             //表示此关键字在当前事务执行过程中被删除，则此关键字的操作记录不允许预提交
                             //并立即返回当前事务预提交冲突
-                            return Err(<Self as Transaction2Pc>::PrepareError::new_transaction_error(ErrorLevel::Normal, format!("Prepare log ordered table conflicted, table: {:?}, key: {:?}, source: {:?}, transaction_uid: {:?}, prepare_uid: {:?}, reason: the key is deleted in table while the transaction is running", self.0.table.name().as_str(), key, self.0.source, self.get_transaction_uid(), self.get_prepare_uid())));
+                            return Err(<Self as Transaction2Pc>::PrepareError::new_transaction_error(ErrorLevel::Normal, format!("Prepare only writable table conflicted, table: {:?}, key: {:?}, source: {:?}, transaction_uid: {:?}, prepare_uid: {:?}, reason: the key is deleted in table while the transaction is running", self.0.table.name().as_str(), key, self.0.source, self.get_transaction_uid(), self.get_prepare_uid())));
                         },
                     }
                 },
@@ -784,7 +833,7 @@ impl<
                             //事务的当前操作记录中的关键字，与事务创建时的表中的关键字不匹配
                             //表示此关键字在当前事务执行过程中未改变，但值已改变，则此关键字的操作记录不允许预提交
                             //并立即返回当前事务预提交冲突
-                            return Err(<Self as Transaction2Pc>::PrepareError::new_transaction_error(ErrorLevel::Normal, format!("Prepare log ordered table conflicted, table: {:?}, key: {:?}, source: {:?}, transaction_uid: {:?}, prepare_uid: {:?}, reason: the value is updated in table while the transaction is running", self.0.table.name().as_str(), key, self.0.source, self.get_transaction_uid(), self.get_prepare_uid())));
+                            return Err(<Self as Transaction2Pc>::PrepareError::new_transaction_error(ErrorLevel::Normal, format!("Prepare only writable table conflicted, table: {:?}, key: {:?}, source: {:?}, transaction_uid: {:?}, prepare_uid: {:?}, reason: the value is updated in table while the transaction is running", self.0.table.name().as_str(), key, self.0.source, self.get_transaction_uid(), self.get_prepare_uid())));
                         },
                     }
                 },
@@ -1029,7 +1078,7 @@ async fn collect_waits<
             .await {
             //写入日志文件失败，则立即中止本次整理
             table.0.collecting.store(false, Ordering::Release); //设置为已整理结束
-            error!("Collect log ordered table failed, table: {:?}, transactions: {}, keys: {}, bytes: {}, reason: {:?}",
+            error!("Collect only writable table failed, table: {:?}, transactions: {}, keys: {}, bytes: {}, reason: {:?}",
             table.name().as_str(),
             trs_len,
             keys_len,
@@ -1045,7 +1094,7 @@ async fn collect_waits<
         if let Err(e) = confirm(wait_tr.get_transaction_uid().unwrap(),
                                 wait_tr.get_commit_uid().unwrap(),
                                 Ok(())) {
-            error!("Collect log ordered table failed, table: {:?}, transactions: {}, keys: {}, bytes: {}, reason: {:?}",
+            error!("Collect only writable table failed, table: {:?}, transactions: {}, keys: {}, bytes: {}, reason: {:?}",
                     table.name().as_str(),
                     trs_len,
                     keys_len,

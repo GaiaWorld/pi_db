@@ -462,6 +462,64 @@ impl<
         }
     }
 
+    /// 异步准备整理指定名称的数据表，准备整理成功，才允许开始整理表
+    pub async fn ready_collect_table(&self, table_name: &Atom) -> IOResult<()> {
+        match self.0.tables.read().await.get(&table_name) {
+            None => (),
+            Some(KVDBTable::MetaTab(table)) => {
+                if let Err(e) = table.ready_collect().await {
+                    return Err(Error::new(ErrorKind::Other, format!("{:?}", e)));
+                }
+            },
+            Some(KVDBTable::MemOrdTab(table)) => {
+                if let Err(e) = table.ready_collect().await {
+                    return Err(Error::new(ErrorKind::Other, format!("{:?}", e)));
+                }
+            },
+            Some(KVDBTable::LogOrdTab(table)) => {
+                if let Err(e) = table.ready_collect().await {
+                    return Err(Error::new(ErrorKind::Other, format!("{:?}", e)));
+                }
+            },
+            Some(KVDBTable::LogWTab(table)) => {
+                if let Err(e) = table.ready_collect().await {
+                    return Err(Error::new(ErrorKind::Other, format!("{:?}", e)));
+                }
+            },
+        }
+
+        Ok(())
+    }
+
+    /// 异步整理指定名称的数据表
+    pub async fn collect_table(&self, table_name: &Atom) -> IOResult<()> {
+        match self.0.tables.read().await.get(&table_name) {
+            None => (),
+            Some(KVDBTable::MetaTab(table)) => {
+                if let Err(e) = table.collect().await {
+                    return Err(Error::new(ErrorKind::Other, format!("{:?}", e)));
+                }
+            },
+            Some(KVDBTable::MemOrdTab(table)) => {
+                if let Err(e) = table.collect().await {
+                    return Err(Error::new(ErrorKind::Other, format!("{:?}", e)));
+                }
+            },
+            Some(KVDBTable::LogOrdTab(table)) => {
+                if let Err(e) = table.collect().await {
+                    return Err(Error::new(ErrorKind::Other, format!("{:?}", e)));
+                }
+            },
+            Some(KVDBTable::LogWTab(table)) => {
+                if let Err(e) = table.collect().await {
+                    return Err(Error::new(ErrorKind::Other, format!("{:?}", e)));
+                }
+            },
+        }
+
+        Ok(())
+    }
+
     // 尝试幂等的重播未确认的提交日志，并修复数据库表数据
     // 注意如果在只有单个线程的运行时修复或并发修复，则可能会发生阻塞
     pub(crate) async fn try_repair(&self) -> IOResult<(usize, usize)> {

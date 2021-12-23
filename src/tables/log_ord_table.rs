@@ -105,6 +105,55 @@ impl<
                          commit_timeout,
                          self.clone())
     }
+
+    fn ready_collect(&self) -> BoxFuture<Result<(), Self::Error>> {
+        let table = self.clone();
+
+        async move {
+            let now = Instant::now();
+            match table.0.log_file.split().await {
+                Err(e) => {
+                    //强制创建新的有序日志表可写日志文件失败，则立即返回有序日志表准备整理错误
+                    return Err(KVTableTrError::new_transaction_error(ErrorLevel::Normal, format!("Ready collect log ordered table failed, path: {:?}, table: {:?}, reason: {:?}", table.0.log_file.path(), table.0.name.as_str(), e)));
+                },
+                Ok(writed_log_index) => {
+                    //强制创建新的有序日志表可写日志文件成功
+                    info!("Ready collect log ordered table ok, time: {:?}, path: {:?}, table: {:?}, writed_log_index: {}",
+                        now.elapsed(),
+                        table.0.log_file.path(),
+                        table.0.name.as_str(),
+                        writed_log_index);
+                    Ok(())
+                },
+            }
+        }.boxed()
+    }
+
+    fn collect(&self) -> BoxFuture<Result<(), Self::Error>> {
+        let table = self.clone();
+
+        async move {
+            let now = Instant::now();
+            match table.0.log_file.collect(1024 * 1024,
+                                           32 * 1024,
+                                           false).await {
+                Err(e) => {
+                    //整理有序日志表的只读日志文件失败，则立即返回有序日志表整理错误
+                    return Err(KVTableTrError::new_transaction_error(ErrorLevel::Normal, format!("Collect log ordered table failed, path: {:?}, table: {:?}, reason: {:?}", table.0.log_file.path(), table.0.name.as_str(), e)));
+                },
+                Ok((size, len)) => {
+                    //整理有序日志表的只读日志文件成功
+                    info!("Collect log ordered table ok, time: {:?}, path: {:?}, table: {:?}, file_size: {}, file_len: {}",
+                        now.elapsed(),
+                        table.0.log_file.path(),
+                        table.0.name.as_str(),
+                        size,
+                        len);
+                    Ok(())
+                },
+            }
+        }.boxed()
+    }
 }
 
 impl<
