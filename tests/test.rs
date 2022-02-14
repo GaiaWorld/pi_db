@@ -2439,7 +2439,7 @@ fn test_multi_tables_write_and_repair1() {
         for index in 0..10 {
             let rt_copy = rt.clone();
             let db_copy = db.clone();
-            let table_names_copy = table_names.clone();
+            let table_names_copy = table_names.clone();0
             let sender_copy = sender.clone();
 
             rt.spawn(rt.alloc(), async move {

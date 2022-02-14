@@ -1915,9 +1915,12 @@ impl<
                             //待创建表的名称与已存在的表相同，且元信息相同，则立即返回创建成功
                             return Ok(());
                         } else {
-                            //待创建表的名称与已存在的表相同，但元信息不同，则表名冲突
-                            return Err(Error::new(ErrorKind::AlreadyExists,
-                                                  format!("Create table failed, name: {:?}, meta: {:?}, reason: name conflict", name, meta)));
+                            //待创建表的名称与已存在的表相同，但元信息不同
+                            if table_meta.is_persistence() {
+                                //已存在的同名表是持久化表，且元信息不同，则表名冲突
+                                return Err(Error::new(ErrorKind::AlreadyExists,
+                                                      format!("Create table failed, name: {:?}, meta: {:?}, reason: name conflict", name, meta)));
+                            }
                         }
                     } else {
                         //指定名称的表的元信息不存在，则立即返回错误原因
