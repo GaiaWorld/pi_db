@@ -1904,7 +1904,7 @@ impl<
                     table_tr.clone()
                 } else {
                     //元信息表的子事务不存在，则创建元信息表的事务
-                    self.table_transaction(meta_table_name, meta_table, false, &mut *childes_map)
+                    self.table_transaction(meta_table_name.clone(), meta_table, false, &mut *childes_map)
                 };
 
                 if let KVDBTransaction::MetaTabTr(tr) = meta_table_tr {
