@@ -2,12 +2,12 @@ use std::sync::Arc;
 
 use pi_db::{log_file_db::STORE_RUNTIME, mgr::{ DatabaseWare, Mgr }};
 use pi_db::memery_db::MemDB;
-use atom::Atom;
-use sinfo;
-use guid::GuidGen;
-use r#async::rt::multi_thread::{MultiTaskPool, MultiTaskRuntime};
+use pi_atom::Atom;
+use pi_sinfo;
+use pi_guid::GuidGen;
+use pi_async::rt::multi_thread::{MultiTaskPool, MultiTaskRuntime};
 use pi_db::db::{TabKV, TabMeta};
-use bon::WriteBuffer;
+use pi_bon::WriteBuffer;
 
 #[test]
 fn test_mem_db_iter() {
@@ -21,7 +21,7 @@ fn test_mem_db_iter() {
 		*STORE_RUNTIME.write().await = Some(rt.clone());
 		let _ = mgr.register(Atom::from("memory"), Arc::new(ware)).await;
 		let mut tr = mgr.transaction(true, Some(rt.clone())).await;
-		let meta = TabMeta::new(sinfo::EnumType::Str, sinfo::EnumType::Str);
+		let meta = TabMeta::new(pi_sinfo::EnumType::Str, pi_sinfo::EnumType::Str);
 		tr.alter(&Atom::from("memory"), &Atom::from("hello"), Some(Arc::new(meta))).await;
 
 		tr.prepare().await;
@@ -81,8 +81,8 @@ fn test_memory_db() {
 		let _ = mgr.register(Atom::from("memory"), Arc::new(ware)).await;
 		let mut tr = mgr.transaction(true, Some(rt.clone())).await;
 
-		let meta = TabMeta::new(sinfo::EnumType::Str, sinfo::EnumType::Str);
-		let meta1 = TabMeta::new(sinfo::EnumType::Str, sinfo::EnumType::Str);
+		let meta = TabMeta::new(pi_sinfo::EnumType::Str, pi_sinfo::EnumType::Str);
+		let meta1 = TabMeta::new(pi_sinfo::EnumType::Str, pi_sinfo::EnumType::Str);
 
 		tr.alter(&Atom::from("memory"), &Atom::from("hello"), Some(Arc::new(meta))).await;
 		tr.alter(&Atom::from("memory"), &Atom::from("world"), Some(Arc::new(meta1))).await;

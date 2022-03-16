@@ -8,13 +8,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crossbeam_channel::bounded;
 use pi_db::{log_file_db::STORE_RUNTIME, mgr::{ DatabaseWare, Mgr }};
 use pi_db::log_file_db::{LOG_FILE_SIZE, AsyncLogFileStore, LogFileDB};
-use atom::Atom;
-use sinfo;
-use guid::GuidGen;
-use r#async::{lock::spin_lock::SpinLock, rt::multi_thread::{MultiTaskRuntimeBuilder, MultiTaskRuntime}};
+use pi_atom::Atom;
+use pi_sinfo;
+use pi_guid::GuidGen;
+use pi_async::{lock::spin_lock::SpinLock, rt::multi_thread::{MultiTaskRuntimeBuilder, MultiTaskRuntime}};
 use pi_db::db::{TabKV, TabMeta};
-use bon::WriteBuffer;
-use hash::XHashMap;
+use pi_bon::WriteBuffer;
+use pi_hash::XHashMap;
 
 #[test]
 fn test_collect_log_file_db() {
@@ -75,7 +75,7 @@ fn test_collect_log_file_db() {
 
 		let mut tr = mgr_copy.transaction(true, Some(rt_copy.clone())).await;
 
-		let meta = TabMeta::new(sinfo::EnumType::Str, sinfo::EnumType::Str);
+		let meta = TabMeta::new(pi_sinfo::EnumType::Str, pi_sinfo::EnumType::Str);
 
 		tr.alter(
 			&Atom::from("./tests"),
@@ -276,8 +276,8 @@ fn test_log_file_db() {
 		let _ = mgr.register(Atom::from("logfile"), Arc::new(ware)).await;
 		let mut tr = mgr.transaction(true, Some(rt.clone())).await;
 
-		let meta = TabMeta::new(sinfo::EnumType::Str, sinfo::EnumType::Str);
-		let meta1 = TabMeta::new(sinfo::EnumType::Str, sinfo::EnumType::Str);
+		let meta = TabMeta::new(pi_sinfo::EnumType::Str, pi_sinfo::EnumType::Str);
+		let meta1 = TabMeta::new(pi_sinfo::EnumType::Str, pi_sinfo::EnumType::Str);
 
 		tr.alter(&Atom::from("logfile"), &Atom::from("./testlogfile/hello"), Some(Arc::new(meta))).await;
 		tr.alter(&Atom::from("logfile"), &Atom::from("./testlogfile/world"), Some(Arc::new(meta1))).await;
@@ -378,8 +378,8 @@ fn write_test_data() {
 		let _ = mgr.register(Atom::from("logfile"), Arc::new(ware)).await;
 		let mut tr = mgr.transaction(true, Some(rt.clone())).await;
 
-		let meta = TabMeta::new(sinfo::EnumType::Str, sinfo::EnumType::Str);
-		let meta1 = TabMeta::new(sinfo::EnumType::Str, sinfo::EnumType::Str);
+		let meta = TabMeta::new(pi_sinfo::EnumType::Str, pi_sinfo::EnumType::Str);
+		let meta1 = TabMeta::new(pi_sinfo::EnumType::Str, pi_sinfo::EnumType::Str);
 
 		tr.alter(&Atom::from("logfile"), &Atom::from("./testlogfile/testtab"), Some(Arc::new(meta))).await;
 		let p = tr.prepare().await;
@@ -446,7 +446,7 @@ fn read_test_data() {
 		let _ = mgr.register(Atom::from("logfile"), Arc::new(ware)).await;
 		let mut tr = mgr.transaction(true, Some(rt.clone())).await;
 
-		let meta = TabMeta::new(sinfo::EnumType::Str, sinfo::EnumType::Str);
+		let meta = TabMeta::new(pi_sinfo::EnumType::Str, pi_sinfo::EnumType::Str);
 
 		let a = tr.alter(&Atom::from("logfile"), &Atom::from("./testlogfile/testtab"), Some(Arc::new(meta))).await;
 		println!("alter result ==== {:?}", a);
@@ -502,7 +502,7 @@ fn bench_log_file_write() {
 
         let mut tr = mgr_copy.transaction(true, Some(rt1.clone())).await;
 
-        let meta = TabMeta::new(sinfo::EnumType::Str, sinfo::EnumType::Str);
+        let meta = TabMeta::new(pi_sinfo::EnumType::Str, pi_sinfo::EnumType::Str);
 
         tr.alter(
             &Atom::from("logfile"),
