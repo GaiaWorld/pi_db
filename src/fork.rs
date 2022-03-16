@@ -1,8 +1,8 @@
 use std::{collections::HashMap, sync::Arc};
 
-use atom::Atom;
-use bon::{Encode, Decode, WriteBuffer, ReadBuffer, ReadBonErr};
-use r#async::lock::mutex_lock::Mutex;
+use pi_atom::Atom;
+use pi_bon::{Encode, Decode, WriteBuffer, ReadBuffer, ReadBonErr};
+use pi_async::lock::mutex_lock::Mutex;
 
 use crate::db::TabMeta;
 
@@ -136,7 +136,7 @@ pub fn load_data_from_fork_chain(chain: &[TableMetaInfo]) {
 }
 
 mod tests {
-	use sinfo::EnumType;
+	use pi_sinfo::EnumType;
 	use super::*;
 	#[test]
 	fn test_table_meta_info_codec() {

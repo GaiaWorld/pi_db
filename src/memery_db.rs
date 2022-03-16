@@ -2,57 +2,21 @@
 use std::sync::Arc;
 use std::mem;
 
-use hash::XHashMap;
-use ordmap::ordmap::{OrdMap, Entry, Iter as OIter, Keys};
-use ordmap::asbtree::{Tree};
-use atom::{Atom};
-use guid::Guid;
-use apm::counter::{GLOBAL_PREF_COLLECT, PrefCounter};
+use pi_hash::XHashMap;
+use pi_ordmap::ordmap::{OrdMap, Entry, Iter as OIter, Keys};
+use pi_ordmap::asbtree::{Tree};
+use pi_atom::{Atom};
+use pi_guid::Guid;
 
 use crate::db::{Bin, TabKV, SResult, IterResult, KeyIterResult, NextResult, Event, Filter, TxState, Iter, RwLog, Bon, TabMeta, CommitResult, DBResult};
 use crate::tabs::{TabLog, Tabs, Prepare};
 use crate::db::BuildDbType;
-use r#async::lock::mutex_lock::Mutex;
-use r#async::lock::rw_lock::RwLock;
+use pi_async::lock::mutex_lock::Mutex;
+use pi_async::lock::rw_lock::RwLock;
 use crate::tabs::TxnType;
 
 //内存表前缀
 const MEMORY_TABLE_PREFIX: &'static str = "mem_table_";
-//内存表事务创建数量后缀
-const MEMORY_TABLE_TRANS_COUNT_SUFFIX: &'static str = "_trans_count";
-//内存表事务预提交数量后缀
-const MEMORY_TABLE_PREPARE_COUNT_SUFFIX: &'static str = "_prepare_count";
-//内存表事务提交数量后缀
-const MEMORY_TABLE_COMMIT_COUNT_SUFFIX: &'static str = "_commit_count";
-//内存表事务回滚数量后缀
-const MEMORY_TABLE_ROLLBACK_COUNT_SUFFIX: &'static str = "_rollback_count";
-//内存表读记录数量后缀
-const MEMORY_TABLE_READ_COUNT_SUFFIX: &'static str = "_read_count";
-//内存表读记录字节数量后缀
-const MEMORY_TABLE_READ_BYTE_COUNT_SUFFIX: &'static str = "_read_byte_count";
-//内存表写记录数量后缀
-const MEMORY_TABLE_WRITE_COUNT_SUFFIX: &'static str = "_write_count";
-//内存表写记录字节数量后缀
-const MEMORY_TABLE_WRITE_BYTE_COUNT_SUFFIX: &'static str = "_write_byte_count";
-//内存表删除记录数量后缀
-const MEMORY_TABLE_REMOVE_COUNT_SUFFIX: &'static str = "_remove_count";
-//内存表删除记录字节数量后缀
-const MEMORY_TABLE_REMOVE_BYTE_COUNT_SUFFIX: &'static str = "_remove_byte_count";
-//内存表关键字迭代数量后缀
-const MEMORY_TABLE_KEY_ITER_COUNT_SUFFIX: &'static str = "_key_iter_count";
-//内存表关键字迭代字节数量后缀
-const MEMORY_TABLE_KEY_ITER_BYTE_COUNT_SUFFIX: &'static str = "_key_iter_byte_count";
-//内存表迭代数量后缀
-const MEMORY_TABLE_ITER_COUNT_SUFFIX: &'static str = "_iter_count";
-//内存表关键字迭代字节数量后缀
-const MEMORY_TABLE_ITER_BYTE_COUNT_SUFFIX: &'static str = "_iter_byte_count";
-
-lazy_static! {
-	//内存库创建数量
-	static ref MEMORY_WARE_CREATE_COUNT: PrefCounter = GLOBAL_PREF_COLLECT.new_static_counter(Atom::from("mem_ware_create_count"), 0).unwrap();
-	//内存表创建数量
-	static ref MEMORY_TABLE_CREATE_COUNT: PrefCounter = GLOBAL_PREF_COLLECT.new_static_counter(Atom::from("mem_table_create_count"), 0).unwrap();
-}
 
 /*
 * 内存表的句柄，跨线程安全，异步安全
@@ -63,50 +27,17 @@ pub struct MTab(Arc<Mutex<MemeryTab>>);
 impl MTab {
 	//创建内存表的句柄
 	pub fn new(tab: &Atom) -> Self {
-		MEMORY_WARE_CREATE_COUNT.sum(1);
 
 		let tab = MemeryTab {
 			prepare: Prepare::new(XHashMap::with_capacity_and_hasher(0, Default::default())),
 			root: OrdMap::new(None),
 			tab: tab.clone(),
-			trans_count: GLOBAL_PREF_COLLECT.
-				new_dynamic_counter(
-					Atom::from(MEMORY_TABLE_PREFIX.to_string() + tab + MEMORY_TABLE_TRANS_COUNT_SUFFIX), 0).unwrap(),
-			prepare_count: GLOBAL_PREF_COLLECT.
-				new_dynamic_counter(
-					Atom::from(MEMORY_TABLE_PREFIX.to_string() + tab + MEMORY_TABLE_PREPARE_COUNT_SUFFIX), 0).unwrap(),
-			commit_count: GLOBAL_PREF_COLLECT.
-				new_dynamic_counter(
-					Atom::from(MEMORY_TABLE_PREFIX.to_string() + tab + MEMORY_TABLE_COMMIT_COUNT_SUFFIX), 0).unwrap(),
-			rollback_count: GLOBAL_PREF_COLLECT.
-				new_dynamic_counter(
-					Atom::from(MEMORY_TABLE_PREFIX.to_string() + tab + MEMORY_TABLE_ROLLBACK_COUNT_SUFFIX), 0).unwrap(),
-			read_count: GLOBAL_PREF_COLLECT.
-				new_dynamic_counter(
-					Atom::from(MEMORY_TABLE_PREFIX.to_string() + tab + MEMORY_TABLE_READ_COUNT_SUFFIX), 0).unwrap(),
-			read_byte: GLOBAL_PREF_COLLECT.
-				new_dynamic_counter(
-					Atom::from(MEMORY_TABLE_PREFIX.to_string() + tab + MEMORY_TABLE_READ_BYTE_COUNT_SUFFIX), 0).unwrap(),
-			write_count: GLOBAL_PREF_COLLECT.
-				new_dynamic_counter(
-					Atom::from(MEMORY_TABLE_PREFIX.to_string() + tab + MEMORY_TABLE_WRITE_COUNT_SUFFIX), 0).unwrap(),
-			write_byte: GLOBAL_PREF_COLLECT.
-				new_dynamic_counter(
-					Atom::from(MEMORY_TABLE_PREFIX.to_string() + tab + MEMORY_TABLE_WRITE_BYTE_COUNT_SUFFIX), 0).unwrap(),
-			remove_count: GLOBAL_PREF_COLLECT.
-				new_dynamic_counter(
-					Atom::from(MEMORY_TABLE_PREFIX.to_string() + tab + MEMORY_TABLE_REMOVE_COUNT_SUFFIX), 0).unwrap(),
-			remove_byte: GLOBAL_PREF_COLLECT.
-				new_dynamic_counter(
-					Atom::from(MEMORY_TABLE_PREFIX.to_string() + tab + MEMORY_TABLE_REMOVE_BYTE_COUNT_SUFFIX), 0).unwrap(),
 		};
 		MTab(Arc::new(Mutex::new(tab)))
 	}
 
 	//创建一个内存表事务的引用
 	pub async fn transaction(&self, id: &Guid, writable: bool) -> RefMemeryTxn {
-		self.0.lock().await.trans_count.sum(1);
-
 		MemeryTxn::new(self.clone(), id, writable).await
 	}
 }
@@ -123,8 +54,6 @@ impl MemDB {
 	* @returns 返回内存数据库
 	*/
 	pub fn new() -> Self {
-		MEMORY_WARE_CREATE_COUNT.sum(1);
-
 		MemDB(Arc::new(Tabs::new()))
 	}
 
@@ -415,8 +344,6 @@ impl MemeryTxn {
 
 	//获取指定主键的记录的值
 	pub async fn get(&mut self, key: Bin) -> Option<Bin> {
-		self.tab.0.lock().await.read_count.sum(1);
-
 		match self.root.get(&Bon::new(key.clone())) {
 			Some(v) => {
 				if self.writable {
@@ -428,8 +355,6 @@ impl MemeryTxn {
 						}
 					}
 				}
-
-				self.tab.0.lock().await.read_byte.sum(v.len());
 
 				return Some(v.clone())
 			},
@@ -444,8 +369,6 @@ impl MemeryTxn {
 
 		{
 			let tab = self.tab.0.lock().await;
-			tab.write_byte.sum(value.len());
-			tab.write_count.sum(1);
 		}
 
 		Ok(())
@@ -456,8 +379,6 @@ impl MemeryTxn {
 		if let Some(Some(value)) = self.root.delete(&Bon::new(key.clone()), false) {
 			{
 				let tab = self.tab.0.lock().await;
-				tab.remove_byte.sum(key.len() + value.len());
-				tab.remove_count.sum(1);
 			}
 		}
 		self.rwlog.insert(key, RwLog::Write(None));
@@ -493,8 +414,6 @@ impl MemeryTxn {
 		let rwlog = mem::replace(&mut self.rwlog, XHashMap::with_capacity_and_hasher(0, Default::default()));
 		//写入预提交
 		tab.prepare.insert(self.id.clone(), rwlog);
-
-		tab.prepare_count.sum(1);
 
 		return Ok(())
 	}
@@ -537,8 +456,6 @@ impl MemeryTxn {
 			}
 		};
 
-		self.tab.0.lock().await.commit_count.sum(1);
-
 		Ok(logs)
 	}
 
@@ -546,8 +463,6 @@ impl MemeryTxn {
 	pub async fn rollback_inner(&mut self) -> DBResult {
 		let mut tab = self.tab.0.lock().await;
 		tab.prepare.remove(&self.id);
-
-		tab.rollback_count.sum(1);
 
 		Ok(())
 	}
@@ -564,24 +479,12 @@ struct MemeryTab {
 	pub prepare: Prepare,			//预提交
 	pub root: BinMap,				//内存表的句柄
 	pub tab: Atom,					//表名，例如"db/user"
-	trans_count:	PrefCounter,	//事务计数
-	prepare_count:	PrefCounter,	//预提交计数
-	commit_count:	PrefCounter,	//提交计数
-	rollback_count:	PrefCounter,	//回滚计数
-	read_count:		PrefCounter,	//读计数
-	read_byte:		PrefCounter,	//读字节
-	write_count:	PrefCounter,	//写计数
-	write_byte:		PrefCounter,	//写字节
-	remove_count:	PrefCounter,	//删除计数
-	remove_byte:	PrefCounter,	//删除字节
 }
 
 pub struct MemIter{
 	_root: BinMap,
 	_filter: Filter,
 	point: usize,
-	iter_count:		PrefCounter,	//迭代计数
-	iter_byte:		PrefCounter,	//迭代字节
 }
 
 impl Drop for MemIter{
@@ -596,12 +499,6 @@ impl MemIter{
 			_root: root,
 			_filter: filter,
 			point: Box::into_raw(Box::new(it)) as usize,
-			iter_count: GLOBAL_PREF_COLLECT.
-				new_dynamic_counter(
-					Atom::from(MEMORY_TABLE_PREFIX.to_string() + tab + MEMORY_TABLE_ITER_COUNT_SUFFIX), 0).unwrap(),
-			iter_byte: GLOBAL_PREF_COLLECT.
-				new_dynamic_counter(
-					Atom::from(MEMORY_TABLE_PREFIX.to_string() + tab + MEMORY_TABLE_ITER_BYTE_COUNT_SUFFIX), 0).unwrap(),
 		}
 	}
 }
@@ -609,14 +506,10 @@ impl MemIter{
 impl Iter for MemIter{
 	type Item = (Bin, Bin);
 	fn next(&mut self) -> Option<NextResult<Self::Item>>{
-		self.iter_count.sum(1);
-
 		let mut it = unsafe{Box::from_raw(self.point as *mut <Tree<Bin, Bin> as OIter<'_>>::IterType)};
 		// println!("MemIter next----------------------------------------------------------------");
 		let r = Some(Ok(match it.next() {
 			Some(&Entry(ref k, ref v)) => {
-				self.iter_byte.sum(k.len() + v.len());
-
 				Some((k.clone(), v.clone()))
 			},
 			None => None,
@@ -630,8 +523,6 @@ pub struct MemKeyIter{
 	_root: BinMap,
 	_filter: Filter,
 	point: usize,
-	iter_count:		PrefCounter,	//迭代计数
-	iter_byte:		PrefCounter,	//迭代字节
 }
 
 impl Drop for MemKeyIter{
@@ -646,12 +537,6 @@ impl MemKeyIter{
 			_root: root,
 			_filter: filter,
 			point: Box::into_raw(Box::new(keys)) as usize,
-			iter_count: GLOBAL_PREF_COLLECT.
-				new_dynamic_counter(
-					Atom::from(MEMORY_TABLE_PREFIX.to_string() + tab + MEMORY_TABLE_KEY_ITER_COUNT_SUFFIX), 0).unwrap(),
-			iter_byte: GLOBAL_PREF_COLLECT.
-				new_dynamic_counter(
-					Atom::from(MEMORY_TABLE_PREFIX.to_string() + tab + MEMORY_TABLE_KEY_ITER_BYTE_COUNT_SUFFIX), 0).unwrap(),
 		}
 	}
 }
@@ -659,13 +544,9 @@ impl MemKeyIter{
 impl Iter for MemKeyIter{
 	type Item = Bin;
 	fn next(&mut self) -> Option<NextResult<Self::Item>>{
-		self.iter_count.sum(1);
-
 		let it = unsafe{Box::from_raw(self.point as *mut Keys<'_, Tree<Bin, Bin>>)};
 		let r = Some(Ok(match unsafe{Box::from_raw(self.point as *mut Keys<'_, Tree<Bin, Bin>>)}.next() {
 			Some(k) => {
-				self.iter_byte.sum(k.len());
-
 				Some(k.clone())
 			},
 			None => None,
