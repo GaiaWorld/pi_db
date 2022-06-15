@@ -12,19 +12,21 @@ async-stream = "0.3"
 bytes = "1.0"
 dashmap = "4.0"
 log = "0.4"
-atom = { path = "../pi_lib/atom" }
-bon = { path = "../pi_lib/bon" }
-guid = { path = "../pi_lib/guid" }
-async = { path = "../pi_lib/async" }
-async_file = { path = "../pi_lib/async_file" }
-async_transaction = { path = "../pi_lib/async_transaction" }
+pi_async = "0.2"
+pi_async_file = "0.1"
+pi_async_transaction = "0.1"
 pi_store = { path = "../pi_store" }
-ordmap = { path = "../pi_lib/ordmap" }
-hash = { path = "../pi_lib/hash" }
-sinfo = { path = "../pi_lib/sinfo" }
+pi_atom = "0.1"
+pi_guid = "0.1"
+pi_bon = "0.1"
+pi_sinfo = "0.1"
+pi_ordmap = "0.1"
+pi_hash = "0.1"
+
+
 
 [dev-dependencies]
 crossbeam-channel = "0.5"
 env_logger = "0.9"
 fastrand = "1.5"
-time = { path = "../pi_lib/time" }
+pi_time = "0.1"

@@ -10,22 +10,22 @@ use futures::{future::{FutureExt, BoxFuture}, stream::{StreamExt, BoxStream}};
 use async_stream::stream;
 use log::{debug, info, error};
 
-use atom::Atom;
-use guid::Guid;
-use hash::XHashMap;
-use ordmap::{ordmap::{Iter, OrdMap, Keys, Entry}, asbtree::Tree};
-use r#async::{lock::{spin_lock::SpinLock,
-                     mutex_lock::Mutex as AsyncMutex},
-              rt::multi_thread::MultiTaskRuntime};
-use async_transaction::{AsyncTransaction,
-                        Transaction2Pc,
-                        UnitTransaction,
-                        SequenceTransaction,
-                        TransactionTree,
-                        TransactionError,
-                        AsyncCommitLog,
-                        ErrorLevel,
-                        manager_2pc::Transaction2PcStatus};
+use pi_atom::Atom;
+use pi_guid::Guid;
+use pi_hash::XHashMap;
+use pi_ordmap::{ordmap::{Iter, OrdMap, Keys, Entry}, asbtree::Tree};
+use pi_async::{lock::{spin_lock::SpinLock,
+                      mutex_lock::Mutex as AsyncMutex},
+               rt::{AsyncRuntime, multi_thread::MultiTaskRuntime}};
+use pi_async_transaction::{AsyncTransaction,
+                           Transaction2Pc,
+                           UnitTransaction,
+                           SequenceTransaction,
+                           TransactionTree,
+                           TransactionError,
+                           AsyncCommitLog,
+                           ErrorLevel,
+                           manager_2pc::Transaction2PcStatus};
 use pi_store::log_store::log_file::{PairLoader,
                                     LogMethod,
                                     LogFile};
@@ -1053,7 +1053,7 @@ async fn collect_waits<
     //等待指定的时间
     if let Some(timeout) = timeout {
         //需要等待指定时间后，再开始整理
-        table.0.rt.wait_timeout(timeout).await;
+        table.0.rt.timeout(timeout).await;
     }
 
     //检查是否正在异步整理，如果并未开始异步整理，则设置为正在异步整理，并继续异步整理

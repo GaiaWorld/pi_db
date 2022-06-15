@@ -4,12 +4,12 @@ use std::path::Path;
 use futures::future::BoxFuture;
 use bytes::{Buf, BufMut};
 
-use atom::Atom;
-use async_transaction::{AsyncTransaction,
-                        Transaction2Pc,
-                        UnitTransaction,
-                        SequenceTransaction,
-                        TransactionTree};
+use pi_atom::Atom;
+use pi_async_transaction::{AsyncTransaction,
+                           Transaction2Pc,
+                           UnitTransaction,
+                           SequenceTransaction,
+                           TransactionTree};
 
 use crate::{Binary,
             KVAction};

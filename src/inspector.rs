@@ -7,13 +7,13 @@ use std::sync::{Arc, atomic::{AtomicIsize, Ordering}};
 
 use crossbeam_channel::{Sender, Receiver, bounded};
 
-use atom::Atom;
-use r#async::rt::multi_thread::MultiTaskRuntime;
-use async_transaction::AsyncCommitLog;
+use pi_atom::Atom;
+use pi_async::rt::{AsyncRuntime, multi_thread::MultiTaskRuntime};
+use pi_async_transaction::AsyncCommitLog;
 use pi_store::{commit_logger::CommitLogger,
                log_store::log_file::{PairLoader, LogMethod, LogFile}};
-use guid::Guid;
-use hash::XHashMap;
+use pi_guid::Guid;
+use pi_hash::XHashMap;
 
 use crate::{KVTableMeta,
             db::{DEFAULT_DB_TABLES_META_DIR, binary_to_table},
