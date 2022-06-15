@@ -23,7 +23,7 @@ pi_store = { path = "../pi_store"}
 pi_hash = "0.1"
 num_cpus = "1.13.0"
 chrono = "0.4"
-pi_async_file = "0.1"
+pi_async_file = "0.1.5"
 
 [dev-dependencies]
 crossbeam-channel = "0.5"
