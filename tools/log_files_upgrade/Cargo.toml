@@ -1,0 +1,12 @@
+[package]
+name = "log_files_upgrade"
+version = "0.1.0"
+edition = "2018"
+
+[dependencies]
+clap = "2.33"
+pi_async = "0.2"
+pi_async_file = "0.1"
+crossbeam-channel = "0.5"
+log = "0.4"
+env_logger = "0.8"
