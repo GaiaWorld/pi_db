@@ -8,13 +8,13 @@ use crossbeam_channel::{unbounded, bounded};
 use bytes::BufMut;
 use env_logger;
 
-use atom::Atom;
-use guid::{GuidGen, Guid};
-use sinfo::EnumType;
-use bon::{WriteBuffer, ReadBuffer, Encode, Decode, ReadBonErr};
-use time::run_nanos;
-use r#async::rt::multi_thread::MultiTaskRuntimeBuilder;
-use async_transaction::{AsyncCommitLog, ErrorLevel, manager_2pc::Transaction2PcManager, Transaction2Pc};
+use pi_atom::Atom;
+use pi_guid::{GuidGen, Guid};
+use pi_sinfo::EnumType;
+use pi_bon::{WriteBuffer, ReadBuffer, Encode, Decode, ReadBonErr};
+use pi_time::run_nanos;
+use pi_async::rt::{AsyncRuntime, multi_thread::MultiTaskRuntimeBuilder};
+use pi_async_transaction::{AsyncCommitLog, ErrorLevel, manager_2pc::Transaction2PcManager, Transaction2Pc};
 use futures::future::err;
 use pi_store::commit_logger::{CommitLoggerBuilder, CommitLogger};
 
@@ -70,7 +70,7 @@ fn test_memory_table() {
                 println!("!!!!!!db table size: {:?}", db.table_size().await);
 
                 //查询表信息
-                rt_copy.wait_timeout(1500).await;
+                rt_copy.timeout(1500).await;
                 println!("");
 
                 println!("!!!!!!test_memory is exist: {:?}", db.is_exist(&table_name).await);
@@ -80,7 +80,7 @@ fn test_memory_table() {
                 println!("!!!!!!test_memory table len: {:?}", db.table_record_size(&table_name).await);
 
                 //操作数据库事务
-                rt_copy.wait_timeout(1500).await;
+                rt_copy.timeout(1500).await;
                 println!("");
 
                 let tr = db.transaction(Atom::from("test memory table"), true, 500, 500).unwrap();
@@ -140,7 +140,7 @@ fn test_memory_table() {
                 let r = tr.upsert(table_kv_list).await;
                 println!("!!!!!!batch upsert, result: {:?}", r);
 
-                rt_copy.wait_timeout(1500).await;
+                rt_copy.timeout(1500).await;
                 println!("");
 
                 if let Some(mut r) = tr.keys(
@@ -153,7 +153,7 @@ fn test_memory_table() {
                     }
                 }
 
-                rt_copy.wait_timeout(1500).await;
+                rt_copy.timeout(1500).await;
                 println!("");
 
                 if let Some(mut r) = tr.keys(
@@ -166,7 +166,7 @@ fn test_memory_table() {
                     }
                 }
 
-                rt_copy.wait_timeout(1500).await;
+                rt_copy.timeout(1500).await;
                 println!("");
 
                 if let Some(mut r) = tr.keys(
@@ -179,7 +179,7 @@ fn test_memory_table() {
                     }
                 }
 
-                rt_copy.wait_timeout(1500).await;
+                rt_copy.timeout(1500).await;
                 println!("");
 
                 if let Some(mut r) = tr.keys(
@@ -192,7 +192,7 @@ fn test_memory_table() {
                     }
                 }
 
-                rt_copy.wait_timeout(1500).await;
+                rt_copy.timeout(1500).await;
                 println!("");
 
                 if let Some(mut r) = tr.values(
@@ -207,7 +207,7 @@ fn test_memory_table() {
                     }
                 }
 
-                rt_copy.wait_timeout(1500).await;
+                rt_copy.timeout(1500).await;
                 println!("");
 
                 if let Some(mut r) = tr.values(
@@ -222,7 +222,7 @@ fn test_memory_table() {
                     }
                 }
 
-                rt_copy.wait_timeout(1500).await;
+                rt_copy.timeout(1500).await;
                 println!("");
 
                 if let Some(mut r) = tr.values(
@@ -237,7 +237,7 @@ fn test_memory_table() {
                     }
                 }
 
-                rt_copy.wait_timeout(1500).await;
+                rt_copy.timeout(1500).await;
                 println!("");
 
                 if let Some(mut r) = tr.values(
@@ -252,7 +252,7 @@ fn test_memory_table() {
                     }
                 }
 
-                rt_copy.wait_timeout(1500).await;
+                rt_copy.timeout(1500).await;
                 println!("");
 
                 let mut table_kv_list = Vec::new();
@@ -266,7 +266,7 @@ fn test_memory_table() {
                 let r = tr.delete(table_kv_list).await;
                 println!("!!!!!!batch delete result: {:?}", r);
 
-                rt_copy.wait_timeout(1500).await;
+                rt_copy.timeout(1500).await;
                 println!("");
 
                 if let Some(mut r) = tr.keys(
@@ -279,7 +279,7 @@ fn test_memory_table() {
                     }
                 }
 
-                rt_copy.wait_timeout(1500).await;
+                rt_copy.timeout(1500).await;
                 println!("");
 
                 if let Some(mut r) = tr.values(
@@ -294,7 +294,7 @@ fn test_memory_table() {
                     }
                 }
 
-                rt_copy.wait_timeout(1500).await;
+                rt_copy.timeout(1500).await;
                 println!("");
 
                 match tr.prepare_modified().await {
@@ -375,7 +375,7 @@ fn test_memory_table_conflict() {
                 println!("!!!!!!db table size: {:?}", db.table_size().await);
 
                 //查询表信息
-                rt_copy.wait_timeout(1500).await;
+                rt_copy.timeout(1500).await;
                 println!("");
 
                 println!("!!!!!!test_memory is exist: {:?}", db.is_exist(&table_name).await);
@@ -385,7 +385,7 @@ fn test_memory_table_conflict() {
                 println!("!!!!!!test_memory table len: {:?}", db.table_record_size(&table_name).await);
 
                 //操作数据库事务
-                rt_copy.wait_timeout(1500).await;
+                rt_copy.timeout(1500).await;
                 println!("");
 
                 {
@@ -441,7 +441,7 @@ fn test_memory_table_conflict() {
                                     if let Err(e) = tr.rollback_modified().await {
                                         println!("rollback failed, reason: {:?}", e);
                                     } else {
-                                        rt_copy_.wait_timeout(0);
+                                        rt_copy_.timeout(0);
                                         continue;
                                     }
                                 },
@@ -454,7 +454,7 @@ fn test_memory_table_conflict() {
                                                 if let Err(e) = tr.rollback_modified().await {
                                                     println!("rollback failed, reason: {:?}", e);
                                                 } else {
-                                                    rt_copy_.wait_timeout(0);
+                                                    rt_copy_.timeout(0);
                                                     continue;
                                                 }
                                             }
@@ -482,7 +482,7 @@ fn test_memory_table_conflict() {
                         Err(e) => {
                             println!(
                                 "!!!!!!recv timeout, len: {}, timer_len: {}, e: {:?}",
-                                rt_copy.timing_len(),
+                                rt_copy.wait_len(),
                                 rt_copy.len(),
                                 e
                             );
@@ -564,7 +564,7 @@ fn test_commit_log() {
                 println!("!!!!!!db table size: {:?}", db.table_size().await);
 
                 //查询表信息
-                rt_copy.wait_timeout(1500).await;
+                rt_copy.timeout(1500).await;
                 println!("");
 
                 println!("!!!!!!test_memory is exist: {:?}", db.is_exist(&table_name).await);
@@ -574,14 +574,14 @@ fn test_commit_log() {
                 println!("!!!!!!test_memory table len: {:?}", db.table_record_size(&table_name).await);
 
                 //操作数据库事务
-                rt_copy.wait_timeout(1500).await;
+                rt_copy.timeout(1500).await;
                 println!("");
 
                 let tr = db.transaction(Atom::from("test memory table"), true, 500, 500).unwrap();
                 let r = tr.query(vec![
                     TableKV {
                         table: table_name.clone(),
-                        key: Binary::new(vec![0]),
+                        key: u8_to_binary(0),
                         value: None
                     }
                 ]).await;
@@ -590,7 +590,7 @@ fn test_commit_log() {
                 let r = tr.upsert(vec![
                     TableKV {
                         table: table_name.clone(),
-                        key: Binary::new(vec![0]),
+                        key: u8_to_binary(0),
                         value: Some(Binary::new("Hello World!".as_bytes().to_vec()))
                     }
                 ]).await;
@@ -599,7 +599,7 @@ fn test_commit_log() {
                 let r = tr.query(vec![
                     TableKV {
                         table: table_name.clone(),
-                        key: Binary::new(vec![0]),
+                        key: u8_to_binary(0),
                         value: None
                     }
                 ]).await;
@@ -608,7 +608,7 @@ fn test_commit_log() {
                 let r = tr.delete(vec![
                     TableKV {
                         table: table_name.clone(),
-                        key: Binary::new(vec![0]),
+                        key: u8_to_binary(0),
                         value: None
                     }
                 ]).await;
@@ -617,7 +617,7 @@ fn test_commit_log() {
                 let r = tr.query(vec![
                     TableKV {
                         table: table_name.clone(),
-                        key: Binary::new(vec![0]),
+                        key: u8_to_binary(0),
                         value: None
                     }
                 ]).await;
@@ -627,14 +627,14 @@ fn test_commit_log() {
                 for key in 0..10u8 {
                     table_kv_list.push(TableKV {
                         table: table_name.clone(),
-                        key: Binary::new(key.to_le_bytes().to_vec()),
+                        key: u8_to_binary(key),
                         value: Some(Binary::new("Hello World!".as_bytes().to_vec()))
                     });
                 }
                 let r = tr.upsert(table_kv_list).await;
                 println!("!!!!!!batch upsert, result: {:?}", r);
 
-                rt_copy.wait_timeout(1500).await;
+                rt_copy.timeout(1500).await;
                 println!("");
 
                 if let Some(mut r) = tr.keys(
@@ -647,7 +647,7 @@ fn test_commit_log() {
                     }
                 }
 
-                rt_copy.wait_timeout(1500).await;
+                rt_copy.timeout(1500).await;
                 println!("");
 
                 if let Some(mut r) = tr.keys(
@@ -660,12 +660,12 @@ fn test_commit_log() {
                     }
                 }
 
-                rt_copy.wait_timeout(1500).await;
+                rt_copy.timeout(1500).await;
                 println!("");
 
                 if let Some(mut r) = tr.keys(
                     table_name.clone(),
-                    Some(Binary::new(6u8.to_le_bytes().to_vec())),
+                    Some(u8_to_binary(6)),
                     false
                 ).await {
                     while let Some(key) = r.next().await {
@@ -673,12 +673,12 @@ fn test_commit_log() {
                     }
                 }
 
-                rt_copy.wait_timeout(1500).await;
+                rt_copy.timeout(1500).await;
                 println!("");
 
                 if let Some(mut r) = tr.keys(
                     table_name.clone(),
-                    Some(Binary::new(6u8.to_le_bytes().to_vec())),
+                    Some(u8_to_binary(6)),
                     true
                 ).await {
                     while let Some(key) = r.next().await {
@@ -686,7 +686,7 @@ fn test_commit_log() {
                     }
                 }
 
-                rt_copy.wait_timeout(1500).await;
+                rt_copy.timeout(1500).await;
                 println!("");
 
                 if let Some(mut r) = tr.values(
@@ -696,12 +696,12 @@ fn test_commit_log() {
                 ).await {
                     while let Some((key, value)) = r.next().await {
                         println!("!!!!!!next key: {:?}, value: {:?}",
-                                 u8::from_le_bytes(key.as_ref().try_into().unwrap()),
+                                 binary_to_u8(&key),
                                  String::from_utf8_lossy(value.as_ref()).as_ref());
                     }
                 }
 
-                rt_copy.wait_timeout(1500).await;
+                rt_copy.timeout(1500).await;
                 println!("");
 
                 if let Some(mut r) = tr.values(
@@ -711,56 +711,56 @@ fn test_commit_log() {
                 ).await {
                     while let Some((key, value)) = r.next().await {
                         println!("!!!!!!next key: {:?}, value: {:?}",
-                                 u8::from_le_bytes(key.as_ref().try_into().unwrap()),
+                                 binary_to_u8(&key),
                                  String::from_utf8_lossy(value.as_ref()).as_ref());
                     }
                 }
 
-                rt_copy.wait_timeout(1500).await;
+                rt_copy.timeout(1500).await;
                 println!("");
 
                 if let Some(mut r) = tr.values(
                     table_name.clone(),
-                    Some(Binary::new(6u8.to_le_bytes().to_vec())),
+                    Some(u8_to_binary(6)),
                     false
                 ).await {
                     while let Some((key, value)) = r.next().await {
                         println!("!!!!!!next key: {:?}, value: {:?}",
-                                 u8::from_le_bytes(key.as_ref().try_into().unwrap()),
+                                 binary_to_u8(&key),
                                  String::from_utf8_lossy(value.as_ref()).as_ref());
                     }
                 }
 
-                rt_copy.wait_timeout(1500).await;
+                rt_copy.timeout(1500).await;
                 println!("");
 
                 if let Some(mut r) = tr.values(
                     table_name.clone(),
-                    Some(Binary::new(6u8.to_le_bytes().to_vec())),
+                    Some(u8_to_binary(6)),
                     true
                 ).await {
                     while let Some((key, value)) = r.next().await {
                         println!("!!!!!!next key: {:?}, value: {:?}",
-                                 u8::from_le_bytes(key.as_ref().try_into().unwrap()),
+                                 binary_to_u8(&key),
                                  String::from_utf8_lossy(value.as_ref()).as_ref());
                     }
                 }
 
-                rt_copy.wait_timeout(1500).await;
+                rt_copy.timeout(1500).await;
                 println!("");
 
                 let mut table_kv_list = Vec::new();
                 for key in 0..10u8 {
                     table_kv_list.push(TableKV {
                         table: table_name.clone(),
-                        key: Binary::new(key.to_le_bytes().to_vec()),
+                        key: u8_to_binary(key),
                         value: None,
                     });
                 }
                 let r = tr.delete(table_kv_list).await;
                 println!("!!!!!!batch delete result: {:?}", r);
 
-                rt_copy.wait_timeout(1500).await;
+                rt_copy.timeout(1500).await;
                 println!("");
 
                 if let Some(mut r) = tr.keys(
@@ -773,7 +773,7 @@ fn test_commit_log() {
                     }
                 }
 
-                rt_copy.wait_timeout(1500).await;
+                rt_copy.timeout(1500).await;
                 println!("");
 
                 if let Some(mut r) = tr.values(
@@ -783,12 +783,12 @@ fn test_commit_log() {
                 ).await {
                     while let Some((key, value)) = r.next().await {
                         println!("!!!!!!next key: {:?}, value: {:?}",
-                                 u8::from_le_bytes(key.as_ref().try_into().unwrap()),
+                                 binary_to_u8(&key),
                                  String::from_utf8_lossy(value.as_ref()).as_ref());
                     }
                 }
 
-                rt_copy.wait_timeout(1500).await;
+                rt_copy.timeout(1500).await;
                 println!("");
 
                 match tr.prepare_modified().await {
@@ -871,7 +871,7 @@ fn test_log_table() {
                 println!("!!!!!!db table size: {:?}", db.table_size().await);
 
                 //查询表信息
-                rt_copy.wait_timeout(1500).await;
+                rt_copy.timeout(1500).await;
                 println!("");
 
                 println!("!!!!!!test_log is exist: {:?}", db.is_exist(&table_name).await);
@@ -881,7 +881,7 @@ fn test_log_table() {
                 println!("!!!!!!test_log table len: {:?}", db.table_record_size(&table_name).await);
 
                 //操作数据库事务
-                rt_copy.wait_timeout(1500).await;
+                rt_copy.timeout(1500).await;
                 println!("");
 
                 let tr = db.transaction(Atom::from("test log table"), true, 500, 500).unwrap();
@@ -898,7 +898,7 @@ fn test_log_table() {
                     }
                 }
 
-                rt_copy.wait_timeout(1500).await;
+                rt_copy.timeout(1500).await;
                 println!("");
 
                 let r = tr.query(vec![
@@ -957,7 +957,7 @@ fn test_log_table() {
                 let r = tr.upsert(table_kv_list).await;
                 println!("!!!!!!batch upsert, result: {:?}", r);
 
-                rt_copy.wait_timeout(1500).await;
+                rt_copy.timeout(1500).await;
                 println!("");
 
                 if let Some(mut r) = tr.keys(
@@ -970,7 +970,7 @@ fn test_log_table() {
                     }
                 }
 
-                rt_copy.wait_timeout(1500).await;
+                rt_copy.timeout(1500).await;
                 println!("");
 
                 if let Some(mut r) = tr.keys(
@@ -983,7 +983,7 @@ fn test_log_table() {
                     }
                 }
 
-                rt_copy.wait_timeout(1500).await;
+                rt_copy.timeout(1500).await;
                 println!("");
 
                 if let Some(mut r) = tr.keys(
@@ -996,7 +996,7 @@ fn test_log_table() {
                     }
                 }
 
-                rt_copy.wait_timeout(1500).await;
+                rt_copy.timeout(1500).await;
                 println!("");
 
                 if let Some(mut r) = tr.keys(
@@ -1009,7 +1009,7 @@ fn test_log_table() {
                     }
                 }
 
-                rt_copy.wait_timeout(1500).await;
+                rt_copy.timeout(1500).await;
                 println!("");
 
                 if let Some(mut r) = tr.values(
@@ -1024,7 +1024,7 @@ fn test_log_table() {
                     }
                 }
 
-                rt_copy.wait_timeout(1500).await;
+                rt_copy.timeout(1500).await;
                 println!("");
 
                 if let Some(mut r) = tr.values(
@@ -1039,7 +1039,7 @@ fn test_log_table() {
                     }
                 }
 
-                rt_copy.wait_timeout(1500).await;
+                rt_copy.timeout(1500).await;
                 println!("");
 
                 if let Some(mut r) = tr.values(
@@ -1054,7 +1054,7 @@ fn test_log_table() {
                     }
                 }
 
-                rt_copy.wait_timeout(1500).await;
+                rt_copy.timeout(1500).await;
                 println!("");
 
                 if let Some(mut r) = tr.values(
@@ -1069,7 +1069,7 @@ fn test_log_table() {
                     }
                 }
 
-                rt_copy.wait_timeout(1500).await;
+                rt_copy.timeout(1500).await;
                 println!("");
 
                 let mut table_kv_list = Vec::new();
@@ -1083,7 +1083,7 @@ fn test_log_table() {
                 let r = tr.delete(table_kv_list).await;
                 println!("!!!!!!batch delete result: {:?}", r);
 
-                rt_copy.wait_timeout(1500).await;
+                rt_copy.timeout(1500).await;
                 println!("");
 
                 if let Some(mut r) = tr.keys(
@@ -1096,7 +1096,7 @@ fn test_log_table() {
                     }
                 }
 
-                rt_copy.wait_timeout(1500).await;
+                rt_copy.timeout(1500).await;
                 println!("");
 
                 if let Some(mut r) = tr.values(
@@ -1111,7 +1111,7 @@ fn test_log_table() {
                     }
                 }
 
-                rt_copy.wait_timeout(1500).await;
+                rt_copy.timeout(1500).await;
                 println!("");
 
                 let mut table_kv_list = Vec::new();
@@ -1125,7 +1125,7 @@ fn test_log_table() {
                 let r = tr.upsert(table_kv_list).await;
                 println!("!!!!!!batch upsert, result: {:?}", r);
 
-                rt_copy.wait_timeout(1500).await;
+                rt_copy.timeout(1500).await;
                 println!("");
 
                 if let Some(mut r) = tr.values(
@@ -1140,7 +1140,7 @@ fn test_log_table() {
                     }
                 }
 
-                rt_copy.wait_timeout(1500).await;
+                rt_copy.timeout(1500).await;
                 println!("");
 
                 match tr.prepare_modified().await {
@@ -1223,7 +1223,7 @@ fn test_log_table_read_only_while_writing() {
                 println!("!!!!!!db table size: {:?}", db.table_size().await);
 
                 //查询表信息
-                rt_copy.wait_timeout(1500).await;
+                rt_copy.timeout(1500).await;
                 println!("");
 
                 println!("!!!!!!test_log is exist: {:?}", db.is_exist(&table_name).await);
@@ -1233,7 +1233,7 @@ fn test_log_table_read_only_while_writing() {
                 println!("!!!!!!test_log table len: {:?}", db.table_record_size(&table_name).await);
 
                 //操作数据库事务
-                rt_copy.wait_timeout(1500).await;
+                rt_copy.timeout(1500).await;
                 println!("");
 
                 let tr = db.transaction(Atom::from("test log table"), true, 500, 500).unwrap();
@@ -1250,7 +1250,7 @@ fn test_log_table_read_only_while_writing() {
                     }
                 }
 
-                rt_copy.wait_timeout(1500).await;
+                rt_copy.timeout(1500).await;
                 println!("");
 
                 let r = tr.query(vec![
@@ -1262,7 +1262,7 @@ fn test_log_table_read_only_while_writing() {
                 ]).await;
                 println!("!!!!!!query result: {:?}", r);
 
-                rt_copy.wait_timeout(1500).await;
+                rt_copy.timeout(1500).await;
                 println!("");
 
                 match tr.prepare_modified().await {
@@ -1343,7 +1343,7 @@ fn test_log_table_conflict() {
                 println!("!!!!!!db table size: {:?}", db.table_size().await);
 
                 //查询表信息
-                rt_copy.wait_timeout(1500).await;
+                rt_copy.timeout(1500).await;
                 println!("");
 
                 println!("!!!!!!test_log is exist: {:?}", db.is_exist(&table_name).await);
@@ -1353,7 +1353,7 @@ fn test_log_table_conflict() {
                 println!("!!!!!!test_log table len: {:?}", db.table_record_size(&table_name).await);
 
                 //操作数据库事务
-                rt_copy.wait_timeout(1500).await;
+                rt_copy.timeout(1500).await;
                 println!("");
 
                 {
@@ -1409,7 +1409,7 @@ fn test_log_table_conflict() {
                                     if let Err(e) = tr.rollback_modified().await {
                                         println!("rollback failed, reason: {:?}", e);
                                     } else {
-                                        rt_copy_.wait_timeout(0).await;
+                                        rt_copy_.timeout(0).await;
                                         continue;
                                     }
                                 },
@@ -1422,7 +1422,7 @@ fn test_log_table_conflict() {
                                                 if let Err(e) = tr.rollback_modified().await {
                                                     println!("rollback failed, reason: {:?}", e);
                                                 } else {
-                                                    rt_copy_.wait_timeout(0).await;
+                                                    rt_copy_.timeout(0).await;
                                                     continue;
                                                 }
                                             }
@@ -1450,7 +1450,7 @@ fn test_log_table_conflict() {
                         Err(e) => {
                             println!(
                                 "!!!!!!recv timeout, len: {}, timer_len: {}, e: {:?}",
-                                rt_copy.timing_len(),
+                                rt_copy.wait_len(),
                                 rt_copy.len(),
                                 e
                             );
@@ -1534,7 +1534,7 @@ fn test_log_write_table() {
                 println!("!!!!!!db table size: {:?}", db.table_size().await);
 
                 //查询表信息
-                rt_copy.wait_timeout(1500).await;
+                rt_copy.timeout(1500).await;
                 println!("");
 
                 println!("!!!!!!test_log_write is exist: {:?}", db.is_exist(&table_name).await);
@@ -1544,7 +1544,7 @@ fn test_log_write_table() {
                 println!("!!!!!!test_log_write table len: {:?}", db.table_record_size(&table_name).await);
 
                 //操作数据库事务
-                rt_copy.wait_timeout(1500).await;
+                rt_copy.timeout(1500).await;
                 println!("");
 
                 let tr = db.transaction(Atom::from("test log table"), true, 500, 500).unwrap();
@@ -1605,7 +1605,7 @@ fn test_log_write_table() {
                 let r = tr.upsert(table_kv_list).await;
                 println!("!!!!!!batch upsert, result: {:?}", r);
 
-                rt_copy.wait_timeout(1500).await;
+                rt_copy.timeout(1500).await;
                 println!("");
 
                 let mut table_kv_list = Vec::new();
@@ -1619,7 +1619,7 @@ fn test_log_write_table() {
                 let r = tr.delete(table_kv_list).await;
                 println!("!!!!!!batch delete result: {:?}", r);
 
-                rt_copy.wait_timeout(1500).await;
+                rt_copy.timeout(1500).await;
                 println!("");
 
                 let mut table_kv_list = Vec::new();
@@ -1633,7 +1633,7 @@ fn test_log_write_table() {
                 let r = tr.upsert(table_kv_list).await;
                 println!("!!!!!!batch upsert, result: {:?}", r);
 
-                rt_copy.wait_timeout(1500).await;
+                rt_copy.timeout(1500).await;
                 println!("");
 
                 match tr.prepare_modified().await {
@@ -1725,7 +1725,7 @@ fn test_db_repair() {
                 println!("!!!!!!db table size: {:?}", db.table_size().await);
 
                 //操作数据库事务
-                rt_copy.wait_timeout(5000).await;
+                rt_copy.timeout(5000).await;
                 println!("");
 
                 let tr = db.transaction(Atom::from("test log table"), true, 500, 500).unwrap();
@@ -1755,7 +1755,7 @@ fn test_db_repair() {
                     }
                 }
 
-                rt_copy.wait_timeout(10000).await;
+                rt_copy.timeout(10000).await;
                 println!("");
 
                 let mut table_kv_list = Vec::new();
@@ -1809,7 +1809,7 @@ fn test_db_repair() {
                 let r = tr.upsert(table_kv_list).await;
                 println!("!!!!!!batch upsert, result: {:?}", r);
 
-                rt_copy.wait_timeout(1500).await;
+                rt_copy.timeout(1500).await;
                 println!("");
 
                 match tr.prepare_modified().await {
@@ -1978,7 +1978,7 @@ fn test_multi_tables_repair() {
                             if let ErrorLevel::Normal = e.level() {
                                 tr.rollback_modified().await.unwrap();
                             }
-                            rt_copy.wait_timeout(0).await;
+                            rt_copy.timeout(0).await;
                             continue;
                         },
                         Ok(output) => {
@@ -2001,7 +2001,7 @@ fn test_multi_tables_repair() {
             Err(e) => {
                 println!(
                     "!!!!!!recv timeout, len: {}, timer_len: {}, e: {:?}",
-                    rt.timing_len(),
+                    rt.wait_len(),
                     rt.len(),
                     e
                 );
@@ -2220,7 +2220,7 @@ fn test_multi_tables_write_and_repair() {
                             if let ErrorLevel::Normal = e.level() {
                                 tr.rollback_modified().await.unwrap();
                             }
-                            rt_copy.wait_timeout(0).await;
+                            rt_copy.timeout(0).await;
                             continue;
                         },
                         Ok(output) => {
@@ -2243,7 +2243,7 @@ fn test_multi_tables_write_and_repair() {
             Err(e) => {
                 println!(
                     "!!!!!!recv timeout, len: {}, timer_len: {}, e: {:?}",
-                    rt.timing_len(),
+                    rt.wait_len(),
                     rt.len(),
                     e
                 );
@@ -2301,7 +2301,7 @@ fn test_multi_tables_write_and_repair() {
                             if let ErrorLevel::Normal = e.level() {
                                 tr.rollback_modified().await.unwrap();
                             }
-                            rt_copy.wait_timeout(0).await;
+                            rt_copy.timeout(0).await;
                             continue;
                         },
                         Ok(output) => {
@@ -2324,7 +2324,7 @@ fn test_multi_tables_write_and_repair() {
             Err(e) => {
                 println!(
                     "!!!!!!recv timeout, len: {}, timer_len: {}, e: {:?}",
-                    rt.timing_len(),
+                    rt.wait_len(),
                     rt.len(),
                     e
                 );
@@ -2478,7 +2478,7 @@ fn test_multi_tables_write_and_repair1() {
                             if let ErrorLevel::Normal = e.level() {
                                 tr.rollback_modified().await.unwrap();
                             }
-                            rt_copy.wait_timeout(0).await;
+                            rt_copy.timeout(0).await;
                             continue;
                         },
                         Ok(output) => {
@@ -2501,7 +2501,7 @@ fn test_multi_tables_write_and_repair1() {
             Err(e) => {
                 println!(
                     "!!!!!!recv timeout, len: {}, timer_len: {}, e: {:?}",
-                    rt.timing_len(),
+                    rt.wait_len(),
                     rt.len(),
                     e
                 );

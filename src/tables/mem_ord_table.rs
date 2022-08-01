@@ -66,6 +66,7 @@ impl<
         None
     }
 
+    #[inline]
     fn is_persistent(&self) -> bool {
         self.0.persistence
     }
