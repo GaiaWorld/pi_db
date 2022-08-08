@@ -43,7 +43,6 @@ use crate::{Binary,
                                      LogOrdTabTr},
                      log_write_table::{LogWriteTable,
                                        LogWTabTr}}};
-use crate::db::KVDBTable::MetaTab;
 
 ///
 /// 默认的数据库表元信息目录名
@@ -1793,6 +1792,7 @@ impl<
     }
 
     // 创建指定名称表的子事务
+    // 注意表事务是否持久化，表示事务是否允许持久化，允许事务持久化表示这个事务的所有写操作会被写入提交日志
     fn table_transaction(&self,
                          name: Atom,
                          table: &KVDBTable<C, Log>,
@@ -1903,8 +1903,8 @@ impl<
                     //元信息表的子事务存在
                     table_tr.clone()
                 } else {
-                    //元信息表的子事务不存在，则创建元信息表的事务，元信息表一定是需要持久化的
-                    self.table_transaction(meta_table_name.clone(), meta_table, true, &mut *childes_map)
+                    //元信息表的子事务不存在，则创建元信息表的事务，因为可能只是查询操作，所以初始化指定表的子事务为非持久化事务
+                    self.table_transaction(meta_table_name.clone(), meta_table, false, &mut *childes_map)
                 };
 
                 if let KVDBTransaction::MetaTabTr(tr) = meta_table_tr {
@@ -1988,9 +1988,10 @@ impl<
             let mut childes_map = self.0.childs_map.lock();
             let meta_table_tr = if let Some(table_tr) = childes_map.get(&meta_table_name) {
                 //元信息表的子事务存在，则设置子事务为需要持久化
+                table_tr.require_persistence();
                 table_tr.clone()
             } else {
-                //元信息表的子事务不存在，则创建元信息表的事务，元信息表一定是需要持久化的
+                //元信息表的子事务不存在，则创建元信息表的事务，因为需要创建表，所以初始化元信息表的子事务为持久化事务
                 self.table_transaction(meta_table_name, meta_table, true, &mut *childes_map)
             };
 
@@ -2075,9 +2076,10 @@ impl<
             let mut childes_map = self.0.childs_map.lock();
             let meta_table_tr = if let Some(table_tr) = childes_map.get(&meta_table_name) {
                 //元信息表的子事务存在，则设置子事务为需要持久化
+                table_tr.require_persistence();
                 table_tr.clone()
             } else {
-                //元信息表的子事务不存在，则创建元信息表的事务，元信息表一定是需要持久化的
+                //元信息表的子事务不存在，则创建元信息表的事务，因为需要创建表，所以初始化元信息表的子事务为持久化事务
                 self.table_transaction(meta_table_name, meta_table, true, &mut *childes_map)
             };
 
@@ -2113,9 +2115,10 @@ impl<
             let mut childes_map = self.0.childs_map.lock();
             let meta_table_tr = if let Some(table_tr) = childes_map.get(&meta_table_name) {
                 //元信息表的子事务存在，则设置子事务为需要持久化
+                table_tr.require_persistence();
                 table_tr.clone()
             } else {
-                //元信息表的子事务不存在，则创建元信息表的事务，元信息表一定时需要持久化的
+                //元信息表的子事务不存在，则创建元信息表的事务，因为需要移除表，所以初始化元信息表的子事务为持久化事务
                 self.table_transaction(meta_table_name, meta_table, true, &mut *childes_map)
             };
 
@@ -2155,14 +2158,8 @@ impl<
                     //指定名称的表的子事务存在
                     table_tr.clone()
                 } else {
-                    //指定名称的表的子事务不存在，则创建指定表的事务
-                    if table.is_persistent() {
-                        //指定表的需要持久化，则设置指定表的子事务为持久化
-                        self.table_transaction(table_kv.table, table, true, &mut *childes_map)
-                    } else {
-                        //指定表的不需要持久化，则设置指定表的子事务为非持久化
-                        self.table_transaction(table_kv.table, table, false, &mut *childes_map)
-                    }
+                    //指定名称的表的子事务不存在，则创建指定表的事务，因为是查询操作，所以初始化指定表的子事务为非持久化事务
+                    self.table_transaction(table_kv.table, table, false, &mut *childes_map)
                 };
 
                 match table_tr {
@@ -2210,14 +2207,18 @@ impl<
                 let mut childes_map = self.0.childs_map.lock();
                 let table_tr = if let Some(table_tr) = childes_map.get(&table_kv.table) {
                     //指定名称的表的子事务存在
+                    if table.is_persistent() {
+                        //指定表需要持久化，且因为插入或更新操作，所以设置子事务为需要持久化
+                        table_tr.require_persistence();
+                    }
                     table_tr.clone()
                 } else {
                     //指定名称的表的子事务不存在，则创建指定表的事务
                     if table.is_persistent() {
-                        //指定表的需要持久化，则设置指定表的子事务为持久化
+                        //指定表需要持久化，且因为插入或更新操作，所以初始化指定表的子事务为持久化事务
                         self.table_transaction(table_kv.table, table, true, &mut *childes_map)
                     } else {
-                        //指定表的不需要持久化，则设置指定表的子事务为非持久化
+                        //指定表不需要持久化，所以即使插入或更新操作，也初始化指定表的子事务为非持久化事务
                         self.table_transaction(table_kv.table, table, false, &mut *childes_map)
                     }
                 };
@@ -2291,14 +2292,18 @@ impl<
                 let mut childes_map = self.0.childs_map.lock();
                 let table_tr = if let Some(table_tr) = childes_map.get(&table_kv.table) {
                     //指定名称的表的子事务存在
+                    if table.is_persistent() {
+                        //指定表需要持久化，且因为插入或更新操作，所以设置子事务为需要持久化
+                        table_tr.require_persistence();
+                    }
                     table_tr.clone()
                 } else {
                     //指定名称的表的子事务不存在，则创建指定表的事务
                     if table.is_persistent() {
-                        //指定表的需要持久化，则设置指定表的子事务为持久化
+                        //指定表需要持久化，且因为插入或更新操作，所以初始化指定表的子事务为持久化事务
                         self.table_transaction(table_kv.table, table, true, &mut *childes_map)
                     } else {
-                        //指定表的不需要持久化，则设置指定表的子事务为非持久化
+                        //指定表不需要持久化，所以即使插入或更新操作，也初始化指定表的子事务为非持久化事务
                         self.table_transaction(table_kv.table, table, false, &mut *childes_map)
                     }
                 };
@@ -2388,14 +2393,8 @@ impl<
                 //指定名称的表的子事务存在
                 table_tr.clone()
             } else {
-                //指定名称的表的子事务不存在，则创建指定表的事务
-                if table.is_persistent() {
-                    //指定表的需要持久化，则设置指定表的子事务为持久化
-                    self.table_transaction(table_name, table, true, &mut *childes_map)
-                } else {
-                    //指定表的不需要持久化，则设置指定表的子事务为非持久化
-                    self.table_transaction(table_name, table, false, &mut *childes_map)
-                }
+                //指定名称的表的子事务不存在，则创建指定表的事务，因为是查询操作，所以初始化指定表的子事务为非持久化事务
+                self.table_transaction(table_name, table, false, &mut *childes_map)
             };
 
             match table_tr {
@@ -2439,14 +2438,8 @@ impl<
                 //指定名称的表的子事务存在
                 table_tr.clone()
             } else {
-                //指定名称的表的子事务不存在，则创建指定表的事务
-                if table.is_persistent() {
-                    //指定表的需要持久化，则设置指定表的子事务为持久化
-                    self.table_transaction(table_name, table, true, &mut *childes_map)
-                } else {
-                    //指定表的不需要持久化，则设置指定表的子事务为非持久化
-                    self.table_transaction(table_name, table, false, &mut *childes_map)
-                }
+                //指定名称的表的子事务不存在，则创建指定表的事务，因为是查询操作，所以初始化指定表的子事务为非持久化事务
+                self.table_transaction(table_name, table, false, &mut *childes_map)
             };
 
             match table_tr {
@@ -2489,14 +2482,8 @@ impl<
                 //指定名称的表的子事务存在
                 table_tr.clone()
             } else {
-                //指定名称的表的子事务不存在，则创建指定表的事务
-                if table.is_persistent() {
-                    //指定表的需要持久化，则设置指定表的子事务为持久化
-                    self.table_transaction(table_name, table, true, &mut *childes_map)
-                } else {
-                    //指定表的不需要持久化，则设置指定表的子事务为非持久化
-                    self.table_transaction(table_name, table, false, &mut *childes_map)
-                }
+                //指定名称的表的子事务不存在，则创建指定表的事务，因为是锁定操作，所以初始化指定表的子事务为非持久化事务
+                self.table_transaction(table_name, table, false, &mut *childes_map)
             };
 
             match table_tr {
@@ -2539,14 +2526,8 @@ impl<
                 //指定名称的表的子事务存在
                 table_tr.clone()
             } else {
-                //指定名称的表的子事务不存在，则创建指定表的事务
-                if table.is_persistent() {
-                    //指定表的需要持久化，则设置指定表的子事务为持久化
-                    self.table_transaction(table_name, table, true, &mut *childes_map)
-                } else {
-                    //指定表的不需要持久化，则设置指定表的子事务为非持久化
-                    self.table_transaction(table_name, table, false, &mut *childes_map)
-                }
+                //指定名称的表的子事务不存在，则创建指定表的事务，因为是解锁操作，所以初始化指定表的子事务为非持久化事务
+                self.table_transaction(table_name, table, false, &mut *childes_map)
             };
 
             match table_tr {

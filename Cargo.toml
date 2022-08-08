@@ -23,8 +23,6 @@ pi_sinfo = "0.1"
 pi_ordmap = "0.1"
 pi_hash = "0.1"
 
-
-
 [dev-dependencies]
 crossbeam-channel = "0.5"
 env_logger = "0.9"

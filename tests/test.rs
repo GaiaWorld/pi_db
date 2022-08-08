@@ -950,7 +950,7 @@ fn test_log_table() {
                 for key in 0..10u8 {
                     table_kv_list.push(TableKV {
                         table: table_name.clone(),
-                        key: Binary::new(key.to_le_bytes().to_vec()),
+                        key: u8_to_binary(key),
                         value: Some(Binary::new("Hello World!".as_bytes().to_vec()))
                     });
                 }
@@ -966,7 +966,7 @@ fn test_log_table() {
                     false
                 ).await {
                     while let Some(key) = r.next().await {
-                        println!("!!!!!!next key: {:?}", u8::from_le_bytes(key.as_ref().try_into().unwrap()));
+                        println!("!!!!!!next key: {:?}", binary_to_u8(&key));
                     }
                 }
 
@@ -979,7 +979,7 @@ fn test_log_table() {
                     true
                 ).await {
                     while let Some(key) = r.next().await {
-                        println!("!!!!!!next key: {:?}", u8::from_le_bytes(key.as_ref().try_into().unwrap()));
+                        println!("!!!!!!next key: {:?}", binary_to_u8(&key));
                     }
                 }
 
@@ -988,11 +988,11 @@ fn test_log_table() {
 
                 if let Some(mut r) = tr.keys(
                     table_name.clone(),
-                    Some(Binary::new(6u8.to_le_bytes().to_vec())),
+                    Some(u8_to_binary(6)),
                     false
                 ).await {
                     while let Some(key) = r.next().await {
-                        println!("!!!!!!next key: {:?}", u8::from_le_bytes(key.as_ref().try_into().unwrap()));
+                        println!("!!!!!!next key: {:?}", binary_to_u8(&key));
                     }
                 }
 
@@ -1001,11 +1001,11 @@ fn test_log_table() {
 
                 if let Some(mut r) = tr.keys(
                     table_name.clone(),
-                    Some(Binary::new(6u8.to_le_bytes().to_vec())),
+                    Some(u8_to_binary(6)),
                     true
                 ).await {
                     while let Some(key) = r.next().await {
-                        println!("!!!!!!next key: {:?}", u8::from_le_bytes(key.as_ref().try_into().unwrap()));
+                        println!("!!!!!!next key: {:?}", binary_to_u8(&key));
                     }
                 }
 
@@ -1019,7 +1019,7 @@ fn test_log_table() {
                 ).await {
                     while let Some((key, value)) = r.next().await {
                         println!("!!!!!!next key: {:?}, value: {:?}",
-                                 u8::from_le_bytes(key.as_ref().try_into().unwrap()),
+                                 binary_to_u8(&key),
                                  String::from_utf8_lossy(value.as_ref()).as_ref());
                     }
                 }
@@ -1034,7 +1034,7 @@ fn test_log_table() {
                 ).await {
                     while let Some((key, value)) = r.next().await {
                         println!("!!!!!!next key: {:?}, value: {:?}",
-                                 u8::from_le_bytes(key.as_ref().try_into().unwrap()),
+                                 binary_to_u8(&key),
                                  String::from_utf8_lossy(value.as_ref()).as_ref());
                     }
                 }
@@ -1044,12 +1044,12 @@ fn test_log_table() {
 
                 if let Some(mut r) = tr.values(
                     table_name.clone(),
-                    Some(Binary::new(6u8.to_le_bytes().to_vec())),
+                    Some(u8_to_binary(6)),
                     false
                 ).await {
                     while let Some((key, value)) = r.next().await {
                         println!("!!!!!!next key: {:?}, value: {:?}",
-                                 u8::from_le_bytes(key.as_ref().try_into().unwrap()),
+                                 binary_to_u8(&key),
                                  String::from_utf8_lossy(value.as_ref()).as_ref());
                     }
                 }
@@ -1059,12 +1059,12 @@ fn test_log_table() {
 
                 if let Some(mut r) = tr.values(
                     table_name.clone(),
-                    Some(Binary::new(6u8.to_le_bytes().to_vec())),
+                    Some(u8_to_binary(6)),
                     true
                 ).await {
                     while let Some((key, value)) = r.next().await {
                         println!("!!!!!!next key: {:?}, value: {:?}",
-                                 u8::from_le_bytes(key.as_ref().try_into().unwrap()),
+                                 binary_to_u8(&key),
                                  String::from_utf8_lossy(value.as_ref()).as_ref());
                     }
                 }
@@ -1076,7 +1076,7 @@ fn test_log_table() {
                 for key in 0..10u8 {
                     table_kv_list.push(TableKV {
                         table: table_name.clone(),
-                        key: Binary::new(key.to_le_bytes().to_vec()),
+                        key: u8_to_binary(key),
                         value: None,
                     });
                 }
@@ -1092,7 +1092,7 @@ fn test_log_table() {
                     false
                 ).await {
                     while let Some(key) = r.next().await {
-                        println!("!!!!!!next key: {:?}", u8::from_le_bytes(key.as_ref().try_into().unwrap()));
+                        println!("!!!!!!next key: {:?}", binary_to_u8(&key));
                     }
                 }
 
@@ -1106,7 +1106,7 @@ fn test_log_table() {
                 ).await {
                     while let Some((key, value)) = r.next().await {
                         println!("!!!!!!next key: {:?}, value: {:?}",
-                                 u8::from_le_bytes(key.as_ref().try_into().unwrap()),
+                                 binary_to_u8(&key),
                                  String::from_utf8_lossy(value.as_ref()).as_ref());
                     }
                 }
@@ -1118,7 +1118,7 @@ fn test_log_table() {
                 for key in 0..10u8 {
                     table_kv_list.push(TableKV {
                         table: table_name.clone(),
-                        key: Binary::new(key.to_le_bytes().to_vec()),
+                        key: u8_to_binary(key),
                         value: Some(Binary::new("Hello World!".as_bytes().to_vec()))
                     });
                 }
@@ -1135,7 +1135,7 @@ fn test_log_table() {
                 ).await {
                     while let Some((key, value)) = r.next().await {
                         println!("!!!!!!next key: {:?}, value: {:?}",
-                                 u8::from_le_bytes(key.as_ref().try_into().unwrap()),
+                                 binary_to_u8(&key),
                                  String::from_utf8_lossy(value.as_ref()).as_ref());
                     }
                 }
