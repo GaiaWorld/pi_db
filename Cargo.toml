@@ -18,7 +18,7 @@ pi_async_transaction = "0.1"
 pi_store = { path = "../pi_store" }
 pi_atom = "0.1"
 pi_guid = "0.1"
-pi_bon = "0.1"
+pi_bon = "0.2"
 pi_sinfo = "0.1"
 pi_ordmap = "0.1"
 pi_hash = "0.1"
