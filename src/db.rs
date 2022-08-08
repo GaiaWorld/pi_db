@@ -1903,8 +1903,8 @@ impl<
                     //元信息表的子事务存在
                     table_tr.clone()
                 } else {
-                    //元信息表的子事务不存在，则创建元信息表的事务
-                    self.table_transaction(meta_table_name.clone(), meta_table, false, &mut *childes_map)
+                    //元信息表的子事务不存在，则创建元信息表的事务，元信息表一定是需要持久化的
+                    self.table_transaction(meta_table_name.clone(), meta_table, true, &mut *childes_map)
                 };
 
                 if let KVDBTransaction::MetaTabTr(tr) = meta_table_tr {
@@ -1988,10 +1988,9 @@ impl<
             let mut childes_map = self.0.childs_map.lock();
             let meta_table_tr = if let Some(table_tr) = childes_map.get(&meta_table_name) {
                 //元信息表的子事务存在，则设置子事务为需要持久化
-                table_tr.require_persistence();
                 table_tr.clone()
             } else {
-                //元信息表的子事务不存在，则创建元信息表的事务
+                //元信息表的子事务不存在，则创建元信息表的事务，元信息表一定是需要持久化的
                 self.table_transaction(meta_table_name, meta_table, true, &mut *childes_map)
             };
 
@@ -2076,10 +2075,9 @@ impl<
             let mut childes_map = self.0.childs_map.lock();
             let meta_table_tr = if let Some(table_tr) = childes_map.get(&meta_table_name) {
                 //元信息表的子事务存在，则设置子事务为需要持久化
-                table_tr.require_persistence();
                 table_tr.clone()
             } else {
-                //元信息表的子事务不存在，则创建元信息表的事务
+                //元信息表的子事务不存在，则创建元信息表的事务，元信息表一定是需要持久化的
                 self.table_transaction(meta_table_name, meta_table, true, &mut *childes_map)
             };
 
@@ -2115,10 +2113,9 @@ impl<
             let mut childes_map = self.0.childs_map.lock();
             let meta_table_tr = if let Some(table_tr) = childes_map.get(&meta_table_name) {
                 //元信息表的子事务存在，则设置子事务为需要持久化
-                table_tr.require_persistence();
                 table_tr.clone()
             } else {
-                //元信息表的子事务不存在，则创建元信息表的事务
+                //元信息表的子事务不存在，则创建元信息表的事务，元信息表一定时需要持久化的
                 self.table_transaction(meta_table_name, meta_table, true, &mut *childes_map)
             };
 
@@ -2159,7 +2156,13 @@ impl<
                     table_tr.clone()
                 } else {
                     //指定名称的表的子事务不存在，则创建指定表的事务
-                    self.table_transaction(table_kv.table, table, false, &mut *childes_map)
+                    if table.is_persistent() {
+                        //指定表的需要持久化，则设置指定表的子事务为持久化
+                        self.table_transaction(table_kv.table, table, true, &mut *childes_map)
+                    } else {
+                        //指定表的不需要持久化，则设置指定表的子事务为非持久化
+                        self.table_transaction(table_kv.table, table, false, &mut *childes_map)
+                    }
                 };
 
                 match table_tr {
@@ -2200,18 +2203,23 @@ impl<
     /// 异步插入或更新指定多个表和键的值
     #[inline]
     async fn upsert(&self,
-                        table_kv_list: Vec<TableKV>) -> Result<(), KVTableTrError> {
+                    table_kv_list: Vec<TableKV>) -> Result<(), KVTableTrError> {
         for table_kv in table_kv_list {
             if let Some(table) = self.0.db_mgr.0.tables.read().await.get(&table_kv.table) {
                 //指定名称的表存在，则获取表事务，并开始插入或更新表的指定关键字的值
                 let mut childes_map = self.0.childs_map.lock();
                 let table_tr = if let Some(table_tr) = childes_map.get(&table_kv.table) {
-                    //指定名称的表的子事务存在，则设置子事务为需要持久化
-                    table_tr.require_persistence();
+                    //指定名称的表的子事务存在
                     table_tr.clone()
                 } else {
                     //指定名称的表的子事务不存在，则创建指定表的事务
-                    self.table_transaction(table_kv.table, table, true, &mut *childes_map)
+                    if table.is_persistent() {
+                        //指定表的需要持久化，则设置指定表的子事务为持久化
+                        self.table_transaction(table_kv.table, table, true, &mut *childes_map)
+                    } else {
+                        //指定表的不需要持久化，则设置指定表的子事务为非持久化
+                        self.table_transaction(table_kv.table, table, false, &mut *childes_map)
+                    }
                 };
 
                 if table_tr.is_require_persistence() {
@@ -2274,8 +2282,7 @@ impl<
     /// 异步删除指定多个表和键的值，并返回删除值的结果集
     #[inline]
     async fn delete(&self,
-                        table_kv_list: Vec<TableKV>)
-                        -> Result<Vec<Option<Binary>>, KVTableTrError> {
+                    table_kv_list: Vec<TableKV>) -> Result<Vec<Option<Binary>>, KVTableTrError> {
         let mut result = Vec::new();
 
         for table_kv in table_kv_list {
@@ -2283,12 +2290,17 @@ impl<
                 //指定名称的表存在，则获取表事务，并开始删除表的指定关键字的值
                 let mut childes_map = self.0.childs_map.lock();
                 let table_tr = if let Some(table_tr) = childes_map.get(&table_kv.table) {
-                    //指定名称的表的子事务存在，则设置子事务为需要持久化
-                    table_tr.require_persistence();
+                    //指定名称的表的子事务存在
                     table_tr.clone()
                 } else {
                     //指定名称的表的子事务不存在，则创建指定表的事务
-                    self.table_transaction(table_kv.table, table, true, &mut *childes_map)
+                    if table.is_persistent() {
+                        //指定表的需要持久化，则设置指定表的子事务为持久化
+                        self.table_transaction(table_kv.table, table, true, &mut *childes_map)
+                    } else {
+                        //指定表的不需要持久化，则设置指定表的子事务为非持久化
+                        self.table_transaction(table_kv.table, table, false, &mut *childes_map)
+                    }
                 };
 
                 if table_tr.is_require_persistence() {
@@ -2377,7 +2389,13 @@ impl<
                 table_tr.clone()
             } else {
                 //指定名称的表的子事务不存在，则创建指定表的事务
-                self.table_transaction(table_name, table, false, &mut *childes_map)
+                if table.is_persistent() {
+                    //指定表的需要持久化，则设置指定表的子事务为持久化
+                    self.table_transaction(table_name, table, true, &mut *childes_map)
+                } else {
+                    //指定表的不需要持久化，则设置指定表的子事务为非持久化
+                    self.table_transaction(table_name, table, false, &mut *childes_map)
+                }
             };
 
             match table_tr {
@@ -2422,7 +2440,13 @@ impl<
                 table_tr.clone()
             } else {
                 //指定名称的表的子事务不存在，则创建指定表的事务
-                self.table_transaction(table_name, table, false, &mut *childes_map)
+                if table.is_persistent() {
+                    //指定表的需要持久化，则设置指定表的子事务为持久化
+                    self.table_transaction(table_name, table, true, &mut *childes_map)
+                } else {
+                    //指定表的不需要持久化，则设置指定表的子事务为非持久化
+                    self.table_transaction(table_name, table, false, &mut *childes_map)
+                }
             };
 
             match table_tr {
@@ -2466,7 +2490,13 @@ impl<
                 table_tr.clone()
             } else {
                 //指定名称的表的子事务不存在，则创建指定表的事务
-                self.table_transaction(table_name, table, false, &mut *childes_map)
+                if table.is_persistent() {
+                    //指定表的需要持久化，则设置指定表的子事务为持久化
+                    self.table_transaction(table_name, table, true, &mut *childes_map)
+                } else {
+                    //指定表的不需要持久化，则设置指定表的子事务为非持久化
+                    self.table_transaction(table_name, table, false, &mut *childes_map)
+                }
             };
 
             match table_tr {
@@ -2510,7 +2540,13 @@ impl<
                 table_tr.clone()
             } else {
                 //指定名称的表的子事务不存在，则创建指定表的事务
-                self.table_transaction(table_name, table, false, &mut *childes_map)
+                if table.is_persistent() {
+                    //指定表的需要持久化，则设置指定表的子事务为持久化
+                    self.table_transaction(table_name, table, true, &mut *childes_map)
+                } else {
+                    //指定表的不需要持久化，则设置指定表的子事务为非持久化
+                    self.table_transaction(table_name, table, false, &mut *childes_map)
+                }
             };
 
             match table_tr {
@@ -2774,6 +2810,22 @@ unsafe impl<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>,
 > Sync for KVDBTable<C, Log> {}
+
+impl<
+    C: Clone + Send + 'static,
+    Log: AsyncCommitLog<C = C, Cid = Guid>,
+> KVDBTable<C, Log> {
+    /// 是否可持久化的表
+    #[inline]
+    pub fn is_persistent(&self) -> bool {
+        match self {
+            Self::MetaTab(tab) => tab.is_persistent(),
+            Self::MemOrdTab(tab) => tab.is_persistent(),
+            Self::LogOrdTab(tab) => tab.is_persistent(),
+            Self::LogWTab(tab) => tab.is_persistent(),
+        }
+    }
+}
 
 // 将表名序列化为二进制数据
 pub(crate) fn table_to_binary(table_name: &Atom) -> Binary {

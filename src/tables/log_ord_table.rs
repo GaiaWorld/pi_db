@@ -80,6 +80,7 @@ impl<
         Some(self.0.log_file.path())
     }
 
+    #[inline]
     fn is_persistent(&self) -> bool {
         true
     }
