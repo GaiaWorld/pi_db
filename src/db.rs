@@ -1917,9 +1917,23 @@ impl<
                         } else {
                             //待创建表的名称与已存在的表相同，但元信息不同
                             if table_meta.is_persistence() {
-                                //已存在的同名表是持久化表，且元信息不同，则表名冲突
-                                return Err(Error::new(ErrorKind::AlreadyExists,
-                                                      format!("Create table failed, name: {:?}, meta: {:?}, reason: name conflict", name, meta)));
+                                match tables.get(&name) {
+                                    Some(KVDBTable::LogOrdTab(tab)) => {
+                                        if tab.len() > 0 {
+                                            //已存在的同名表是持久化表，且元信息不同，且表中有记录，则表名冲突
+                                            return Err(Error::new(ErrorKind::AlreadyExists,
+                                                                  format!("Create table failed, name: {:?}, meta: {:?}, reason: name conflict", name, meta)));
+                                        }
+                                    },
+                                    Some(KVDBTable::LogWTab(tab)) => {
+                                        if tab.len() > 0 {
+                                            //已存在的同名表是持久化表，且元信息不同，且表中有记录，则表名冲突
+                                            return Err(Error::new(ErrorKind::AlreadyExists,
+                                                                  format!("Create table failed, name: {:?}, meta: {:?}, reason: name conflict", name, meta)));
+                                        }
+                                    },
+                                    _ => (),
+                                }
                             }
                         }
                     } else {
