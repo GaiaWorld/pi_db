@@ -31,6 +31,7 @@ opentelemetry = { version = "0.18", optional = true }
 tracing-opentelemetry = { version = "0.18", optional = true }
 tracing = { version = "0.1", optional = true }
 tracing-subscriber = { version = "0.3", optional = true }
+lazy_static = "1.4"
 
 [dev-dependencies]
 crossbeam-channel = "0.5"
