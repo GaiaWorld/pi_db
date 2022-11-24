@@ -34,6 +34,7 @@ use pi_async_transaction::{AsyncTransaction,
                            manager_2pc::{Transaction2PcStatus, Transaction2PcManager}};
 use pi_async_file::file::create_dir;
 use pi_hash::XHashMap;
+use tracing::Instrument;
 
 use crate::{Binary,
             KVAction,
@@ -1123,11 +1124,41 @@ impl<
                 TransactionSpans.insert(key, context);
             }
 
-            span
+            match self {
+                KVDBTransaction::RootTr(tr) => {
+                    tr
+                        .prepare()
+                        .instrument(span)
+                        .boxed()
+                },
+                KVDBTransaction::MetaTabTr(tr) => {
+                    tr
+                        .prepare()
+                        .instrument(span)
+                        .boxed()
+                },
+                KVDBTransaction::MemOrdTabTr(tr) => {
+                    tr
+                        .prepare()
+                        .instrument(span)
+                        .boxed()
+                },
+                KVDBTransaction::LogOrdTabTr(tr) => {
+                    tr
+                        .prepare()
+                        .instrument(span)
+                        .boxed()
+                },
+                KVDBTransaction::LogWTabTr(tr) => {
+                    tr
+                        .prepare()
+                        .instrument(span)
+                        .boxed()
+                },
+            }
         };
-        #[cfg(feature = "trace")]
-        let _enter = db_prepare_span.enter();
 
+        #[cfg(feature = "default")]
         match self {
             KVDBTransaction::RootTr(tr) => {
                 tr.prepare()
@@ -1150,10 +1181,10 @@ impl<
     fn commit(&self, confirm: <Self as Transaction2Pc>::CommitConfirm)
               -> BoxFuture<Result<<Self as AsyncTransaction>::Output, <Self as AsyncTransaction>::Error>> {
         #[cfg(feature = "trace")]
-        let db_commit_span = {
+        {
             let cid = self.get_transaction_uid().unwrap_or(Guid(0));
             //当前事务的事务id存在
-            if let Some((_, parent_context)) = TransactionSpans.remove(&cid) {
+            let db_commit_span = if let Some((_, parent_context)) = TransactionSpans.remove(&cid) {
                 //当前事务有预提交Span
                 let span = tracing::debug_span!("db_commit",
                         tid = cid.0,
@@ -1168,11 +1199,43 @@ impl<
                         cid = self.get_commit_uid().unwrap_or(Guid(0)).0,
                         status = self.get_status() as u8);
                 span
-            }
-        };
-        #[cfg(feature = "trace")]
-        let _enter = db_commit_span.enter();
+            };
 
+            match self {
+                KVDBTransaction::RootTr(tr) => {
+                    return tr
+                        .commit(confirm)
+                        .instrument(db_commit_span)
+                        .boxed();
+                },
+                KVDBTransaction::MetaTabTr(tr) => {
+                    return tr
+                        .commit(confirm)
+                        .instrument(db_commit_span)
+                        .boxed();
+                },
+                KVDBTransaction::MemOrdTabTr(tr) => {
+                    return tr
+                        .commit(confirm)
+                        .instrument(db_commit_span)
+                        .boxed();
+                },
+                KVDBTransaction::LogOrdTabTr(tr) => {
+                    return tr
+                        .commit(confirm)
+                        .instrument(db_commit_span)
+                        .boxed();
+                },
+                KVDBTransaction::LogWTabTr(tr) => {
+                    return tr
+                        .commit(confirm)
+                        .instrument(db_commit_span)
+                        .boxed();
+                },
+            }
+        }
+
+        #[cfg(feature = "default")]
         match self {
             KVDBTransaction::RootTr(tr) => {
                 tr.commit(confirm)
