@@ -13,6 +13,8 @@ use bytes::{Buf, BufMut};
 use log::info;
 
 #[cfg(feature = "trace")]
+use tracing::Instrument;
+#[cfg(feature = "trace")]
 use opentelemetry::{global, Context};
 #[cfg(feature = "trace")]
 use tracing_opentelemetry::OpenTelemetrySpanExt;
@@ -34,7 +36,6 @@ use pi_async_transaction::{AsyncTransaction,
                            manager_2pc::{Transaction2PcStatus, Transaction2PcManager}};
 use pi_async_file::file::create_dir;
 use pi_hash::XHashMap;
-use tracing::Instrument;
 
 use crate::{Binary,
             KVAction,
@@ -89,6 +90,7 @@ const DB_CLOSEING_STATUS: u64 = 3;
 ///
 const DB_CLOSED_STATUS: u64 = 4;
 
+#[cfg(feature = "trace")]
 lazy_static! {
     static ref TransactionSpans: DashMap<Guid, Context> = DashMap::default();
 }
@@ -1102,7 +1104,7 @@ impl<
     fn prepare(&self)
                -> BoxFuture<Result<Option<<Self as Transaction2Pc>::PrepareOutput>, <Self as Transaction2Pc>::PrepareError>> {
         #[cfg(feature = "trace")]
-        let db_prepare_span = {
+        {
             let mut carrier = HashMap::new();
             carrier.insert(
                 "traceparent".to_string(),
