@@ -1128,37 +1128,37 @@ impl<
 
             match self {
                 KVDBTransaction::RootTr(tr) => {
-                    tr
+                    return tr
                         .prepare()
                         .instrument(span)
-                        .boxed()
+                        .boxed();
                 },
                 KVDBTransaction::MetaTabTr(tr) => {
-                    tr
+                    return tr
                         .prepare()
                         .instrument(span)
-                        .boxed()
+                        .boxed();
                 },
                 KVDBTransaction::MemOrdTabTr(tr) => {
-                    tr
+                    return tr
                         .prepare()
                         .instrument(span)
-                        .boxed()
+                        .boxed();
                 },
                 KVDBTransaction::LogOrdTabTr(tr) => {
-                    tr
+                    return tr
                         .prepare()
                         .instrument(span)
-                        .boxed()
+                        .boxed();
                 },
                 KVDBTransaction::LogWTabTr(tr) => {
-                    tr
+                    return tr
                         .prepare()
                         .instrument(span)
-                        .boxed()
+                        .boxed();
                 },
             }
-        };
+        }
 
         #[cfg(feature = "default")]
         match self {
