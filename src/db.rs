@@ -1,7 +1,7 @@
 use std::time::Instant;
 use std::convert::TryInto;
 use std::path::{Path, PathBuf};
-use std::collections::VecDeque;
+use std::collections::{VecDeque, HashMap};
 use std::io::{Error, Result as IOResult, ErrorKind, Read};
 use std::sync::{Arc, atomic::{AtomicBool, AtomicU64, Ordering}};
 
@@ -9,6 +9,13 @@ use futures::{future::{FutureExt, BoxFuture}, stream::BoxStream, StreamExt};
 use crossbeam_channel::bounded;
 use bytes::{Buf, BufMut};
 use log::info;
+
+#[cfg(feature = "trace")]
+use opentelemetry::{global, Context};
+#[cfg(feature = "trace")]
+use tracing_opentelemetry::OpenTelemetrySpanExt;
+#[cfg(feature = "trace")]
+use tracing_subscriber::prelude::*;
 
 use pi_atom::Atom;
 use pi_bon::{WriteBuffer, ReadBuffer, Encode, Decode, ReadBonErr};
@@ -289,6 +296,21 @@ impl<
                        is_writable: bool,
                        prepare_timeout: u64,
                        commit_timeout: u64) -> Option<KVDBTransaction<C, Log>> {
+        #[cfg(feature = "trace")]
+        let _db_transaction_span = {
+            let mut carrier = HashMap::new();
+            carrier.insert(
+                "traceparent".to_string(),
+                source.as_str().to_string(),
+            );
+            let parent_context = global::get_text_map_propagator(|propagator| {
+                propagator.extract(&carrier)
+            });
+            let span = tracing::info_span!("db_transaction");
+            span.set_parent(parent_context);
+            span
+        };
+
         let status = self.0.status.load(Ordering::Relaxed);
         if status != DB_INITING_STATUS && status != DB_INITED_STATUS {
             //当前数据库状态不允许创建键值对数据库的根事务，则立即返回空
@@ -1087,6 +1109,14 @@ impl<
 
     fn prepare(&self)
                -> BoxFuture<Result<Option<<Self as Transaction2Pc>::PrepareOutput>, <Self as Transaction2Pc>::PrepareError>> {
+        #[cfg(feature = "trace")]
+        let _db_prepare_span = {
+            tracing::info_span!("db_prepare",
+                tid = self.get_transaction_uid().unwrap_or(Guid(0)).0,
+                cid = self.get_commit_uid().unwrap_or(Guid(0)).0,
+                status = self.get_status() as u8)
+        };
+
         match self {
             KVDBTransaction::RootTr(tr) => {
                 tr.prepare()
@@ -1108,6 +1138,14 @@ impl<
 
     fn commit(&self, confirm: <Self as Transaction2Pc>::CommitConfirm)
               -> BoxFuture<Result<<Self as AsyncTransaction>::Output, <Self as AsyncTransaction>::Error>> {
+        #[cfg(feature = "trace")]
+        let _db_commit_span = {
+            tracing::info_span!("db_commit",
+                tid = self.get_transaction_uid().unwrap_or(Guid(0)).0,
+                cid = self.get_commit_uid().unwrap_or(Guid(0)).0,
+                status = self.get_status() as u8)
+        };
+
         match self {
             KVDBTransaction::RootTr(tr) => {
                 tr.commit(confirm)
@@ -1368,6 +1406,18 @@ impl<
     /// 在键值对数据库事务的根事务内，异步查询多个表和键的值的结果集
     pub async fn query(&self,
                        table_kv_list: Vec<TableKV>) -> Vec<Option<Binary>> {
+        #[cfg(feature = "trace")]
+        let _db_qurey_span = {
+            let mut tks = Vec::with_capacity(table_kv_list.len());
+            for tkv in &table_kv_list {
+                tks.push((&tkv.table, &tkv.key));
+            }
+            tracing::info_span!("db_query",
+                tid = self.get_transaction_uid().unwrap_or(Guid(0)).0,
+                cid = self.get_commit_uid().unwrap_or(Guid(0)).0,
+                status = self.get_status() as u8, tks = format!("{:#?}", tks))
+        };
+
         match self {
             KVDBTransaction::RootTr(tr) => {
                 tr.query(table_kv_list).await
@@ -1379,6 +1429,19 @@ impl<
     /// 在键值对数据库事务的根事务内，异步插入或更新指定多个表和键的值
     pub async fn upsert(&self,
                         table_kv_list: Vec<TableKV>) -> Result<(), KVTableTrError> {
+        #[cfg(feature = "trace")]
+        let _db_upsert_span = {
+            let mut tks = Vec::with_capacity(table_kv_list.len());
+            for tkv in &table_kv_list {
+                tks.push((&tkv.table, &tkv.key));
+            }
+            tracing::info_span!("db_upsert",
+                tid = self.get_transaction_uid().unwrap_or(Guid(0)).0,
+                cid = self.get_commit_uid().unwrap_or(Guid(0)).0,
+                status = self.get_status() as u8,
+                tks = format!("{:#?}", tks))
+        };
+
         match self {
             KVDBTransaction::RootTr(tr) => {
                 tr.upsert(table_kv_list).await
@@ -1391,6 +1454,19 @@ impl<
     pub async fn delete(&self,
                         table_kv_list: Vec<TableKV>)
                         -> Result<Vec<Option<Binary>>, KVTableTrError> {
+        #[cfg(feature = "trace")]
+        let _db_delete_span = {
+            let mut tks = Vec::with_capacity(table_kv_list.len());
+            for tkv in &table_kv_list {
+                tks.push((&tkv.table, &tkv.key));
+            }
+            tracing::info_span!("db_delete",
+                tid = self.get_transaction_uid().unwrap_or(Guid(0)).0,
+                cid = self.get_commit_uid().unwrap_or(Guid(0)).0,
+                status = self.get_status() as u8,
+                tks = format!("{:#?}", tks))
+        };
+
         match self {
             KVDBTransaction::RootTr(tr) => {
                 tr.delete(table_kv_list).await
