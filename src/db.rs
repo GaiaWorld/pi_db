@@ -15,7 +15,9 @@ use log::info;
 #[cfg(feature = "trace")]
 use tracing::Instrument;
 #[cfg(feature = "trace")]
-use opentelemetry::{global, Context};
+use opentelemetry::{global, Context,
+                    propagation::TextMapPropagator,
+                    sdk::propagation::TraceContextPropagator};
 #[cfg(feature = "trace")]
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 #[cfg(feature = "trace")]
@@ -1110,9 +1112,8 @@ impl<
                 "traceparent".to_string(),
                 self.get_source().as_str().to_string(),
             );
-            let parent_context = global::get_text_map_propagator(|propagator| {
-                propagator.extract(&carrier)
-            });
+            let propagator = TraceContextPropagator::new();
+            let parent_context = propagator.extract(&carrier);
             let cid = self.get_transaction_uid();
             let span = tracing::debug_span!("db_prepare",
                 tid = cid.clone().unwrap_or(Guid(0)).0,
