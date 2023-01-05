@@ -22,6 +22,7 @@ use pi_async_transaction::{AsyncCommitLog, TransactionError, ErrorLevel};
 pub mod db;
 pub mod tables;
 pub mod inspector;
+pub mod utils;
 
 ///
 /// 二进制数据

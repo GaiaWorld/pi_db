@@ -55,7 +55,8 @@ use crate::{Binary,
                      log_ord_table::{LogOrderedTable,
                                      LogOrdTabTr},
                      log_write_table::{LogWriteTable,
-                                       LogWTabTr}}};
+                                       LogWTabTr}},
+            utils::CreateTableOptions};
 
 ///
 /// 默认的数据库表元信息目录名
@@ -2017,9 +2018,10 @@ impl<
 
     /// 异步创建表，表名可以是用文件分隔符分隔的路径，但必须是相对路径，且不允许使用".."
     #[inline]
-    async fn create_table(&self,
-                          name: Atom,
-                          meta: KVTableMeta) -> IOResult<()> {
+    async fn create_table_with_options(&self,
+                                       name: Atom,
+                                       meta: KVTableMeta,
+                                       options: CreateTableOptions) -> IOResult<()> {
         //检查待创建的指定名称的表是否存在
         let meta_table_name = Atom::from(DEFAULT_DB_TABLES_META_DIR);
         let mut tables = self.0.db_mgr.0.tables.write().await;
@@ -2093,20 +2095,30 @@ impl<
             KVDBTableType::LogOrdTab => {
                 //创建一个有序日志表
                 let table_path = self.0.db_mgr.0.tables_path.join(name.as_str()); //通过键值对数据库的表所在目录的路径与表名，生成表所在目录的路径
-                let table =
-                    LogOrderedTable::new(self.0.db_mgr.0.rt.clone(),
-                                         table_path,
-                                         name.clone(),
-                                         512 * 1024 * 1024,
-                                         2 * 1024 * 1024,
-                                         None,
-                                         2 * 1024 * 1024,
-                                         true,
-                                         16 * 1024 * 1024,
-                                         60 * 1000).await;
+                if let CreateTableOptions::LogOrdTab(log_file_limit, block_limit, load_buf_len) = options.clone() {
+                    //有序日志表的选项
+                    let table =
+                        LogOrderedTable::new(self.0.db_mgr.0.rt.clone(),
+                                             table_path,
+                                             name.clone(),
+                                             log_file_limit,
+                                             block_limit,
+                                             None,
+                                             load_buf_len as u64,
+                                             true,
+                                             16 * 1024 * 1024,
+                                             60 * 1000).await;
 
-                //注册创建的有序日志表
-                tables.insert(name.clone(), KVDBTable::LogOrdTab(table));
+                    //注册创建的有序日志表
+                    tables.insert(name.clone(), KVDBTable::LogOrdTab(table));
+                } else {
+                    //没有有序日志表的选项，则立即返回错误原因
+                    return Err(Error::new(ErrorKind::Other,
+                                          format!("Create table failed, name: {:?}, meta: {:?}, options: {:?}, reason: invalid options",
+                                                  name,
+                                                  meta,
+                                                  options)));
+                }
             },
             KVDBTableType::LogWTab => {
                 //创建一个只写日志表
@@ -2155,6 +2167,18 @@ impl<
         }
 
         Ok(())
+    }
+
+    /// 通过默认参数异步创建表，表名可以是用文件分隔符分隔的路径，但必须是相对路径，且不允许使用".."
+    #[inline]
+    async fn create_table(&self,
+                          name: Atom,
+                          meta: KVTableMeta) -> IOResult<()> {
+        self.create_table_with_options(name,
+                                       meta,
+                                       CreateTableOptions::LogOrdTab(512 * 1024 * 1024,
+                                                                     2 * 1024 * 1024,
+                                                                     2 * 1024 * 1024)).await
     }
 
     /// 异步修复创建表，表名可以是用文件分隔符分隔的路径，但必须是相对路径，且不允许使用".."
