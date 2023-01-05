@@ -1454,6 +1454,19 @@ impl<
     }
 
     /// 异步创建表，需要指定表名和表的元信息
+    pub async fn create_table_with_options(&self,
+                                           name: Atom,
+                                           meta: KVTableMeta,
+                                           options: CreateTableOptions) -> IOResult<()> {
+        match self {
+            KVDBTransaction::RootTr(tr) => {
+                tr.create_table_with_options(name, meta, options).await
+            },
+            _ => panic!("Create table failed, reason: invalid root transaction"),
+        }
+    }
+
+    /// 异步创建表，需要指定表名和表的元信息
     pub async fn create_table(&self,
                               name: Atom,
                               meta: KVTableMeta) -> IOResult<()> {
