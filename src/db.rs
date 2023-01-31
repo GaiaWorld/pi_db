@@ -2053,7 +2053,7 @@ impl<
                     self.table_transaction(meta_table_name.clone(), meta_table, false, &mut *childes_map)
                 };
 
-                if let KVDBTransaction::MetaTabTr(tr) = meta_table_tr {
+                if let KVDBTransaction::MetaTabTr(tr) = &meta_table_tr {
                     if let Some(value) = tr.query(table_to_binary(&name)).await {
                         //指定名称的表的元信息存在
                         let table_meta = KVTableMeta::from(value);
@@ -2165,7 +2165,7 @@ impl<
                 self.table_transaction(meta_table_name, meta_table, true, &mut *childes_map)
             };
 
-            if let KVDBTransaction::MetaTabTr(tr) = meta_table_tr {
+            if let KVDBTransaction::MetaTabTr(tr) = &meta_table_tr {
                 if let Err(e) = tr.upsert(table_to_binary(&name),
                                                Binary::from(meta.clone())).await {
                     //写入表的元信息失败，则立即返回错误原因
@@ -2265,7 +2265,7 @@ impl<
                 self.table_transaction(meta_table_name, meta_table, true, &mut *childes_map)
             };
 
-            if let KVDBTransaction::MetaTabTr(tr) = meta_table_tr {
+            if let KVDBTransaction::MetaTabTr(tr) = &meta_table_tr {
                 if let Err(e) = tr.upsert(table_to_binary(&name),
                                           Binary::from(meta.clone())).await {
                     //写入表的元信息失败，则立即返回错误原因
@@ -2304,7 +2304,7 @@ impl<
                 self.table_transaction(meta_table_name, meta_table, true, &mut *childes_map)
             };
 
-            if let KVDBTransaction::MetaTabTr(tr) = meta_table_tr {
+            if let KVDBTransaction::MetaTabTr(tr) = &meta_table_tr {
                 if let Err(e) = tr.delete(table_to_binary(&table)).await {
                     //删除表的元信息失败，则立即返回错误原因
                     return Err(Error::new(ErrorKind::Other,
@@ -2344,7 +2344,7 @@ impl<
                     self.table_transaction(table_kv.table, table, false, &mut *childes_map)
                 };
 
-                match table_tr {
+                match &table_tr {
                     KVDBTransaction::RootTr(_tr) => {
                         //忽略键值对数据库的根事务
                         ()
@@ -2410,7 +2410,7 @@ impl<
                     self.0.persistence.store(true, Ordering::Relaxed);
                 }
 
-                match table_tr {
+                match &table_tr {
                     KVDBTransaction::RootTr(_tr) => {
                         //忽略键值对数据库的根事务
                         ()
@@ -2495,7 +2495,7 @@ impl<
                     self.0.persistence.store(true, Ordering::Relaxed);
                 }
 
-                match table_tr {
+                match &table_tr {
                     KVDBTransaction::RootTr(_tr) => {
                         //忽略键值对数据库的根事务
                         ()
@@ -2579,7 +2579,7 @@ impl<
                 self.table_transaction(table_name, table, false, &mut *childes_map)
             };
 
-            match table_tr {
+            match &table_tr {
                 KVDBTransaction::RootTr(_tr) => {
                     //忽略键值对数据库的根事务
                     None
@@ -2624,7 +2624,7 @@ impl<
                 self.table_transaction(table_name, table, false, &mut *childes_map)
             };
 
-            match table_tr {
+            match &table_tr {
                 KVDBTransaction::RootTr(_tr) => {
                     //忽略键值对数据库的根事务
                     None
@@ -2668,7 +2668,7 @@ impl<
                 self.table_transaction(table_name, table, false, &mut *childes_map)
             };
 
-            match table_tr {
+            match &table_tr {
                 KVDBTransaction::RootTr(_tr) => {
                     //忽略键值对数据库的根事务
                     Ok(())
@@ -2712,7 +2712,7 @@ impl<
                 self.table_transaction(table_name, table, false, &mut *childes_map)
             };
 
-            match table_tr {
+            match &table_tr {
                 KVDBTransaction::RootTr(_tr) => {
                     //忽略键值对数据库的根事务
                     Ok(())
@@ -2868,7 +2868,7 @@ impl<
                             -> Result<(), KVTableTrError> {
         let mut childs = self.to_children();
         while let Some(child) = childs.next() {
-            match child {
+            match &child {
                 KVDBTransaction::MetaTabTr(tr) => {
                     tr.prepare_repair(transaction_uid.clone());
                 },

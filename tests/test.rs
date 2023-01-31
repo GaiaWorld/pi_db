@@ -2803,6 +2803,7 @@ fn test_multi_tables_write_commit_log() {
             rt.spawn(rt.alloc(), async move {
                 let mut result = true;
                 let now = Instant::now();
+                let mut retry_count = 0;
                 while now.elapsed().as_millis() < 5000 {
                     let tr = db_copy.transaction(Atom::from("Test multi table repair"), true, 500, 500).unwrap();
 
@@ -2835,8 +2836,16 @@ fn test_multi_tables_write_commit_log() {
                         Err(e) => {
                             if let ErrorLevel::Normal = e.level() {
                                 tr.rollback_modified().await.unwrap();
+                            } else {
+                                panic!("Prepare failed");
                             }
-                            rt_copy.timeout(0).await;
+
+                            if retry_count > 10 {
+                                rt_copy.timeout(15).await;
+                            } else {
+                                rt_copy.timeout(0).await;
+                            }
+                            retry_count += 1;
                             continue;
                         },
                         Ok(output) => {
