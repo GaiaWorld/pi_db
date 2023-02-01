@@ -2859,6 +2859,13 @@ impl<
             return Err(e);
         }
 
+        //回滚键值对数据库的根事务成功，则完成本次键值对数据库事务
+        self
+            .0
+            .db_mgr
+            .0
+            .tr_mgr
+            .finish(KVDBTransaction::RootTr(self.clone()));
         Ok(())
     }
 

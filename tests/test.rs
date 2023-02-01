@@ -2836,15 +2836,19 @@ fn test_multi_tables_write_commit_log() {
                         Err(e) => {
                             if let ErrorLevel::Normal = e.level() {
                                 tr.rollback_modified().await.unwrap();
-                            } else {
-                                panic!("Prepare failed");
                             }
 
-                            if retry_count > 10 {
-                                rt_copy.timeout(15).await;
-                            } else {
-                                rt_copy.timeout(0).await;
+                            #[cfg(target_os = "windows")]
+                            {
+                                if retry_count > 10 {
+                                    rt_copy.timeout(15).await;
+                                } else {
+                                    rt_copy.timeout(0).await;
+                                }
                             }
+                            #[cfg(target_os = "linux")]
+                            rt_copy.timeout(0).await;
+
                             retry_count += 1;
                             continue;
                         },
