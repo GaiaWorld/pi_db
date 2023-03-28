@@ -1510,6 +1510,17 @@ impl<
         }
     }
 
+    /// 在键值对数据库事务的根事务内，异步查询多个表和键的值的结果集，可能会查询到旧值
+    pub async fn dirty_query(&self,
+                             table_kv_list: Vec<TableKV>) -> Vec<Option<Binary>> {
+        match self {
+            KVDBTransaction::RootTr(tr) => {
+                tr.dirty_query(table_kv_list).await
+            },
+            _ => panic!("Query by dirty db failed, reason: invalid root transaction"),
+        }
+    }
+
     /// 在键值对数据库事务的根事务内，异步查询多个表和键的值的结果集
     pub async fn query(&self,
                        table_kv_list: Vec<TableKV>) -> Vec<Option<Binary>> {
@@ -1521,6 +1532,17 @@ impl<
         }
     }
 
+    /// 在键值对数据库事务的根事务内，异步插入或更新指定多个表和键的值，插入或更新可能会被覆蓋
+    pub async fn dirty_upsert(&self,
+                              table_kv_list: Vec<TableKV>) -> Result<(), KVTableTrError> {
+        match self {
+            KVDBTransaction::RootTr(tr) => {
+                tr.dirty_upsert(table_kv_list).await
+            },
+            _ => panic!("Upsert db failed, reason: invalid root transaction"),
+        }
+    }
+
     /// 在键值对数据库事务的根事务内，异步插入或更新指定多个表和键的值
     pub async fn upsert(&self,
                         table_kv_list: Vec<TableKV>) -> Result<(), KVTableTrError> {
@@ -1529,6 +1551,18 @@ impl<
                 tr.upsert(table_kv_list).await
             },
             _ => panic!("Upsert db failed, reason: invalid root transaction"),
+        }
+    }
+
+    /// 在键值对数据库事务的根事务内，异步删除指定多个表和键的值，并返回删除值的结果集，删除可能会被覆蓋
+    pub async fn dirty_delete(&self,
+                        table_kv_list: Vec<TableKV>)
+                        -> Result<Vec<Option<Binary>>, KVTableTrError> {
+        match self {
+            KVDBTransaction::RootTr(tr) => {
+                tr.dirty_delete(table_kv_list).await
+            },
+            _ => panic!("Delete db failed, reason: invalid root transaction"),
         }
     }
 
@@ -2326,6 +2360,59 @@ impl<
         self.remove_table(table).await
     }
 
+    /// 异步查询多个表和键的值的结果集，可能会查询到旧值
+    #[inline]
+    async fn dirty_query(&self,
+                         table_kv_list: Vec<TableKV>) -> Vec<Option<Binary>> {
+        let mut result = Vec::new();
+
+        for table_kv in table_kv_list {
+            if let Some(table) = self.0.db_mgr.0.tables.read().await.get(&table_kv.table) {
+                //指定名称的表存在，则获取表事务，并开始查询表的指定关键字的值
+                let mut childes_map = self.0.childs_map.lock();
+                let table_tr = if let Some(table_tr) = childes_map.get(&table_kv.table) {
+                    //指定名称的表的子事务存在
+                    table_tr.clone()
+                } else {
+                    //指定名称的表的子事务不存在，则创建指定表的事务，因为是查询操作，所以初始化指定表的子事务为非持久化事务
+                    self.table_transaction(table_kv.table, table, false, &mut *childes_map)
+                };
+
+                match &table_tr {
+                    KVDBTransaction::RootTr(_tr) => {
+                        //忽略键值对数据库的根事务
+                        ()
+                    },
+                    KVDBTransaction::MetaTabTr(tr) => {
+                        //查询元信息表的指定关键字的值
+                        let value = tr.dirty_query(table_kv.key).await;
+                        result.push(value);
+                    },
+                    KVDBTransaction::MemOrdTabTr(tr) => {
+                        //查询有序内存表的指定关键字的值
+                        let value = tr.dirty_query(table_kv.key).await;
+                        result.push(value);
+                    },
+                    KVDBTransaction::LogOrdTabTr(tr) => {
+                        //查询有序日志表的指定关键字的值
+                        let value = tr.dirty_query(table_kv.key).await;
+                        result.push(value);
+                    },
+                    KVDBTransaction::LogWTabTr(tr) => {
+                        //查询只写日志表的指定关键字的值
+                        let value = tr.dirty_query(table_kv.key).await;
+                        result.push(value);
+                    },
+                }
+            } else {
+                //指定名称的表不存在
+                result.push(None);
+            }
+        }
+
+        result
+    }
+
     /// 异步查询多个表和键的值的结果集
     #[inline]
     async fn query(&self,
@@ -2377,6 +2464,89 @@ impl<
         }
 
         result
+    }
+
+    /// 异步插入或更新指定多个表和键的值，插入或更新可能会被覆蓋
+    #[inline]
+    async fn dirty_upsert(&self,
+                          table_kv_list: Vec<TableKV>) -> Result<(), KVTableTrError> {
+        for table_kv in table_kv_list {
+            if let Some(table) = self.0.db_mgr.0.tables.read().await.get(&table_kv.table) {
+                //指定名称的表存在，则获取表事务，并开始插入或更新表的指定关键字的值
+                let mut childes_map = self.0.childs_map.lock();
+                let table_tr = if let Some(table_tr) = childes_map.get(&table_kv.table) {
+                    //指定名称的表的子事务存在
+                    if table.is_persistent() {
+                        //指定表需要持久化，且因为插入或更新操作，所以设置子事务为需要持久化
+                        table_tr.require_persistence();
+                    }
+                    table_tr.clone()
+                } else {
+                    //指定名称的表的子事务不存在，则创建指定表的事务
+                    if table.is_persistent() {
+                        //指定表需要持久化，且因为插入或更新操作，所以初始化指定表的子事务为持久化事务
+                        self.table_transaction(table_kv.table, table, true, &mut *childes_map)
+                    } else {
+                        //指定表不需要持久化，所以即使插入或更新操作，也初始化指定表的子事务为非持久化事务
+                        self.table_transaction(table_kv.table, table, false, &mut *childes_map)
+                    }
+                };
+
+                if table_tr.is_require_persistence() {
+                    //如果任意写操作对应的子事务需要持久化，则根事务也需要持久化
+                    self.0.persistence.store(true, Ordering::Relaxed);
+                }
+
+                match &table_tr {
+                    KVDBTransaction::RootTr(_tr) => {
+                        //忽略键值对数据库的根事务
+                        ()
+                    },
+                    KVDBTransaction::MetaTabTr(tr) => {
+                        //插入或更新元信息表的指定关键字的值
+                        if let Some(value) = table_kv.value {
+                            //有值则插入或更新
+                            if let Err(e) = tr.dirty_upsert(table_kv.key, value).await {
+                                //插入或更新元信息表的指定关键字的值错误，则立即返回错误原因
+                                return Err(e);
+                            }
+                        }
+                    },
+                    KVDBTransaction::MemOrdTabTr(tr) => {
+                        //插入或更新有序内存表的指定关键字的值
+                        if let Some(value) = table_kv.value {
+                            //有值则插入或更新
+                            if let Err(e) = tr.dirty_upsert(table_kv.key, value).await {
+                                //插入或更新有序内存表的指定关键字的值错误，则立即返回错误原因
+                                return Err(e);
+                            }
+                        }
+                    },
+                    KVDBTransaction::LogOrdTabTr(tr) => {
+                        //插入或更新有序日志表的指定关键字的值
+                        if let Some(value) = table_kv.value {
+                            //有值则插入或更新
+                            if let Err(e) = tr.dirty_upsert(table_kv.key, value).await {
+                                //插入或更新有序日志表的指定关键字的值错误，则立即返回错误原因
+                                return Err(e);
+                            }
+                        }
+                    },
+                    KVDBTransaction::LogWTabTr(tr) => {
+                        //插入或更新只写日志表的指定关键字的值
+                        if let Some(value) = table_kv.value {
+                            //有值则插入或更新
+                            if let Err(e) = tr.dirty_upsert(table_kv.key, value).await {
+                                //插入或更新只写日志表的指定关键字的值错误，则立即返回错误原因
+                                return Err(e);
+                            }
+                        }
+                    },
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// 异步插入或更新指定多个表和键的值
@@ -2460,6 +2630,106 @@ impl<
         }
 
         Ok(())
+    }
+
+    /// 异步删除指定多个表和键的值，并返回删除值的结果集，删除可能会被覆蓋
+    #[inline]
+    async fn dirty_delete(&self,
+                          table_kv_list: Vec<TableKV>) -> Result<Vec<Option<Binary>>, KVTableTrError> {
+        let mut result = Vec::new();
+
+        for table_kv in table_kv_list {
+            if let Some(table) = self.0.db_mgr.0.tables.read().await.get(&table_kv.table) {
+                //指定名称的表存在，则获取表事务，并开始删除表的指定关键字的值
+                let mut childes_map = self.0.childs_map.lock();
+                let table_tr = if let Some(table_tr) = childes_map.get(&table_kv.table) {
+                    //指定名称的表的子事务存在
+                    if table.is_persistent() {
+                        //指定表需要持久化，且因为插入或更新操作，所以设置子事务为需要持久化
+                        table_tr.require_persistence();
+                    }
+                    table_tr.clone()
+                } else {
+                    //指定名称的表的子事务不存在，则创建指定表的事务
+                    if table.is_persistent() {
+                        //指定表需要持久化，且因为插入或更新操作，所以初始化指定表的子事务为持久化事务
+                        self.table_transaction(table_kv.table, table, true, &mut *childes_map)
+                    } else {
+                        //指定表不需要持久化，所以即使插入或更新操作，也初始化指定表的子事务为非持久化事务
+                        self.table_transaction(table_kv.table, table, false, &mut *childes_map)
+                    }
+                };
+
+                if table_tr.is_require_persistence() {
+                    //如果任意写操作对应的子事务需要持久化，则根事务也需要持久化
+                    self.0.persistence.store(true, Ordering::Relaxed);
+                }
+
+                match &table_tr {
+                    KVDBTransaction::RootTr(_tr) => {
+                        //忽略键值对数据库的根事务
+                        ()
+                    },
+                    KVDBTransaction::MetaTabTr(tr) => {
+                        //删除元信息表的指定关键字的值
+                        match tr.dirty_delete(table_kv.key).await {
+                            Err(e) => {
+                                //删除元信息表的指定关键字的值错误，则立即返回错误原因
+                                return Err(e);
+                            },
+                            Ok(value) => {
+                                //删除元信息表的指定关键字的值成功
+                                result.push(value);
+                            },
+                        }
+                    },
+                    KVDBTransaction::MemOrdTabTr(tr) => {
+                        //删除有序内存表的指定关键字的值
+                        match tr.dirty_delete(table_kv.key).await {
+                            Err(e) => {
+                                //删除有序内存表的指定关键字的值错误，则立即返回错误原因
+                                return Err(e);
+                            },
+                            Ok(value) => {
+                                //删除有序内存表的指定关键字的值成功
+                                result.push(value);
+                            },
+                        }
+                    },
+                    KVDBTransaction::LogOrdTabTr(tr) => {
+                        //删除有序日志表的指定关键字的值
+                        match tr.dirty_delete(table_kv.key).await {
+                            Err(e) => {
+                                //删除有序日志表的指定关键字的值错误，则立即返回错误原因
+                                return Err(e);
+                            },
+                            Ok(value) => {
+                                //删除有序日志表的指定关键字的值成功
+                                result.push(value);
+                            },
+                        }
+                    },
+                    KVDBTransaction::LogWTabTr(tr) => {
+                        //删除只写日志表的指定关键字的值
+                        match tr.dirty_delete(table_kv.key).await {
+                            Err(e) => {
+                                //删除只写日志表的指定关键字的值错误，则立即返回错误原因
+                                return Err(e);
+                            },
+                            Ok(value) => {
+                                //删除只写日志表的指定关键字的值成功
+                                result.push(value);
+                            },
+                        }
+                    },
+                }
+            } else {
+                //指定名称的表不存在
+                result.push(None);
+            }
+        }
+
+        Ok(result)
     }
 
     /// 异步删除指定多个表和键的值，并返回删除值的结果集

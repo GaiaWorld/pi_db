@@ -148,39 +148,53 @@ pub trait KVAction: Send + Sync + 'static {
     type Value: AsRef<[u8]> + Deref<Target = [u8]> + Default + Clone + Send + 'static;
     type Error: Debug + 'static;
 
+    /// 异步查询指定关键字的值，可能会查询到旧值
+    fn dirty_query(&self, key: <Self as KVAction>::Key)
+        -> BoxFuture<Option<<Self as KVAction>::Value>>;
+
     /// 异步查询指定关键字的值
     fn query(&self, key: <Self as KVAction>::Key)
-             -> BoxFuture<Option<<Self as KVAction>::Value>>;
+        -> BoxFuture<Option<<Self as KVAction>::Value>>;
+
+    /// 异步插入或更新指定关键字的值，插入或更新可能会被覆蓋
+    fn dirty_upsert(&self,
+                    key: <Self as KVAction>::Key,
+                    value: <Self as KVAction>::Value)
+        -> BoxFuture<Result<(), <Self as KVAction>::Error>>;
 
     /// 异步插入或更新指定关键字的值
     fn upsert(&self,
               key: <Self as KVAction>::Key,
               value: <Self as KVAction>::Value)
-              -> BoxFuture<Result<(), <Self as KVAction>::Error>>;
+        -> BoxFuture<Result<(), <Self as KVAction>::Error>>;
+
+    /// 异步删除指定关键值的值，并返回删除值，删除可能会被覆蓋
+    fn dirty_delete(&self, key: <Self as KVAction>::Key)
+        -> BoxFuture<Result<Option<<Self as KVAction>::Value>, <Self as KVAction>::Error>>;
 
     /// 异步删除指定关键值的值，并返回删除值
     fn delete(&self, key: <Self as KVAction>::Key)
-              -> BoxFuture<Result<Option<<Self as KVAction>::Value>, <Self as KVAction>::Error>>;
+        -> BoxFuture<Result<Option<<Self as KVAction>::Value>, <Self as KVAction>::Error>>;
 
     /// 获取从指定关键字开始，从前向后或从后向前的关键字异步流
     fn keys<'a>(&self,
                 key: Option<<Self as KVAction>::Key>,
                 descending: bool)
-                -> BoxStream<'a, <Self as KVAction>::Key>;
+        -> BoxStream<'a, <Self as KVAction>::Key>;
 
     /// 获取从指定关键字开始，从前向后或从后向前的键值对异步流
     fn values<'a>(&self,
                   key: Option<<Self as KVAction>::Key>,
                   descending: bool)
-                  -> BoxStream<'a, (<Self as KVAction>::Key, <Self as KVAction>::Value)>;
+        -> BoxStream<'a, (<Self as KVAction>::Key, <Self as KVAction>::Value)>;
 
     /// 锁住指定关键字
     fn lock_key(&self, key: <Self as KVAction>::Key)
-                -> BoxFuture<Result<(), <Self as KVAction>::Error>>;
+        -> BoxFuture<Result<(), <Self as KVAction>::Error>>;
 
     /// 解锁指定关键字
     fn unlock_key(&self, key: <Self as KVAction>::Key)
-                  -> BoxFuture<Result<(), <Self as KVAction>::Error>>;
+        -> BoxFuture<Result<(), <Self as KVAction>::Error>>;
 }
 
 ///
@@ -325,8 +339,21 @@ impl Default for TableTrQos {
 ///
 #[derive(Debug, Clone)]
 pub enum KVActionLog {
-    Read,				    //读操作，读操作记录不允许覆盖写操作记录
-    Write(Option<Binary>),	//写操作，为None则表示删除，否则主键不存在则为插入，主键存在则为更新，写操作记录会覆盖读操作记录
+    Read,				        //读操作，读操作记录不允许覆盖写操作记录
+    Write(Option<Binary>),	    //写操作，为None则表示删除，否则主键不存在则为插入，主键存在则为更新，写操作记录会覆盖读操作记录
+    DirtyWrite(Option<Binary>), //脏写操作，为None则表示删除，否则主键不存在则为插入，主键存在则为更新，脏写操作记录不会覆盖读操作记录
+}
+
+impl KVActionLog {
+    /// 判断是否是脏写操作记录
+    #[inline]
+    pub fn is_dirty_writed(&self) -> bool {
+        if let KVActionLog::DirtyWrite(_) = self {
+            true
+        } else {
+            false
+        }
+    }
 }
 
 ///

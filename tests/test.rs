@@ -2898,6 +2898,1296 @@ fn test_multi_tables_write_commit_log() {
     thread::sleep(Duration::from_millis(1000000000));
 }
 
+#[test]
+fn test_query_conflict() {
+    use std::thread;
+    use std::time::Duration;
+
+    let builder = MultiTaskRuntimeBuilder::default();
+    let rt = builder.build();
+    let rt_copy = rt.clone();
+
+    let builder = MultiTaskRuntimeBuilder::default();
+    let rt1 = builder.build();
+
+    rt.spawn(rt.alloc(), async move {
+        let guid_gen = GuidGen::new(run_nanos(), 0);
+        let commit_logger_builder = CommitLoggerBuilder::new(rt_copy.clone(), "./.commit_log");
+        let commit_logger = commit_logger_builder
+            .build()
+            .await
+            .unwrap();
+
+        let tr_mgr = Transaction2PcManager::new(rt_copy.clone(),
+                                                guid_gen,
+                                                commit_logger);
+
+        let mut builder = KVDBManagerBuilder::new(rt_copy.clone(), tr_mgr, "./db");
+        match builder.startup().await {
+            Err(e) => {
+                panic!(e);
+            },
+            Ok(db) => {
+                println!("!!!!!!db table size: {:?}", db.table_size().await);
+
+                let table_name = Atom::from("test_log");
+                let tr = db.transaction(table_name.clone(), true, 500, 500).unwrap();
+                if let Err(e) = tr.create_table(table_name.clone(),
+                                                KVTableMeta::new(KVDBTableType::LogOrdTab,
+                                                                 true,
+                                                                 EnumType::Usize,
+                                                                 EnumType::Usize)).await {
+                    //创建有序内存表失败
+                    println!("!!!!!!create log ordered table failed, reason: {:?}", e);
+                }
+                let output = tr.prepare_modified().await.unwrap();
+                let _ = tr.commit_modified(output).await;
+
+                println!("!!!!!!db table size: {:?}", db.table_size().await);
+
+                //查询表信息
+                rt_copy.timeout(1500).await;
+                println!("");
+
+                println!("!!!!!!test_log is exist: {:?}", db.is_exist(&table_name).await);
+                println!("!!!!!!test_log is ordered table: {:?}", db.is_ordered_table(&table_name).await);
+                println!("!!!!!!test_log is persistent table: {:?}", db.is_persistent_table(&table_name).await);
+                println!("!!!!!!test_log table_dir: {:?}", db.table_path(&table_name).await);
+                println!("!!!!!!test_log table len: {:?}", db.table_record_size(&table_name).await);
+
+                //操作数据库事务
+                rt_copy.timeout(1500).await;
+                println!("");
+
+                {
+                    let tr = db.transaction(table_name.clone(), true, 500, 500).unwrap();
+
+                    let _r = tr.upsert(vec![
+                        TableKV {
+                            table: table_name.clone(),
+                            key: usize_to_binary(0),
+                            value: Some(Binary::new(0usize.to_le_bytes().to_vec()))
+                        }
+                    ]).await;
+
+                    if let Ok(output) = tr.prepare_modified().await {
+                        tr.commit_modified(output).await.is_ok();
+                    }
+                }
+
+                let rt_copy_ = rt1.clone();
+                let db_copy = db.clone();
+                let table_name_copy = table_name.clone();
+                rt1.spawn(rt1.alloc(), async move {
+                    let mut conflict_count = 0;
+                    for _ in 0..1000 {
+                        let now = Instant::now();
+                        let mut is_ok = false;
+
+                        while now.elapsed().as_millis() <= 60000 {
+                            let tr = db_copy.transaction(Atom::from("test log table"), true, 500, 500).unwrap();
+                            let r = tr.query(vec![
+                                TableKV {
+                                    table: table_name_copy.clone(),
+                                    key: usize_to_binary(0),
+                                    value: None
+                                }
+                            ]).await;
+                            let last_value = usize::from_le_bytes(r[0].as_ref().unwrap().as_ref().try_into().unwrap());
+
+                            let new_value = last_value + 1;
+                            let _r = tr.upsert(vec![
+                                TableKV {
+                                    table: table_name_copy.clone(),
+                                    key: usize_to_binary(0),
+                                    value: Some(Binary::new(new_value.to_le_bytes().to_vec()))
+                                }
+                            ]).await;
+
+                            match tr.prepare_modified().await {
+                                Err(_e) => {
+                                    if let Err(e) = tr.rollback_modified().await {
+                                        println!("rollback failed, reason: {:?}", e);
+                                    } else {
+                                        conflict_count += 1;
+                                        rt_copy_.timeout(0).await;
+                                        continue;
+                                    }
+                                },
+                                Ok(output) => {
+                                    match tr.commit_modified(output).await {
+                                        Err(e) => {
+                                            if let ErrorLevel::Fatal = &e.level() {
+                                                println!("rollback failed, reason: commit fatal error");
+                                            } else {
+                                                if let Err(e) = tr.rollback_modified().await {
+                                                    println!("rollback failed, reason: {:?}", e);
+                                                } else {
+                                                    rt_copy_.timeout(0).await;
+                                                    continue;
+                                                }
+                                            }
+                                        },
+                                        Ok(()) => {
+                                            is_ok = true;
+                                            break;
+                                        },
+                                    }
+                                },
+                            }
+                        }
+
+                        if !is_ok {
+                            println!("writed timeout");
+                        }
+                    }
+                    println!("!!!!!!writable conflict, {}", conflict_count);
+                });
+
+                let rt_copy_ = rt_copy.clone();
+                let db_copy = db.clone();
+                let table_name_copy = table_name.clone();
+                rt_copy.spawn(rt_copy.alloc(), async move {
+                    let mut conflict_count = 0;
+                    for _ in 0..10000 {
+                        let now = Instant::now();
+                        let mut is_ok = false;
+
+                        while now.elapsed().as_millis() <= 60000 {
+                            let tr = db_copy.transaction(Atom::from("test log table"), true, 500, 500).unwrap();
+                            let r = tr.query(vec![
+                                TableKV {
+                                    table: table_name_copy.clone(),
+                                    key: usize_to_binary(0),
+                                    value: None
+                                }
+                            ]).await;
+
+                            match tr.prepare_modified().await {
+                                Err(_e) => {
+                                    if let Err(e) = tr.rollback_modified().await {
+                                        println!("rollback failed, reason: {:?}", e);
+                                    } else {
+                                        conflict_count += 1;
+                                        rt_copy_.timeout(0).await;
+                                        continue;
+                                    }
+                                },
+                                Ok(output) => {
+                                    match tr.commit_modified(output).await {
+                                        Err(e) => {
+                                            if let ErrorLevel::Fatal = &e.level() {
+                                                println!("rollback failed, reason: commit fatal error");
+                                            } else {
+                                                if let Err(e) = tr.rollback_modified().await {
+                                                    println!("rollback failed, reason: {:?}", e);
+                                                } else {
+                                                    rt_copy_.timeout(0).await;
+                                                    continue;
+                                                }
+                                            }
+                                        },
+                                        Ok(()) => {
+                                            is_ok = true;
+                                            break;
+                                        },
+                                    }
+                                },
+                            }
+                        }
+                    }
+                    println!("!!!!!!only read conflict, {}", conflict_count);
+                });
+            },
+        }
+    });
+
+    thread::sleep(Duration::from_millis(1000000000));
+}
+
+#[test]
+fn test_dirty_query_conflict() {
+    use std::thread;
+    use std::time::Duration;
+
+    let builder = MultiTaskRuntimeBuilder::default();
+    let rt = builder.build();
+    let rt_copy = rt.clone();
+
+    let builder = MultiTaskRuntimeBuilder::default();
+    let rt1 = builder.build();
+
+    rt.spawn(rt.alloc(), async move {
+        let guid_gen = GuidGen::new(run_nanos(), 0);
+        let commit_logger_builder = CommitLoggerBuilder::new(rt_copy.clone(), "./.commit_log");
+        let commit_logger = commit_logger_builder
+            .build()
+            .await
+            .unwrap();
+
+        let tr_mgr = Transaction2PcManager::new(rt_copy.clone(),
+                                                guid_gen,
+                                                commit_logger);
+
+        let mut builder = KVDBManagerBuilder::new(rt_copy.clone(), tr_mgr, "./db");
+        match builder.startup().await {
+            Err(e) => {
+                panic!(e);
+            },
+            Ok(db) => {
+                println!("!!!!!!db table size: {:?}", db.table_size().await);
+
+                let table_name = Atom::from("test_log");
+                let tr = db.transaction(table_name.clone(), true, 500, 500).unwrap();
+                if let Err(e) = tr.create_table(table_name.clone(),
+                                                KVTableMeta::new(KVDBTableType::LogOrdTab,
+                                                                 true,
+                                                                 EnumType::Usize,
+                                                                 EnumType::Usize)).await {
+                    //创建有序内存表失败
+                    println!("!!!!!!create log ordered table failed, reason: {:?}", e);
+                }
+                let output = tr.prepare_modified().await.unwrap();
+                let _ = tr.commit_modified(output).await;
+
+                println!("!!!!!!db table size: {:?}", db.table_size().await);
+
+                //查询表信息
+                rt_copy.timeout(1500).await;
+                println!("");
+
+                println!("!!!!!!test_log is exist: {:?}", db.is_exist(&table_name).await);
+                println!("!!!!!!test_log is ordered table: {:?}", db.is_ordered_table(&table_name).await);
+                println!("!!!!!!test_log is persistent table: {:?}", db.is_persistent_table(&table_name).await);
+                println!("!!!!!!test_log table_dir: {:?}", db.table_path(&table_name).await);
+                println!("!!!!!!test_log table len: {:?}", db.table_record_size(&table_name).await);
+
+                //操作数据库事务
+                rt_copy.timeout(1500).await;
+                println!("");
+
+                {
+                    let tr = db.transaction(table_name.clone(), true, 500, 500).unwrap();
+
+                    let _r = tr.upsert(vec![
+                        TableKV {
+                            table: table_name.clone(),
+                            key: usize_to_binary(0),
+                            value: Some(Binary::new(0usize.to_le_bytes().to_vec()))
+                        }
+                    ]).await;
+
+                    if let Ok(output) = tr.prepare_modified().await {
+                        tr.commit_modified(output).await.is_ok();
+                    }
+                }
+
+                let rt_copy_ = rt1.clone();
+                let db_copy = db.clone();
+                let table_name_copy = table_name.clone();
+                rt1.spawn(rt1.alloc(), async move {
+                    let mut conflict_count = 0;
+                    for _ in 0..1000 {
+                        let now = Instant::now();
+                        let mut is_ok = false;
+
+                        while now.elapsed().as_millis() <= 60000 {
+                            let tr = db_copy.transaction(Atom::from("test log table"), true, 500, 500).unwrap();
+                            let r = tr.query(vec![
+                                TableKV {
+                                    table: table_name_copy.clone(),
+                                    key: usize_to_binary(0),
+                                    value: None
+                                }
+                            ]).await;
+                            let last_value = usize::from_le_bytes(r[0].as_ref().unwrap().as_ref().try_into().unwrap());
+
+                            let new_value = last_value + 1;
+                            let _r = tr.upsert(vec![
+                                TableKV {
+                                    table: table_name_copy.clone(),
+                                    key: usize_to_binary(0),
+                                    value: Some(Binary::new(new_value.to_le_bytes().to_vec()))
+                                }
+                            ]).await;
+
+                            match tr.prepare_modified().await {
+                                Err(_e) => {
+                                    if let Err(e) = tr.rollback_modified().await {
+                                        println!("rollback failed, reason: {:?}", e);
+                                    } else {
+                                        conflict_count += 1;
+                                        rt_copy_.timeout(0).await;
+                                        continue;
+                                    }
+                                },
+                                Ok(output) => {
+                                    match tr.commit_modified(output).await {
+                                        Err(e) => {
+                                            if let ErrorLevel::Fatal = &e.level() {
+                                                println!("rollback failed, reason: commit fatal error");
+                                            } else {
+                                                if let Err(e) = tr.rollback_modified().await {
+                                                    println!("rollback failed, reason: {:?}", e);
+                                                } else {
+                                                    rt_copy_.timeout(0).await;
+                                                    continue;
+                                                }
+                                            }
+                                        },
+                                        Ok(()) => {
+                                            is_ok = true;
+                                            break;
+                                        },
+                                    }
+                                },
+                            }
+                        }
+
+                        if !is_ok {
+                            println!("writed timeout");
+                        }
+                    }
+                    println!("!!!!!!writable conflict, {}", conflict_count);
+                });
+
+                let rt_copy_ = rt_copy.clone();
+                let db_copy = db.clone();
+                let table_name_copy = table_name.clone();
+                rt_copy.spawn(rt_copy.alloc(), async move {
+                    let mut conflict_count = 0;
+                    for _ in 0..10000 {
+                        let now = Instant::now();
+                        let mut is_ok = false;
+
+                        while now.elapsed().as_millis() <= 60000 {
+                            let tr = db_copy.transaction(Atom::from("test log table"), true, 500, 500).unwrap();
+                            let r = tr.dirty_query(vec![
+                                TableKV {
+                                    table: table_name_copy.clone(),
+                                    key: usize_to_binary(0),
+                                    value: None
+                                }
+                            ]).await;
+
+                            match tr.prepare_modified().await {
+                                Err(_e) => {
+                                    if let Err(e) = tr.rollback_modified().await {
+                                        println!("rollback failed, reason: {:?}", e);
+                                    } else {
+                                        conflict_count += 1;
+                                        rt_copy_.timeout(0).await;
+                                        continue;
+                                    }
+                                },
+                                Ok(output) => {
+                                    match tr.commit_modified(output).await {
+                                        Err(e) => {
+                                            if let ErrorLevel::Fatal = &e.level() {
+                                                println!("rollback failed, reason: commit fatal error");
+                                            } else {
+                                                if let Err(e) = tr.rollback_modified().await {
+                                                    println!("rollback failed, reason: {:?}", e);
+                                                } else {
+                                                    rt_copy_.timeout(0).await;
+                                                    continue;
+                                                }
+                                            }
+                                        },
+                                        Ok(()) => {
+                                            is_ok = true;
+                                            break;
+                                        },
+                                    }
+                                },
+                            }
+                        }
+                    }
+                    println!("!!!!!!only read conflict, {}", conflict_count);
+                });
+            },
+        }
+    });
+
+    thread::sleep(Duration::from_millis(1000000000));
+}
+
+#[test]
+fn test_upsert_conflict() {
+    use std::thread;
+    use std::time::Duration;
+
+    let builder = MultiTaskRuntimeBuilder::default();
+    let rt = builder.build();
+    let rt_copy = rt.clone();
+
+    let builder = MultiTaskRuntimeBuilder::default();
+    let rt1 = builder.build();
+
+    rt.spawn(rt.alloc(), async move {
+        let guid_gen = GuidGen::new(run_nanos(), 0);
+        let commit_logger_builder = CommitLoggerBuilder::new(rt_copy.clone(), "./.commit_log");
+        let commit_logger = commit_logger_builder
+            .build()
+            .await
+            .unwrap();
+
+        let tr_mgr = Transaction2PcManager::new(rt_copy.clone(),
+                                                guid_gen,
+                                                commit_logger);
+
+        let mut builder = KVDBManagerBuilder::new(rt_copy.clone(), tr_mgr, "./db");
+        match builder.startup().await {
+            Err(e) => {
+                panic!(e);
+            },
+            Ok(db) => {
+                println!("!!!!!!db table size: {:?}", db.table_size().await);
+
+                let table_name = Atom::from("test_log");
+                let tr = db.transaction(table_name.clone(), true, 500, 500).unwrap();
+                if let Err(e) = tr.create_table(table_name.clone(),
+                                                KVTableMeta::new(KVDBTableType::LogOrdTab,
+                                                                 true,
+                                                                 EnumType::Usize,
+                                                                 EnumType::Usize)).await {
+                    //创建有序内存表失败
+                    println!("!!!!!!create log ordered table failed, reason: {:?}", e);
+                }
+                let output = tr.prepare_modified().await.unwrap();
+                let _ = tr.commit_modified(output).await;
+
+                println!("!!!!!!db table size: {:?}", db.table_size().await);
+
+                //查询表信息
+                rt_copy.timeout(1500).await;
+                println!("");
+
+                println!("!!!!!!test_log is exist: {:?}", db.is_exist(&table_name).await);
+                println!("!!!!!!test_log is ordered table: {:?}", db.is_ordered_table(&table_name).await);
+                println!("!!!!!!test_log is persistent table: {:?}", db.is_persistent_table(&table_name).await);
+                println!("!!!!!!test_log table_dir: {:?}", db.table_path(&table_name).await);
+                println!("!!!!!!test_log table len: {:?}", db.table_record_size(&table_name).await);
+
+                //操作数据库事务
+                rt_copy.timeout(1500).await;
+                println!("");
+
+                {
+                    let tr = db.transaction(table_name.clone(), true, 500, 500).unwrap();
+
+                    let _r = tr.upsert(vec![
+                        TableKV {
+                            table: table_name.clone(),
+                            key: usize_to_binary(0),
+                            value: Some(Binary::new(0usize.to_le_bytes().to_vec()))
+                        }
+                    ]).await;
+
+                    if let Ok(output) = tr.prepare_modified().await {
+                        tr.commit_modified(output).await.is_ok();
+                    }
+                }
+
+                let rt_copy_ = rt1.clone();
+                let db_copy = db.clone();
+                let table_name_copy = table_name.clone();
+                rt1.spawn(rt1.alloc(), async move {
+                    let mut conflict_count = 0;
+                    for _ in 0..1000 {
+                        let now = Instant::now();
+                        let mut is_ok = false;
+
+                        while now.elapsed().as_millis() <= 60000 {
+                            let tr = db_copy.transaction(Atom::from("test log table"), true, 500, 500).unwrap();
+                            let r = tr.query(vec![
+                                TableKV {
+                                    table: table_name_copy.clone(),
+                                    key: usize_to_binary(0),
+                                    value: None
+                                }
+                            ]).await;
+                            let last_value = usize::from_le_bytes(r[0].as_ref().unwrap().as_ref().try_into().unwrap());
+
+                            let new_value = last_value + 1;
+                            let _r = tr.upsert(vec![
+                                TableKV {
+                                    table: table_name_copy.clone(),
+                                    key: usize_to_binary(0),
+                                    value: Some(Binary::new(new_value.to_le_bytes().to_vec()))
+                                }
+                            ]).await;
+
+                            match tr.prepare_modified().await {
+                                Err(_e) => {
+                                    if let Err(e) = tr.rollback_modified().await {
+                                        println!("rollback failed, reason: {:?}", e);
+                                    } else {
+                                        conflict_count += 1;
+                                        rt_copy_.timeout(0).await;
+                                        continue;
+                                    }
+                                },
+                                Ok(output) => {
+                                    match tr.commit_modified(output).await {
+                                        Err(e) => {
+                                            if let ErrorLevel::Fatal = &e.level() {
+                                                println!("rollback failed, reason: commit fatal error");
+                                            } else {
+                                                if let Err(e) = tr.rollback_modified().await {
+                                                    println!("rollback failed, reason: {:?}", e);
+                                                } else {
+                                                    rt_copy_.timeout(0).await;
+                                                    continue;
+                                                }
+                                            }
+                                        },
+                                        Ok(()) => {
+                                            is_ok = true;
+                                            break;
+                                        },
+                                    }
+                                },
+                            }
+                        }
+
+                        if !is_ok {
+                            println!("writed timeout");
+                        }
+                    }
+                    println!("!!!!!!writable conflict, {}", conflict_count);
+                });
+
+                let rt_copy_ = rt1.clone();
+                let db_copy = db.clone();
+                let table_name_copy = table_name.clone();
+                rt1.spawn(rt1.alloc(), async move {
+                    let mut conflict_count = 0;
+                    for _ in 0..1000 {
+                        let now = Instant::now();
+                        let mut is_ok = false;
+
+                        while now.elapsed().as_millis() <= 60000 {
+                            let tr = db_copy.transaction(Atom::from("test log table"), true, 500, 500).unwrap();
+                            let r = tr.query(vec![
+                                TableKV {
+                                    table: table_name_copy.clone(),
+                                    key: usize_to_binary(0),
+                                    value: None
+                                }
+                            ]).await;
+                            let last_value = usize::from_le_bytes(r[0].as_ref().unwrap().as_ref().try_into().unwrap());
+
+                            let new_value = last_value + 1;
+                            let _r = tr.upsert(vec![
+                                TableKV {
+                                    table: table_name_copy.clone(),
+                                    key: usize_to_binary(0),
+                                    value: Some(Binary::new(new_value.to_le_bytes().to_vec()))
+                                }
+                            ]).await;
+
+                            match tr.prepare_modified().await {
+                                Err(_e) => {
+                                    if let Err(e) = tr.rollback_modified().await {
+                                        println!("rollback failed, reason: {:?}", e);
+                                    } else {
+                                        conflict_count += 1;
+                                        rt_copy_.timeout(0).await;
+                                        continue;
+                                    }
+                                },
+                                Ok(output) => {
+                                    match tr.commit_modified(output).await {
+                                        Err(e) => {
+                                            if let ErrorLevel::Fatal = &e.level() {
+                                                println!("rollback failed, reason: commit fatal error");
+                                            } else {
+                                                if let Err(e) = tr.rollback_modified().await {
+                                                    println!("rollback failed, reason: {:?}", e);
+                                                } else {
+                                                    rt_copy_.timeout(0).await;
+                                                    continue;
+                                                }
+                                            }
+                                        },
+                                        Ok(()) => {
+                                            is_ok = true;
+                                            break;
+                                        },
+                                    }
+                                },
+                            }
+                        }
+
+                        if !is_ok {
+                            println!("writed timeout");
+                        }
+                    }
+                    println!("!!!!!!writable conflict, {}", conflict_count);
+                });
+            },
+        }
+    });
+
+    thread::sleep(Duration::from_millis(1000000000));
+}
+
+#[test]
+fn test_dirty_upsert_conflict() {
+    use std::thread;
+    use std::time::Duration;
+
+    let builder = MultiTaskRuntimeBuilder::default();
+    let rt = builder.build();
+    let rt_copy = rt.clone();
+
+    let builder = MultiTaskRuntimeBuilder::default();
+    let rt1 = builder.build();
+
+    rt.spawn(rt.alloc(), async move {
+        let guid_gen = GuidGen::new(run_nanos(), 0);
+        let commit_logger_builder = CommitLoggerBuilder::new(rt_copy.clone(), "./.commit_log");
+        let commit_logger = commit_logger_builder
+            .build()
+            .await
+            .unwrap();
+
+        let tr_mgr = Transaction2PcManager::new(rt_copy.clone(),
+                                                guid_gen,
+                                                commit_logger);
+
+        let mut builder = KVDBManagerBuilder::new(rt_copy.clone(), tr_mgr, "./db");
+        match builder.startup().await {
+            Err(e) => {
+                panic!(e);
+            },
+            Ok(db) => {
+                println!("!!!!!!db table size: {:?}", db.table_size().await);
+
+                let table_name = Atom::from("test_log");
+                let tr = db.transaction(table_name.clone(), true, 500, 500).unwrap();
+                if let Err(e) = tr.create_table(table_name.clone(),
+                                                KVTableMeta::new(KVDBTableType::LogOrdTab,
+                                                                 true,
+                                                                 EnumType::Usize,
+                                                                 EnumType::Usize)).await {
+                    //创建有序内存表失败
+                    println!("!!!!!!create log ordered table failed, reason: {:?}", e);
+                }
+                let output = tr.prepare_modified().await.unwrap();
+                let _ = tr.commit_modified(output).await;
+
+                println!("!!!!!!db table size: {:?}", db.table_size().await);
+
+                //查询表信息
+                rt_copy.timeout(1500).await;
+                println!("");
+
+                println!("!!!!!!test_log is exist: {:?}", db.is_exist(&table_name).await);
+                println!("!!!!!!test_log is ordered table: {:?}", db.is_ordered_table(&table_name).await);
+                println!("!!!!!!test_log is persistent table: {:?}", db.is_persistent_table(&table_name).await);
+                println!("!!!!!!test_log table_dir: {:?}", db.table_path(&table_name).await);
+                println!("!!!!!!test_log table len: {:?}", db.table_record_size(&table_name).await);
+
+                //操作数据库事务
+                rt_copy.timeout(1500).await;
+                println!("");
+
+                {
+                    let tr = db.transaction(table_name.clone(), true, 500, 500).unwrap();
+
+                    let _r = tr.upsert(vec![
+                        TableKV {
+                            table: table_name.clone(),
+                            key: usize_to_binary(0),
+                            value: Some(Binary::new(0usize.to_le_bytes().to_vec()))
+                        }
+                    ]).await;
+
+                    if let Ok(output) = tr.prepare_modified().await {
+                        tr.commit_modified(output).await.is_ok();
+                    }
+                }
+
+                let rt_copy_ = rt1.clone();
+                let db_copy = db.clone();
+                let table_name_copy = table_name.clone();
+                rt1.spawn(rt1.alloc(), async move {
+                    let mut conflict_count = 0;
+                    for _ in 0..1000 {
+                        let now = Instant::now();
+                        let mut is_ok = false;
+
+                        while now.elapsed().as_millis() <= 60000 {
+                            let tr = db_copy.transaction(Atom::from("test log table"), true, 500, 500).unwrap();
+                            let r = tr.query(vec![
+                                TableKV {
+                                    table: table_name_copy.clone(),
+                                    key: usize_to_binary(0),
+                                    value: None
+                                }
+                            ]).await;
+                            let last_value = usize::from_le_bytes(r[0].as_ref().unwrap().as_ref().try_into().unwrap());
+
+                            let new_value = last_value + 1;
+                            let _r = tr.upsert(vec![
+                                TableKV {
+                                    table: table_name_copy.clone(),
+                                    key: usize_to_binary(0),
+                                    value: Some(Binary::new(new_value.to_le_bytes().to_vec()))
+                                }
+                            ]).await;
+
+                            match tr.prepare_modified().await {
+                                Err(_e) => {
+                                    if let Err(e) = tr.rollback_modified().await {
+                                        println!("rollback failed, reason: {:?}", e);
+                                    } else {
+                                        conflict_count += 1;
+                                        rt_copy_.timeout(0).await;
+                                        continue;
+                                    }
+                                },
+                                Ok(output) => {
+                                    match tr.commit_modified(output).await {
+                                        Err(e) => {
+                                            if let ErrorLevel::Fatal = &e.level() {
+                                                println!("rollback failed, reason: commit fatal error");
+                                            } else {
+                                                if let Err(e) = tr.rollback_modified().await {
+                                                    println!("rollback failed, reason: {:?}", e);
+                                                } else {
+                                                    rt_copy_.timeout(0).await;
+                                                    continue;
+                                                }
+                                            }
+                                        },
+                                        Ok(()) => {
+                                            is_ok = true;
+                                            break;
+                                        },
+                                    }
+                                },
+                            }
+                        }
+
+                        if !is_ok {
+                            println!("writed timeout");
+                        }
+                    }
+                    println!("!!!!!!writable conflict, {}", conflict_count);
+                });
+
+                let rt_copy_ = rt1.clone();
+                let db_copy = db.clone();
+                let table_name_copy = table_name.clone();
+                rt1.spawn(rt1.alloc(), async move {
+                    let mut conflict_count = 0;
+                    for _ in 0..1000 {
+                        let now = Instant::now();
+                        let mut is_ok = false;
+
+                        while now.elapsed().as_millis() <= 60000 {
+                            let tr = db_copy.transaction(Atom::from("test log table"), true, 500, 500).unwrap();
+                            let r = tr.dirty_query(vec![
+                                TableKV {
+                                    table: table_name_copy.clone(),
+                                    key: usize_to_binary(0),
+                                    value: None
+                                }
+                            ]).await;
+                            let last_value = usize::from_le_bytes(r[0].as_ref().unwrap().as_ref().try_into().unwrap());
+
+                            let new_value = last_value + 1;
+                            let _r = tr.dirty_upsert(vec![
+                                TableKV {
+                                    table: table_name_copy.clone(),
+                                    key: usize_to_binary(0),
+                                    value: Some(Binary::new(new_value.to_le_bytes().to_vec()))
+                                }
+                            ]).await;
+
+                            match tr.prepare_modified().await {
+                                Err(_e) => {
+                                    if let Err(e) = tr.rollback_modified().await {
+                                        println!("rollback failed, reason: {:?}", e);
+                                    } else {
+                                        conflict_count += 1;
+                                        rt_copy_.timeout(0).await;
+                                        continue;
+                                    }
+                                },
+                                Ok(output) => {
+                                    match tr.commit_modified(output).await {
+                                        Err(e) => {
+                                            if let ErrorLevel::Fatal = &e.level() {
+                                                println!("rollback failed, reason: commit fatal error");
+                                            } else {
+                                                if let Err(e) = tr.rollback_modified().await {
+                                                    println!("rollback failed, reason: {:?}", e);
+                                                } else {
+                                                    rt_copy_.timeout(0).await;
+                                                    continue;
+                                                }
+                                            }
+                                        },
+                                        Ok(()) => {
+                                            is_ok = true;
+                                            break;
+                                        },
+                                    }
+                                },
+                            }
+                        }
+
+                        if !is_ok {
+                            println!("writed timeout");
+                        }
+                    }
+                    println!("!!!!!!writable conflict, {}", conflict_count);
+                });
+            },
+        }
+    });
+
+    thread::sleep(Duration::from_millis(1000000000));
+}
+
+#[test]
+fn test_delete_conflict() {
+    use std::thread;
+    use std::time::Duration;
+
+    let builder = MultiTaskRuntimeBuilder::default();
+    let rt = builder.build();
+    let rt_copy = rt.clone();
+
+    let builder = MultiTaskRuntimeBuilder::default();
+    let rt1 = builder.build();
+
+    rt.spawn(rt.alloc(), async move {
+        let guid_gen = GuidGen::new(run_nanos(), 0);
+        let commit_logger_builder = CommitLoggerBuilder::new(rt_copy.clone(), "./.commit_log");
+        let commit_logger = commit_logger_builder
+            .build()
+            .await
+            .unwrap();
+
+        let tr_mgr = Transaction2PcManager::new(rt_copy.clone(),
+                                                guid_gen,
+                                                commit_logger);
+
+        let mut builder = KVDBManagerBuilder::new(rt_copy.clone(), tr_mgr, "./db");
+        match builder.startup().await {
+            Err(e) => {
+                panic!(e);
+            },
+            Ok(db) => {
+                println!("!!!!!!db table size: {:?}", db.table_size().await);
+
+                let table_name = Atom::from("test_log");
+                let tr = db.transaction(table_name.clone(), true, 500, 500).unwrap();
+                if let Err(e) = tr.create_table(table_name.clone(),
+                                                KVTableMeta::new(KVDBTableType::LogOrdTab,
+                                                                 true,
+                                                                 EnumType::Usize,
+                                                                 EnumType::Usize)).await {
+                    //创建有序内存表失败
+                    println!("!!!!!!create log ordered table failed, reason: {:?}", e);
+                }
+                let output = tr.prepare_modified().await.unwrap();
+                let _ = tr.commit_modified(output).await;
+
+                println!("!!!!!!db table size: {:?}", db.table_size().await);
+
+                //查询表信息
+                rt_copy.timeout(1500).await;
+                println!("");
+
+                println!("!!!!!!test_log is exist: {:?}", db.is_exist(&table_name).await);
+                println!("!!!!!!test_log is ordered table: {:?}", db.is_ordered_table(&table_name).await);
+                println!("!!!!!!test_log is persistent table: {:?}", db.is_persistent_table(&table_name).await);
+                println!("!!!!!!test_log table_dir: {:?}", db.table_path(&table_name).await);
+                println!("!!!!!!test_log table len: {:?}", db.table_record_size(&table_name).await);
+
+                //操作数据库事务
+                rt_copy.timeout(1500).await;
+                println!("");
+
+                {
+                    let tr = db.transaction(table_name.clone(), true, 500, 500).unwrap();
+
+                    let _r = tr.upsert(vec![
+                        TableKV {
+                            table: table_name.clone(),
+                            key: usize_to_binary(0),
+                            value: Some(Binary::new(0usize.to_le_bytes().to_vec()))
+                        }
+                    ]).await;
+
+                    if let Ok(output) = tr.prepare_modified().await {
+                        tr.commit_modified(output).await.is_ok();
+                    }
+                }
+
+                let rt_copy_ = rt1.clone();
+                let db_copy = db.clone();
+                let table_name_copy = table_name.clone();
+                rt1.spawn(rt1.alloc(), async move {
+                    let mut conflict_count = 0;
+                    for _ in 0..1000 {
+                        let now = Instant::now();
+                        let mut is_ok = false;
+
+                        while now.elapsed().as_millis() <= 60000 {
+                            let tr = db_copy.transaction(Atom::from("test log table"), true, 500, 500).unwrap();
+                            let r = tr.query(vec![
+                                TableKV {
+                                    table: table_name_copy.clone(),
+                                    key: usize_to_binary(0),
+                                    value: None
+                                }
+                            ]).await;
+
+                            let _r = tr.delete(vec![
+                                TableKV {
+                                    table: table_name_copy.clone(),
+                                    key: usize_to_binary(0),
+                                    value: None
+                                }
+                            ]).await;
+
+                            match tr.prepare_modified().await {
+                                Err(_e) => {
+                                    if let Err(e) = tr.rollback_modified().await {
+                                        println!("rollback failed, reason: {:?}", e);
+                                    } else {
+                                        conflict_count += 1;
+                                        rt_copy_.timeout(0).await;
+                                        continue;
+                                    }
+                                },
+                                Ok(output) => {
+                                    match tr.commit_modified(output).await {
+                                        Err(e) => {
+                                            if let ErrorLevel::Fatal = &e.level() {
+                                                println!("rollback failed, reason: commit fatal error");
+                                            } else {
+                                                if let Err(e) = tr.rollback_modified().await {
+                                                    println!("rollback failed, reason: {:?}", e);
+                                                } else {
+                                                    rt_copy_.timeout(0).await;
+                                                    continue;
+                                                }
+                                            }
+                                        },
+                                        Ok(()) => {
+                                            is_ok = true;
+                                            break;
+                                        },
+                                    }
+                                },
+                            }
+                        }
+
+                        if !is_ok {
+                            println!("writed timeout");
+                        }
+                    }
+                    println!("!!!!!!writable conflict, {}", conflict_count);
+                });
+
+                let rt_copy_ = rt1.clone();
+                let db_copy = db.clone();
+                let table_name_copy = table_name.clone();
+                rt1.spawn(rt1.alloc(), async move {
+                    let mut conflict_count = 0;
+                    for _ in 0..1000 {
+                        let now = Instant::now();
+                        let mut is_ok = false;
+
+                        while now.elapsed().as_millis() <= 60000 {
+                            let tr = db_copy.transaction(Atom::from("test log table"), true, 500, 500).unwrap();
+                            let r = tr.query(vec![
+                                TableKV {
+                                    table: table_name_copy.clone(),
+                                    key: usize_to_binary(0),
+                                    value: None
+                                }
+                            ]).await;
+
+                            let _r = tr.delete(vec![
+                                TableKV {
+                                    table: table_name_copy.clone(),
+                                    key: usize_to_binary(0),
+                                    value: None
+                                }
+                            ]).await;
+
+                            match tr.prepare_modified().await {
+                                Err(_e) => {
+                                    if let Err(e) = tr.rollback_modified().await {
+                                        println!("rollback failed, reason: {:?}", e);
+                                    } else {
+                                        conflict_count += 1;
+                                        rt_copy_.timeout(0).await;
+                                        continue;
+                                    }
+                                },
+                                Ok(output) => {
+                                    match tr.commit_modified(output).await {
+                                        Err(e) => {
+                                            if let ErrorLevel::Fatal = &e.level() {
+                                                println!("rollback failed, reason: commit fatal error");
+                                            } else {
+                                                if let Err(e) = tr.rollback_modified().await {
+                                                    println!("rollback failed, reason: {:?}", e);
+                                                } else {
+                                                    rt_copy_.timeout(0).await;
+                                                    continue;
+                                                }
+                                            }
+                                        },
+                                        Ok(()) => {
+                                            is_ok = true;
+                                            break;
+                                        },
+                                    }
+                                },
+                            }
+                        }
+
+                        if !is_ok {
+                            println!("writed timeout");
+                        }
+                    }
+                    println!("!!!!!!writable conflict, {}", conflict_count);
+                });
+            },
+        }
+    });
+
+    thread::sleep(Duration::from_millis(1000000000));
+}
+
+#[test]
+fn test_dirty_delete_conflict() {
+    use std::thread;
+    use std::time::Duration;
+
+    let builder = MultiTaskRuntimeBuilder::default();
+    let rt = builder.build();
+    let rt_copy = rt.clone();
+
+    let builder = MultiTaskRuntimeBuilder::default();
+    let rt1 = builder.build();
+
+    rt.spawn(rt.alloc(), async move {
+        let guid_gen = GuidGen::new(run_nanos(), 0);
+        let commit_logger_builder = CommitLoggerBuilder::new(rt_copy.clone(), "./.commit_log");
+        let commit_logger = commit_logger_builder
+            .build()
+            .await
+            .unwrap();
+
+        let tr_mgr = Transaction2PcManager::new(rt_copy.clone(),
+                                                guid_gen,
+                                                commit_logger);
+
+        let mut builder = KVDBManagerBuilder::new(rt_copy.clone(), tr_mgr, "./db");
+        match builder.startup().await {
+            Err(e) => {
+                panic!(e);
+            },
+            Ok(db) => {
+                println!("!!!!!!db table size: {:?}", db.table_size().await);
+
+                let table_name = Atom::from("test_log");
+                let tr = db.transaction(table_name.clone(), true, 500, 500).unwrap();
+                if let Err(e) = tr.create_table(table_name.clone(),
+                                                KVTableMeta::new(KVDBTableType::LogOrdTab,
+                                                                 true,
+                                                                 EnumType::Usize,
+                                                                 EnumType::Usize)).await {
+                    //创建有序内存表失败
+                    println!("!!!!!!create log ordered table failed, reason: {:?}", e);
+                }
+                let output = tr.prepare_modified().await.unwrap();
+                let _ = tr.commit_modified(output).await;
+
+                println!("!!!!!!db table size: {:?}", db.table_size().await);
+
+                //查询表信息
+                rt_copy.timeout(1500).await;
+                println!("");
+
+                println!("!!!!!!test_log is exist: {:?}", db.is_exist(&table_name).await);
+                println!("!!!!!!test_log is ordered table: {:?}", db.is_ordered_table(&table_name).await);
+                println!("!!!!!!test_log is persistent table: {:?}", db.is_persistent_table(&table_name).await);
+                println!("!!!!!!test_log table_dir: {:?}", db.table_path(&table_name).await);
+                println!("!!!!!!test_log table len: {:?}", db.table_record_size(&table_name).await);
+
+                //操作数据库事务
+                rt_copy.timeout(1500).await;
+                println!("");
+
+                {
+                    let tr = db.transaction(table_name.clone(), true, 500, 500).unwrap();
+
+                    let _r = tr.upsert(vec![
+                        TableKV {
+                            table: table_name.clone(),
+                            key: usize_to_binary(0),
+                            value: Some(Binary::new(0usize.to_le_bytes().to_vec()))
+                        }
+                    ]).await;
+
+                    if let Ok(output) = tr.prepare_modified().await {
+                        tr.commit_modified(output).await.is_ok();
+                    }
+                }
+
+                let rt_copy_ = rt1.clone();
+                let db_copy = db.clone();
+                let table_name_copy = table_name.clone();
+                rt1.spawn(rt1.alloc(), async move {
+                    let mut conflict_count = 0;
+                    for _ in 0..1000 {
+                        let now = Instant::now();
+                        let mut is_ok = false;
+
+                        while now.elapsed().as_millis() <= 60000 {
+                            let tr = db_copy.transaction(Atom::from("test log table"), true, 500, 500).unwrap();
+                            let r = tr.query(vec![
+                                TableKV {
+                                    table: table_name_copy.clone(),
+                                    key: usize_to_binary(0),
+                                    value: None
+                                }
+                            ]).await;
+
+                            let _r = tr.delete(vec![
+                                TableKV {
+                                    table: table_name_copy.clone(),
+                                    key: usize_to_binary(0),
+                                    value: None
+                                }
+                            ]).await;
+
+                            match tr.prepare_modified().await {
+                                Err(_e) => {
+                                    if let Err(e) = tr.rollback_modified().await {
+                                        println!("rollback failed, reason: {:?}", e);
+                                    } else {
+                                        conflict_count += 1;
+                                        rt_copy_.timeout(0).await;
+                                        continue;
+                                    }
+                                },
+                                Ok(output) => {
+                                    match tr.commit_modified(output).await {
+                                        Err(e) => {
+                                            if let ErrorLevel::Fatal = &e.level() {
+                                                println!("rollback failed, reason: commit fatal error");
+                                            } else {
+                                                if let Err(e) = tr.rollback_modified().await {
+                                                    println!("rollback failed, reason: {:?}", e);
+                                                } else {
+                                                    rt_copy_.timeout(0).await;
+                                                    continue;
+                                                }
+                                            }
+                                        },
+                                        Ok(()) => {
+                                            is_ok = true;
+                                            break;
+                                        },
+                                    }
+                                },
+                            }
+                        }
+
+                        if !is_ok {
+                            println!("writed timeout");
+                        }
+                    }
+                    println!("!!!!!!writable conflict, {}", conflict_count);
+                });
+
+                let rt_copy_ = rt1.clone();
+                let db_copy = db.clone();
+                let table_name_copy = table_name.clone();
+                rt1.spawn(rt1.alloc(), async move {
+                    let mut conflict_count = 0;
+                    for _ in 0..1000 {
+                        let now = Instant::now();
+                        let mut is_ok = false;
+
+                        while now.elapsed().as_millis() <= 60000 {
+                            let tr = db_copy.transaction(Atom::from("test log table"), true, 500, 500).unwrap();
+                            let r = tr.dirty_query(vec![
+                                TableKV {
+                                    table: table_name_copy.clone(),
+                                    key: usize_to_binary(0),
+                                    value: None
+                                }
+                            ]).await;
+
+                            let _r = tr.dirty_delete(vec![
+                                TableKV {
+                                    table: table_name_copy.clone(),
+                                    key: usize_to_binary(0),
+                                    value: None
+                                }
+                            ]).await;
+
+                            match tr.prepare_modified().await {
+                                Err(_e) => {
+                                    if let Err(e) = tr.rollback_modified().await {
+                                        println!("rollback failed, reason: {:?}", e);
+                                    } else {
+                                        conflict_count += 1;
+                                        rt_copy_.timeout(0).await;
+                                        continue;
+                                    }
+                                },
+                                Ok(output) => {
+                                    match tr.commit_modified(output).await {
+                                        Err(e) => {
+                                            if let ErrorLevel::Fatal = &e.level() {
+                                                println!("rollback failed, reason: commit fatal error");
+                                            } else {
+                                                if let Err(e) = tr.rollback_modified().await {
+                                                    println!("rollback failed, reason: {:?}", e);
+                                                } else {
+                                                    rt_copy_.timeout(0).await;
+                                                    continue;
+                                                }
+                                            }
+                                        },
+                                        Ok(()) => {
+                                            is_ok = true;
+                                            break;
+                                        },
+                                    }
+                                },
+                            }
+                        }
+
+                        if !is_ok {
+                            println!("writed timeout");
+                        }
+                    }
+                    println!("!!!!!!writable conflict, {}", conflict_count);
+                });
+            },
+        }
+    });
+
+    thread::sleep(Duration::from_millis(1000000000));
+}
+
 // 将u8序列化为二进制数据
 fn u8_to_binary(number: u8) -> Binary {
     let mut buffer = WriteBuffer::new();
@@ -2923,4 +4213,5 @@ fn binary_to_usize(bin: &Binary) -> Result<usize, ReadBonErr> {
     let mut buffer = ReadBuffer::new(bin, 0);
     usize::decode(&mut buffer)
 }
+
 

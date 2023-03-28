@@ -12,15 +12,15 @@ use crossbeam_channel::{unbounded, bounded};
 use bytes::BufMut;
 use env_logger;
 
-use atom::Atom;
-use guid::{GuidGen, Guid};
-use sinfo::EnumType;
-use time::run_nanos;
-use r#async::rt::multi_thread::MultiTaskRuntimeBuilder;
-use async_transaction::{TransactionError,
-                        AsyncCommitLog,
-                        ErrorLevel,
-                        manager_2pc::Transaction2PcManager};
+use pi_atom::Atom;
+use pi_guid::{GuidGen, Guid};
+use pi_sinfo::EnumType;
+use pi_time::run_nanos;
+use pi_async::rt::{AsyncRuntime, multi_thread::MultiTaskRuntimeBuilder};
+use pi_async_transaction::{TransactionError,
+                           AsyncCommitLog,
+                           ErrorLevel,
+                           manager_2pc::Transaction2PcManager};
 use pi_store::commit_logger::{CommitLoggerBuilder, CommitLogger};
 
 use pi_db::{Binary, KVDBTableType, KVTableMeta, db::KVDBManagerBuilder, tables::TableKV, KVTableTrError};
@@ -139,7 +139,7 @@ fn bench_memory_table(b: &mut Bencher) {
                 Err(e) => {
                     println!(
                         "!!!!!!recv timeout, len: {}, timer_len: {}, e: {:?}",
-                        rt_copy.timing_len(),
+                        rt_copy.wait_len(),
                         rt_copy.len(),
                         e
                     );
@@ -280,7 +280,7 @@ fn bench_multi_memory_table(b: &mut Bencher) {
                 Err(e) => {
                     println!(
                         "!!!!!!recv timeout, len: {}, timer_len: {}, e: {:?}",
-                        rt_copy.timing_len(),
+                        rt_copy.wait_len(),
                         rt_copy.len(),
                         e
                     );
@@ -412,7 +412,7 @@ fn bench_commit_log(b: &mut Bencher) {
                 Err(e) => {
                     println!(
                         "!!!!!!recv timeout, len: {}, timer_len: {}, e: {:?}",
-                        rt_copy.timing_len(),
+                        rt_copy.wait_len(),
                         rt_copy.len(),
                         e
                     );
@@ -553,7 +553,7 @@ fn bench_multi_commit_log(b: &mut Bencher) {
                 Err(e) => {
                     println!(
                         "!!!!!!recv timeout, len: {}, timer_len: {}, e: {:?}",
-                        rt_copy.timing_len(),
+                        rt_copy.wait_len(),
                         rt_copy.len(),
                         e
                     );
@@ -687,7 +687,7 @@ fn bench_log_table(b: &mut Bencher) {
                 Err(e) => {
                     println!(
                         "!!!!!!recv timeout, len: {}, timer_len: {}, e: {:?}",
-                        rt_copy.timing_len(),
+                        rt_copy.wait_len(),
                         rt_copy.len(),
                         e
                     );
@@ -829,7 +829,7 @@ fn bench_multi_log_table(b: &mut Bencher) {
                 Err(e) => {
                     println!(
                         "!!!!!!recv timeout, len: {}, timer_len: {}, e: {:?}",
-                        rt_copy.timing_len(),
+                        rt_copy.wait_len(),
                         rt_copy.len(),
                         e
                     );
@@ -938,7 +938,7 @@ fn bench_iterator_table(b: &mut Bencher) {
                 Err(e) => {
                     println!(
                         "!!!!!!recv timeout, len: {}, timer_len: {}, e: {:?}",
-                        rt_copy.timing_len(),
+                        rt_copy.wait_len(),
                         rt_copy.len(),
                         e
                     );
@@ -1073,7 +1073,7 @@ fn bench_sequence_upsert(b: &mut Bencher) {
                 Err(e) => {
                     println!(
                         "!!!!!!recv timeout, len: {}, timer_len: {}, e: {:?}",
-                        rt_copy.timing_len(),
+                        rt_copy.wait_len(),
                         rt_copy.len(),
                         e
                     );
@@ -1208,7 +1208,7 @@ fn bench_table_conflict(b: &mut Bencher) {
                                 s_copy.send(Err(e));
                                 return;
                             } else {
-                                rt_copy_.wait_timeout(0).await;
+                                rt_copy_.timeout(0).await;
                                 continue;
                             }
                         },
@@ -1220,7 +1220,7 @@ fn bench_table_conflict(b: &mut Bencher) {
                                         s_copy.send(Err(e));
                                         return;
                                     } else {
-                                        rt_copy_.wait_timeout(0).await;
+                                        rt_copy_.timeout(0).await;
                                         continue;
                                     }
                                 },
@@ -1244,7 +1244,7 @@ fn bench_table_conflict(b: &mut Bencher) {
                 Err(e) => {
                     println!(
                         "!!!!!!recv timeout, len: {}, timer_len: {}, e: {:?}",
-                        rt_copy.timing_len(),
+                        rt_copy.wait_len(),
                         rt_copy.len(),
                         e
                     );

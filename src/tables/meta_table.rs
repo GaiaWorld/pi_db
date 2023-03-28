@@ -424,7 +424,7 @@ impl<
                     let mut writed_count = 0;
                     for (_key, action) in tr.0.actions.lock().iter() {
                         match action {
-                            KVActionLog::Write(_) => {
+                            KVActionLog::Write(_) | KVActionLog::DirtyWrite(_) => {
                                 //对指定关键字进行了写操作，则增加本次事务写操作计数
                                 writed_count += 1;
                             }
@@ -447,18 +447,21 @@ impl<
                             return Err(e);
                         }
 
-                        if let Err(e) = tr
-                            .check_root_conflict(key) {
-                            //尝试表的预提交失败，则立即返回错误原因
-                            return Err(e);
+                        if !action.is_dirty_writed() {
+                            //非脏写操作需要对根节点冲突进行检查
+                            if let Err(e) = tr
+                                .check_root_conflict(key) {
+                                //尝试表的预提交失败，则立即返回错误原因
+                                return Err(e);
+                            }
                         }
 
                         //指定关键字的操作预提交成功，则将写操作写入预提交缓冲区
                         match action {
-                            KVActionLog::Write(None) => {
+                            KVActionLog::Write(None) | KVActionLog::DirtyWrite(None) => {
                                 tr.0.table.append_key_value_to_table_prepare_output(&mut buf, key, None);
                             },
-                            KVActionLog::Write(Some(value)) => {
+                            KVActionLog::Write(Some(value)) | KVActionLog::DirtyWrite(Some(value)) => {
                                 tr.0.table.append_key_value_to_table_prepare_output(&mut buf, key, Some(value));
                             },
                             _ => (), //忽略读操作
@@ -515,11 +518,11 @@ impl<
                             //则将当前事务的修改直接作用在当前元信息表中
                             for (key, action) in actions.iter() {
                                 match action {
-                                    KVActionLog::Write(None) => {
+                                    KVActionLog::Write(None) | KVActionLog::DirtyWrite(None) => {
                                         //删除指定关键字
                                         let _ = locked.delete(key, false);
                                     },
-                                    KVActionLog::Write(Some(value)) => {
+                                    KVActionLog::Write(Some(value)) | KVActionLog::DirtyWrite(Some(value)) => {
                                         //插入或更新指定关键字
                                         let _ = locked.upsert(key.clone(), value.clone(), false);
                                     },
@@ -546,10 +549,10 @@ impl<
                     let mut size = 0;
                     for (key, action) in &actions {
                         match action {
-                            KVActionLog::Write(Some(value)) => {
+                            KVActionLog::Write(Some(value)) | KVActionLog::DirtyWrite(Some(value)) => {
                                 size += key.len() + value.len();
                             },
-                            KVActionLog::Write(None) => {
+                            KVActionLog::Write(None) | KVActionLog::DirtyWrite(None) => {
                                 size += key.len();
                             },
                             KVActionLog::Read => (),
@@ -664,6 +667,20 @@ impl<
     type Value = Binary;
     type Error = KVTableTrError;
 
+    fn dirty_query(&self, key: <Self as KVAction>::Key)
+                   -> BoxFuture<Option<<Self as KVAction>::Value>> {
+        let tr = self.clone();
+
+        async move {
+            if let Some(value) = tr.0.root_mut.lock().get(&key) {
+                //指定关键值存在
+                return Some(value.clone());
+            }
+
+            None
+        }.boxed()
+    }
+
     fn query(&self, key: <Self as KVAction>::Key)
              -> BoxFuture<Option<<Self as KVAction>::Value>> {
         let tr = self.clone();
@@ -685,6 +702,23 @@ impl<
         }.boxed()
     }
 
+    fn dirty_upsert(&self,
+                    key: <Self as KVAction>::Key,
+                    value: <Self as KVAction>::Value)
+                    -> BoxFuture<Result<(), <Self as KVAction>::Error>> {
+        let tr = self.clone();
+
+        async move {
+            //记录对指定关键字的最新插入或更新操作
+            let _ = tr.0.actions.lock().insert(key.clone(), KVActionLog::DirtyWrite(Some(value.clone())));
+
+            //插入或更新指定的键值对
+            let _ = tr.0.root_mut.lock().upsert(key, value, false);
+
+            Ok(())
+        }.boxed()
+    }
+
     fn upsert(&self,
               key: <Self as KVAction>::Key,
               value: <Self as KVAction>::Value)
@@ -699,6 +733,23 @@ impl<
             let _ = tr.0.root_mut.lock().upsert(key, value, false);
 
             Ok(())
+        }.boxed()
+    }
+
+    fn dirty_delete(&self, key: <Self as KVAction>::Key)
+        -> BoxFuture<Result<Option<<Self as KVAction>::Value>, <Self as KVAction>::Error>> {
+        let tr = self.clone();
+
+        async move {
+            //记录对指定关键字的最新删除操作，并增加写操作计数
+            let _ = tr.0.actions.lock().insert(key.clone(), KVActionLog::DirtyWrite(None));
+
+            if let Some(Some(value)) = tr.0.root_mut.lock().delete(&key, false) {
+                //指定关键字存在
+                return Ok(Some(value));
+            }
+
+            Ok(None)
         }.boxed()
     }
 
@@ -815,10 +866,9 @@ impl<
         for (guid, actions) in prepare.iter() {
             match actions.get(key) {
                 Some(KVActionLog::Read) => {
-                    //元信息表的预提交表中的一个预提交事务与本地预提交事务操作了相同的关键字，且是读操作
                     match action {
-                        KVActionLog::Read => {
-                            //本地预提交事务对相同的关键字也执行了读操作，则不存在读写冲突，并立即返回检查成功
+                        KVActionLog::Read | KVActionLog::DirtyWrite(_) => {
+                            //本地预提交事务对相同的关键字也执行了读操作或脏写操作，则不存在读写冲突，并继续检查预提交表中是否存在读写冲突
                             continue;
                         },
                         KVActionLog::Write(_) => {
@@ -827,12 +877,24 @@ impl<
                         },
                     }
                 },
+                Some(KVActionLog::DirtyWrite(_)) => {
+                    //元信息表的预提交表中的一个预提交事务与本地预提交事务操作了相同的关键字，且是写操作，则不存在读写冲突，并继续检查预提交表中是否存在读写冲突
+                    continue;
+                },
                 Some(KVActionLog::Write(_)) => {
-                    //元信息表的预提交表中的一个预提交事务与本地预提交事务操作了相同的关键字，且是写操作，则存在读写冲突
-                    return Err(<Self as Transaction2Pc>::PrepareError::new_transaction_error(ErrorLevel::Normal, format!("Prepare meta table conflicted, table: {:?}, key: {:?}, source: {:?}, transaction_uid: {:?}, prepare_uid: {:?}, confilicted_transaction_uid: {:?}, reason: writing now", self.0.table.name().as_str(), key, self.0.source, self.get_transaction_uid(), self.get_prepare_uid(), guid)));
+                    match action {
+                        KVActionLog::DirtyWrite(_) => {
+                            //本地预提交事务对相同的关键字也执行了脏写操作，则不存在读写冲突，并继续检查预提交表中是否存在读写冲突
+                            continue;
+                        },
+                        _ => {
+                            //元信息表的预提交表中的一个预提交事务与本地预提交事务操作了相同的关键字，且是写操作，则存在读写冲突
+                            return Err(<Self as Transaction2Pc>::PrepareError::new_transaction_error(ErrorLevel::Normal, format!("Prepare meta table conflicted, table: {:?}, key: {:?}, source: {:?}, transaction_uid: {:?}, prepare_uid: {:?}, confilicted_transaction_uid: {:?}, reason: writing now", self.0.table.name().as_str(), key, self.0.source, self.get_transaction_uid(), self.get_prepare_uid(), guid)));
+                        },
+                    }
                 },
                 None => {
-                    //元信息表的预提交表中没有任何预提交事务与本地预提交事务操作了相同的关键字，则不存在读写冲突，并立即返回检查成功
+                    //元信息表的预提交表中没有任何预提交事务与本地预提交事务操作了相同的关键字，则不存在读写冲突，并继续检查预提交表中是否存在读写冲突
                     continue;
                 },
             }
@@ -898,7 +960,7 @@ impl<
         //在事务对应的表的根节点，执行操作记录中的所有写操作
         for (key, action) in &actions {
             match action {
-                KVActionLog::Write(Some(value)) => {
+                KVActionLog::Write(Some(value)) | KVActionLog::DirtyWrite(Some(value)) => {
                     //执行插入或更新指定关键字的值的操作
                     self
                         .0
@@ -908,7 +970,7 @@ impl<
                         .lock()
                         .upsert(key.clone(), value.clone(), false);
                 },
-                KVActionLog::Write(None) => {
+                KVActionLog::Write(None) | KVActionLog::DirtyWrite(None) => {
                     //执行删除指定关键字的值的操作
                     self.0.table.0.root.lock().delete(key, false);
                 },
@@ -1082,7 +1144,7 @@ async fn collect_waits<
         while let Some((wait_tr, actions, confirm)) = locked.pop_front() {
             for (key, actions) in actions.iter() {
                 match actions {
-                    KVActionLog::Write(None) => {
+                    KVActionLog::Write(None) | KVActionLog::DirtyWrite(None) => {
                         //删除了元信息表中指定关键字的值
                         log_uid = table
                             .0
@@ -1094,7 +1156,7 @@ async fn collect_waits<
                         keys_len += 1;
                         bytes_len += key.len();
                     },
-                    KVActionLog::Write(Some(value)) => {
+                    KVActionLog::Write(Some(value)) | KVActionLog::DirtyWrite(Some(value)) => {
                         //插入或更新了元信息表中指定关键字的值
                         log_uid = table
                             .0
