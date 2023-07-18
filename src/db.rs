@@ -2,20 +2,21 @@ use std::time::Instant;
 use std::convert::TryInto;
 use std::path::{Path, PathBuf};
 use std::collections::{VecDeque, HashMap};
-use std::io::{Error, Result as IOResult, ErrorKind, Read};
+use std::io::{Error, Result as IOResult, ErrorKind};
 use std::sync::{Arc, atomic::{AtomicBool, AtomicU64, Ordering}};
 
 use futures::{future::{FutureExt, BoxFuture}, stream::BoxStream, StreamExt};
 use crossbeam_channel::bounded;
+use async_lock::RwLock;
 use dashmap::DashMap;
 use lazy_static::lazy_static;
-use bytes::{Buf, BufMut};
+use bytes::BufMut;
 use log::info;
 
 #[cfg(feature = "trace")]
 use tracing::Instrument;
 #[cfg(feature = "trace")]
-use opentelemetry::{global, Context,
+use opentelemetry::{Context,
                     propagation::TextMapPropagator,
                     sdk::propagation::TraceContextPropagator};
 #[cfg(feature = "trace")]
@@ -26,9 +27,9 @@ use tracing_subscriber::prelude::*;
 use pi_atom::Atom;
 use pi_bon::{WriteBuffer, ReadBuffer, Encode, Decode, ReadBonErr};
 use pi_guid::Guid;
-use pi_async::{lock::{spin_lock::SpinLock,
-                      rw_lock::RwLock},
-               rt::{AsyncRuntime, multi_thread::MultiTaskRuntime}};
+use pi_async_rt::{lock::spin_lock::SpinLock,
+                  rt::{AsyncRuntime,
+                       multi_thread::MultiTaskRuntime}};
 use pi_async_transaction::{AsyncTransaction,
                            Transaction2Pc,
                            UnitTransaction,
@@ -594,7 +595,7 @@ impl<
 
                                     if let Err(e) = tr.repair_create_table(table_name.clone(), table_meta.clone()).await {
                                         //重播的创建表失败，则立即返回错误原因
-                                        sender.send(Err(Error::new(ErrorKind::Other, format!("Repair tables meta failed, transaction_uid: {:?}, commit_uid: {:?}, table_name: {:?}, table_meta: {:?}, reason: {:?}", transaciton_uid, commit_uid_copy, table_name, table_meta, e))));
+                                        let _ = sender.send(Err(Error::new(ErrorKind::Other, format!("Repair tables meta failed, transaction_uid: {:?}, commit_uid: {:?}, table_name: {:?}, table_meta: {:?}, reason: {:?}", transaciton_uid, commit_uid_copy, table_name, table_meta, e))));
                                         return;
                                     }
                                 } else {
@@ -603,7 +604,7 @@ impl<
 
                                     if let Err(e) = tr.repair_remove_table(table_name.clone()).await {
                                         //重播的移除表失败，则立即返回错误原因
-                                        sender.send(Err(Error::new(ErrorKind::Other, format!("Repair tables meta failed, transaction_uid: {:?}, commit_uid: {:?}, table_name: {:?}, reason: {:?}", transaciton_uid, commit_uid_copy, table_name, e))));
+                                        let _ = sender.send(Err(Error::new(ErrorKind::Other, format!("Repair tables meta failed, transaction_uid: {:?}, commit_uid: {:?}, table_name: {:?}, reason: {:?}", transaciton_uid, commit_uid_copy, table_name, e))));
                                         return;
                                     }
                                 }
@@ -615,14 +616,14 @@ impl<
                                     //有值，则执行插入或更新操作
                                     if let Err(e) = tr.upsert(vec![write]).await {
                                         //重播的插入或更新操作失败，则立即返回错误原因
-                                        sender.send(Err(Error::new(ErrorKind::Other, format!("Repair db failed, transaction_uid: {:?}, commit_uid: {:?}, reason: {:?}", transaciton_uid, commit_uid_copy, e))));
+                                        let _ = sender.send(Err(Error::new(ErrorKind::Other, format!("Repair db failed, transaction_uid: {:?}, commit_uid: {:?}, reason: {:?}", transaciton_uid, commit_uid_copy, e))));
                                         return;
                                     }
                                 } else {
                                     //无值，则执行删除操作
                                     if let Err(e) = tr.delete(vec![write]).await {
                                         //重播的删除操作失败，则立即返回错误原因
-                                        sender.send(Err(Error::new(ErrorKind::Other, format!("Repair db failed, transaction_uid: {:?}, commit_uid: {:?}, reason: {:?}", transaciton_uid, commit_uid_copy, e))));
+                                        let _ = sender.send(Err(Error::new(ErrorKind::Other, format!("Repair db failed, transaction_uid: {:?}, commit_uid: {:?}, reason: {:?}", transaciton_uid, commit_uid_copy, e))));
                                         return;
                                     }
                                 }
@@ -636,7 +637,7 @@ impl<
                     //指定本次重播事务的事务唯一id后执行预提交修复
                     if let Err(e) = tr.prepare_repair(transaciton_uid.clone()).await {
                         //预提交重播事务失败，则立即返回错误原因
-                        sender.send(Err(Error::new(ErrorKind::Other, format!("Repair db failed, transaction_uid: {:?}, commit_uid: {:?}, reason: {:?}", transaciton_uid, commit_uid_copy, e))));
+                        let _ = sender.send(Err(Error::new(ErrorKind::Other, format!("Repair db failed, transaction_uid: {:?}, commit_uid: {:?}, reason: {:?}", transaciton_uid, commit_uid_copy, e))));
                         return;
                     }
 
@@ -646,18 +647,18 @@ impl<
                                        commit_uid_copy.clone(),
                                        prepare_output).await {
                         //提交重播事务失败，则立即返回错误原因
-                        sender.send(Err(Error::new(ErrorKind::Other, format!("Repair db failed, transaction_uid: {:?}, commit_uid: {:?}, reason: {:?}", transaciton_uid, commit_uid_copy, e))));
+                        let _ = sender.send(Err(Error::new(ErrorKind::Other, format!("Repair db failed, transaction_uid: {:?}, commit_uid: {:?}, reason: {:?}", transaciton_uid, commit_uid_copy, e))));
                         return;
                     }
 
                     //返回成功重播一条未确认的提交日志
-                    sender.send(Ok(()));
+                    let _ = sender.send(Ok(()));
                 } else {
                     //创建数据库事务失败，则立即返回错误原因
-                    sender.send(Err(Error::new(ErrorKind::Other, format!("Repair db failed, transaction_uid: {:?}, commit_uid: {:?}, reason: get db transaction error", transaciton_uid, commit_uid_copy))));
+                    let _ = sender.send(Err(Error::new(ErrorKind::Other, format!("Repair db failed, transaction_uid: {:?}, commit_uid: {:?}, reason: get db transaction error", transaciton_uid, commit_uid_copy))));
                 }
             }.boxed();
-            db_mgr.0.rt.spawn(db_mgr.0.rt.alloc(), boxed);
+            let _ = db_mgr.0.rt.spawn(boxed);
 
             //注意单个线程的运行时重播或并发重播，则可能会发生阻塞
             match receiver.recv() {

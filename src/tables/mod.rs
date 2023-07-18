@@ -132,7 +132,7 @@ pub trait KVTable: Send + Sync + 'static {
 
         //读取缓冲区数据
         let mut tkvs = Vec::with_capacity(kvs_len as usize);
-        for index in 0..kvs_len {
+        for _index in 0..kvs_len {
             let key_len = bytes.get_u16_le() as usize; //获取关键字长度
             offset += 2;
             let key = Binary::from_slice(&bytes[0..key_len]); //获取关键字

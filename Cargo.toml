@@ -1,6 +1,6 @@
 [package]
 name = "pi_db"
-version = "0.1.0"
+version = "0.2.0"
 authors = ["zmythleo <zmythleo@gmail.com>"]
 edition = "2018"
 
@@ -9,21 +9,22 @@ default = []
 trace = ["opentelemetry", "tracing-opentelemetry", "tracing", "tracing-subscriber"]
 
 [dependencies]
-parking_lot = "0.11"
+parking_lot = "0.12"
 futures = "0.3"
 crossbeam-channel = "0.5"
+async-lock = "2.7"
 async-stream = "0.3"
-bytes = "1.0"
-dashmap = "4.0"
+bytes = "1.4"
+dashmap = "5.5"
 log = "0.4"
-pi_async = "0.5"
-pi_async_file = "0.4"
-pi_async_transaction = "0.1"
+pi-async-rt = "0.1"
+pi_async_file = "0.5"
+pi_async_transaction = "0.2"
 pi_store = { path = "../pi_store" }
-pi_atom = "0.1"
+pi_atom = "0.2"
 pi_guid = "0.1"
-pi_bon = "0.1"
-pi_sinfo = "0.1"
+pi_bon = "0.2"
+pi_sinfo = "0.2"
 pi_ordmap = "0.2"
 pi_logger = { path = "../pi_logger" }
 pi_hash = "0.1"
@@ -37,4 +38,4 @@ lazy_static = "1.4"
 crossbeam-channel = "0.5"
 env_logger = "0.9"
 fastrand = "1.5"
-pi_time = "0.1"
+pi_time = "0.3"

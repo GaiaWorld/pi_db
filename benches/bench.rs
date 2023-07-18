@@ -16,7 +16,7 @@ use pi_atom::Atom;
 use pi_guid::{GuidGen, Guid};
 use pi_sinfo::EnumType;
 use pi_time::run_nanos;
-use pi_async::rt::{AsyncRuntime, multi_thread::MultiTaskRuntimeBuilder};
+use pi_async_rt::rt::{AsyncRuntime, multi_thread::MultiTaskRuntimeBuilder};
 use pi_async_transaction::{TransactionError,
                            AsyncCommitLog,
                            ErrorLevel,

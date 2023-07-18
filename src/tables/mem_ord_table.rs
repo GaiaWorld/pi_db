@@ -12,7 +12,7 @@ use pi_atom::Atom;
 use pi_guid::Guid;
 use pi_hash::XHashMap;
 use pi_ordmap::{ordmap::{Iter, OrdMap, Keys, Entry}, asbtree::Tree};
-use pi_async::lock::spin_lock::SpinLock;
+use pi_async_rt::lock::spin_lock::SpinLock;
 use pi_async_transaction::{AsyncTransaction,
                            Transaction2Pc,
                            UnitTransaction,

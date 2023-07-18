@@ -6,6 +6,7 @@ use std::collections::hash_map::Entry as HashMapEntry;
 
 use parking_lot::Mutex;
 use futures::{future::{FutureExt, BoxFuture}, stream::{StreamExt, BoxStream}};
+use async_lock::Mutex as AsyncMutex;
 use async_stream::stream;
 use log::{debug, info, error};
 
@@ -13,9 +14,9 @@ use pi_atom::Atom;
 use pi_guid::Guid;
 use pi_hash::XHashMap;
 use pi_ordmap::{ordmap::{Iter, OrdMap, Keys, Entry}, asbtree::Tree};
-use pi_async::{lock::{spin_lock::SpinLock,
-                      mutex_lock::Mutex as AsyncMutex},
-               rt::{AsyncRuntime, multi_thread::MultiTaskRuntime}};
+use pi_async_rt::{lock::spin_lock::SpinLock,
+                  rt::{AsyncRuntime,
+                       multi_thread::MultiTaskRuntime}};
 use pi_async_transaction::{AsyncTransaction,
                            Transaction2Pc,
                            UnitTransaction,
@@ -229,7 +230,7 @@ impl<
 
                 //启动元信息表的提交待确认事务的定时整理
                 let table_copy = table.clone();
-                let _ = table.0.rt.spawn(table.0.rt.alloc(), async move {
+                let _ = table.0.rt.spawn(async move {
                     let table_ref = &table_copy;
                     loop {
                         match collect_waits(table_ref,
@@ -545,7 +546,7 @@ impl<
             if tr.is_require_persistence() {
                 //持久化的元信息表事务，则异步将表的修改写入日志文件后，再确认提交成功
                 let table_copy = tr.0.table.clone();
-                let _ = self.0.table.0.rt.spawn(self.0.table.0.rt.alloc(), async move {
+                let _ = self.0.table.0.rt.spawn(async move {
                     let mut size = 0;
                     for (key, action) in &actions {
                         match action {

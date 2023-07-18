@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::io::{Error, Result, ErrorKind};
 
 use clap::{App, Arg, ArgMatches, SubCommand};
-use pi_async::rt::{AsyncRuntime, multi_thread::MultiTaskRuntimeBuilder};
+use pi_async_rt::rt::{AsyncRuntime, multi_thread::MultiTaskRuntimeBuilder};
 use pi_async_file::file::rename;
 use crossbeam_channel::bounded;
 use log::{info, error};
