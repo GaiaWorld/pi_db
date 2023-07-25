@@ -851,6 +851,114 @@ fn bench_multi_log_table(b: &mut Bencher) {
 }
 
 #[bench]
+fn bench_query_multi_log_table(b: &mut Bencher) {
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    env_logger::init();
+
+    let builder = MultiTaskRuntimeBuilder::default();
+    let rt = builder.build();
+    let rt_copy = rt.clone();
+
+    //异步构建数据库管理器
+    let (sender, receiver) = bounded(1);
+    rt.spawn(rt.alloc(), async move {
+        let guid_gen = GuidGen::new(run_nanos(), 0);
+        let commit_logger_builder = CommitLoggerBuilder::new(rt_copy.clone(), "./.commit_log");
+        let commit_logger = commit_logger_builder
+            .build()
+            .await
+            .unwrap();
+
+        let tr_mgr = Transaction2PcManager::new(rt_copy.clone(),
+                                                guid_gen,
+                                                commit_logger);
+
+        let builder = KVDBManagerBuilder::new(rt_copy.clone(), tr_mgr, "./db");
+        match builder.startup().await {
+            Err(e) => {
+                println!("!!!!!!startup db failed, reason: {:?}", e);
+            },
+            Ok(db) => {
+                for index in 0..10 {
+                    let tr = db.transaction(Atom::from("test_log"), true, 500, 500).unwrap();
+                    if let Err(e) = tr.create_table(Atom::from("test_log".to_string() + index.to_string().as_str()),
+                                                    KVTableMeta::new(KVDBTableType::LogOrdTab,
+                                                                     true,
+                                                                     EnumType::Usize,
+                                                                     EnumType::Str)).await {
+                        //创建有序日志表失败
+                        println!("!!!!!!create log ordered table failed, reason: {:?}", e);
+                    }
+                    let output = tr.prepare_modified().await.unwrap();
+                    let _ = tr.commit_modified(output).await;
+                }
+                println!("!!!!!!db table size: {:?}", db.table_size().await);
+
+                sender.send(db);
+            },
+        }
+    });
+    thread::sleep(Duration::from_millis(3000));
+
+    let rt_copy = rt.clone();
+    let db = receiver.recv().unwrap();
+    let mut table_names = Vec::new();
+    for index in 0..10 {
+        table_names.push(Atom::from("test_log".to_string() + index.to_string().as_str()));
+    }
+    b.iter(move || {
+        let (s, r) = unbounded();
+
+        for index in 0..1000usize {
+            let s_copy = s.clone();
+            let db_copy = db.clone();
+            let table_names_copy = table_names.clone();
+
+            rt_copy.spawn(rt_copy.alloc(), async move {
+                let tr = db_copy
+                    .transaction(Atom::from("test log table"),
+                                 true,
+                                 500,
+                                 500).unwrap();
+
+                for table_name in table_names_copy {
+                    if let None = tr.query(vec![TableKV::new(table_name, usize_to_binary(index), None)]).await[0] {
+                        panic!("query failed, key: {}", index);
+                    }
+                }
+
+                s_copy.send(());
+            });
+        }
+
+        let mut count = 0;
+        loop {
+            match r.recv_timeout(Duration::from_millis(10000)) {
+                Err(e) => {
+                    println!(
+                        "!!!!!!recv timeout, len: {}, timer_len: {}, e: {:?}",
+                        rt_copy.wait_len(),
+                        rt_copy.len(),
+                        e
+                    );
+                    continue;
+                },
+                Ok(_) => {
+                    count += 1;
+                    if count >= 1000 {
+                        break;
+                    }
+                },
+            }
+        }
+    });
+
+    thread::sleep(Duration::from_millis(70000));
+}
+
+#[bench]
 fn bench_iterator_table(b: &mut Bencher) {
     use std::thread;
     use std::time::{Duration, Instant};
