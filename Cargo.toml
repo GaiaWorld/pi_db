@@ -25,7 +25,7 @@ pi_guid = "0.1"
 pi_bon = "0.1"
 pi_sinfo = "0.1"
 pi_ordmap = "0.2"
-pi_logger = { path = "../pi_logger" }
+pi_logger = "0.1"
 pi_hash = "0.1"
 opentelemetry = { version = "0.18", optional = true }
 tracing-opentelemetry = { version = "0.18", optional = true }

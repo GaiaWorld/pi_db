@@ -21,6 +21,7 @@ use pi_async_transaction::{TransactionError,
                            AsyncCommitLog,
                            ErrorLevel,
                            manager_2pc::Transaction2PcManager};
+use pi_bon::{WriteBuffer, ReadBuffer, Encode, Decode, ReadBonErr};
 use pi_store::commit_logger::{CommitLoggerBuilder, CommitLogger};
 
 use pi_db::{Binary, KVDBTableType, KVTableMeta, db::KVDBManagerBuilder, tables::TableKV, KVTableTrError};
@@ -784,7 +785,7 @@ fn bench_multi_log_table(b: &mut Bencher) {
                 for table_name in table_names_copy {
                     let _ = tr.upsert(vec![TableKV {
                         table: table_name,
-                        key: Binary::new(index.to_le_bytes().to_vec()),
+                        key: usize_to_binary(index),
                         value: Some(Binary::new("Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!".as_bytes().to_vec()))
                     }]).await;
                 }
@@ -1264,4 +1265,30 @@ fn bench_table_conflict(b: &mut Bencher) {
         }
         println!("!!!!!!error: {}, time: {:?}", error_count, Instant::now() - now);
     });
+}
+
+// 将u8序列化为二进制数据
+fn u8_to_binary(number: u8) -> Binary {
+    let mut buffer = WriteBuffer::new();
+    number.encode(&mut buffer);
+    Binary::new(buffer.bytes)
+}
+
+// 将二进制数据反序列化为u8
+fn binary_to_u8(bin: &Binary) -> Result<u8, ReadBonErr> {
+    let mut buffer = ReadBuffer::new(bin, 0);
+    u8::decode(&mut buffer)
+}
+
+// 将usize序列化为二进制数据
+fn usize_to_binary(number: usize) -> Binary {
+    let mut buffer = WriteBuffer::new();
+    number.encode(&mut buffer);
+    Binary::new(buffer.bytes)
+}
+
+// 将二进制数据反序列化为usize
+fn binary_to_usize(bin: &Binary) -> Result<usize, ReadBonErr> {
+    let mut buffer = ReadBuffer::new(bin, 0);
+    usize::decode(&mut buffer)
 }
