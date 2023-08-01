@@ -3,27 +3,155 @@
 extern crate test;
 use test::Bencher;
 
-use std::convert::TryInto;
-use std::io::Result as IOResult;
-
-use futures::{future::{FutureExt, BoxFuture},
-              stream::{StreamExt, BoxStream}};
+use futures::stream::StreamExt;
 use crossbeam_channel::{unbounded, bounded};
-use bytes::BufMut;
 use env_logger;
 
-use pi_atom::Atom;
-use pi_guid::{GuidGen, Guid};
+use pi_guid::GuidGen;
 use pi_sinfo::EnumType;
 use pi_time::run_nanos;
-use pi_async_rt::rt::{AsyncRuntime, multi_thread::MultiTaskRuntimeBuilder};
+use pi_ordmap::{ordmap::{Iter, ImOrdMap, OrdMap, Entry}, asbtree::Tree};
+use pi_atom::Atom;
+use pi_async_rt::rt::{AsyncRuntime,
+                      multi_thread::MultiTaskRuntimeBuilder};
 use pi_async_transaction::{TransactionError,
-                           AsyncCommitLog,
                            ErrorLevel,
                            manager_2pc::Transaction2PcManager};
-use pi_store::commit_logger::{CommitLoggerBuilder, CommitLogger};
+use pi_store::commit_logger::CommitLoggerBuilder;
+use async_stream::stream;
 
 use pi_db::{Binary, KVDBTableType, KVTableMeta, db::KVDBManagerBuilder, tables::TableKV, KVTableTrError};
+
+#[bench]
+fn bench_insert_ordmap_by_small(b: &mut Bencher) {
+    b.iter(move || {
+        let mut tree = OrdMap::<Tree<usize, usize>>::new(Tree::new());
+
+        for index in 0..100000usize {
+            let _ = tree.upsert(index,
+                                index,
+                                false);
+        }
+    });
+}
+
+#[bench]
+fn bench_insert_ordmap(b: &mut Bencher) {
+    b.iter(move || {
+        let mut tree = OrdMap::<Tree<Vec<u8>, Vec<u8>>>::new(Tree::new());
+
+        for key in 0..100000usize {
+            let _ = tree.upsert(key.to_le_bytes().to_vec(),
+                                "Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!".as_bytes().to_vec(),
+                                false);
+        }
+    });
+}
+
+#[bench]
+fn bench_update_ordmap(b: &mut Bencher) {
+    let mut tree = OrdMap::<Tree<Vec<u8>, Vec<u8>>>::new(Tree::new());
+
+    for key in 0..100000usize {
+        let _ = tree.upsert(key.to_le_bytes().to_vec(),
+                            "Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!".as_bytes().to_vec(),
+                            false);
+    }
+
+    b.iter(move || {
+        for key in 0..100000usize {
+            let _ = tree.upsert(key.to_le_bytes().to_vec(),
+                                "Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!".as_bytes().to_vec(),
+                                false);
+        }
+    });
+}
+
+#[bench]
+fn bench_read_ordmap(b: &mut Bencher) {
+    let mut tree = OrdMap::<Tree<Vec<u8>, Vec<u8>>>::new(Tree::new());
+
+    for key in 0..100000usize {
+        let _ = tree.upsert(key.to_le_bytes().to_vec(),
+                            "Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!".as_bytes().to_vec(),
+                            false);
+    }
+
+    b.iter(move || {
+        for key in 0..100000usize {
+            if let None = tree.get(&key.to_le_bytes().to_vec()) {
+                panic!("read ordmap failed");
+            }
+        }
+    });
+}
+
+#[bench]
+fn bench_iter_ordmap(b: &mut Bencher) {
+    let mut tree = OrdMap::<Tree<Vec<u8>, Vec<u8>>>::new(Tree::new());
+
+    for key in 0..100000usize {
+        let _ = tree.upsert(key.to_le_bytes().to_vec(),
+                            "Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!".as_bytes().to_vec(),
+                            false);
+    }
+
+    b.iter(move || {
+        let mut iter = tree.iter(None, false);
+
+        while let Some(_) = iter.next() {}
+    });
+}
+
+#[bench]
+fn bench_iter_ordmap_by_desc(b: &mut Bencher) {
+    let mut tree = OrdMap::<Tree<Vec<u8>, Vec<u8>>>::new(Tree::new());
+
+    for key in 0..100000usize {
+        let _ = tree.upsert(key.to_le_bytes().to_vec(),
+                            "Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!".as_bytes().to_vec(),
+                            false);
+    }
+
+    b.iter(move || {
+        let mut iter = tree.iter(None, true);
+
+        while let Some(_) = iter.next() {}
+    });
+}
+
+#[bench]
+fn bench_async_iter_ordmap(b: &mut Bencher) {
+    let rt = MultiTaskRuntimeBuilder::default().build();
+
+    let mut tree = OrdMap::<Tree<Vec<u8>, Vec<u8>>>::new(Tree::new());
+
+    for key in 0..100000usize {
+        let _ = tree.upsert(key.to_le_bytes().to_vec(),
+                            "Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!".as_bytes().to_vec(),
+                            false);
+    }
+
+    b.iter(move || {
+        let ptr = Box::into_raw(Box::new(tree.iter(None, false))) as usize;
+        let mut stream = stream! {
+            let mut iterator = unsafe {
+                Box::from_raw(ptr as *mut <Tree<Vec<u8>, Vec<u8>> as Iter<'_>>::IterType)
+            };
+
+            while let Some(Entry(key, value)) = iterator.next() {
+                yield (key.clone(), value.clone());
+            }
+        }.boxed();
+
+        let (sender, receiver) = bounded(1);
+        rt.spawn(async move {
+            while let Some(_) = stream.next().await {}
+            sender.send(());
+        });
+        let _ = receiver.recv().unwrap();
+    });
+}
 
 #[bench]
 fn bench_memory_table(b: &mut Bencher) {
@@ -36,7 +164,7 @@ fn bench_memory_table(b: &mut Bencher) {
 
     //异步构建数据库管理器
     let (sender, receiver) = bounded(1);
-    rt.spawn(rt.alloc(), async move {
+    let _ = rt.spawn(async move {
         let guid_gen = GuidGen::new(run_nanos(), 0);
         let commit_logger_builder = CommitLoggerBuilder::new(rt_copy.clone(), "./.commit_log");
         let commit_logger = commit_logger_builder
@@ -85,7 +213,7 @@ fn bench_memory_table(b: &mut Bencher) {
             let db_copy = db.clone();
             let table_name_copy = table_name.clone();
 
-            rt_copy.spawn(rt_copy.alloc(), async move {
+            let _ = rt_copy.spawn(async move {
                 let tr = db_copy
                     .transaction(Atom::from("test memory table"),
                                  true,
@@ -168,7 +296,7 @@ fn bench_multi_memory_table(b: &mut Bencher) {
 
     //异步构建数据库管理器
     let (sender, receiver) = bounded(1);
-    rt.spawn(rt.alloc(), async move {
+    let _ = rt.spawn(async move {
         let guid_gen = GuidGen::new(run_nanos(), 0);
         let commit_logger_builder = CommitLoggerBuilder::new(rt_copy.clone(), "./.commit_log");
         let commit_logger = commit_logger_builder
@@ -223,7 +351,7 @@ fn bench_multi_memory_table(b: &mut Bencher) {
             let db_copy = db.clone();
             let table_names_copy = table_names.clone();
 
-            rt_copy.spawn(rt_copy.alloc(), async move {
+            let _ = rt_copy.spawn(async move {
                 let tr = db_copy
                     .transaction(Atom::from("test memory table"),
                                  true,
@@ -309,7 +437,7 @@ fn bench_commit_log(b: &mut Bencher) {
 
     //异步构建数据库管理器
     let (sender, receiver) = bounded(1);
-    rt.spawn(rt.alloc(), async move {
+    let _ = rt.spawn(async move {
         let guid_gen = GuidGen::new(run_nanos(), 0);
         let commit_logger_builder = CommitLoggerBuilder::new(rt_copy.clone(), "./.commit_log");
         let commit_logger = commit_logger_builder
@@ -358,7 +486,7 @@ fn bench_commit_log(b: &mut Bencher) {
             let db_copy = db.clone();
             let table_name_copy = table_name.clone();
 
-            rt_copy.spawn(rt_copy.alloc(), async move {
+            let _ = rt_copy.spawn(async move {
                 let tr = db_copy
                     .transaction(Atom::from("test memory table"),
                                  true,
@@ -441,7 +569,7 @@ fn bench_multi_commit_log(b: &mut Bencher) {
 
     //异步构建数据库管理器
     let (sender, receiver) = bounded(1);
-    rt.spawn(rt.alloc(), async move {
+    let _ = rt.spawn(async move {
         let guid_gen = GuidGen::new(run_nanos(), 0);
         let commit_logger_builder = CommitLoggerBuilder::new(rt_copy.clone(), "./.commit_log");
         let commit_logger = commit_logger_builder
@@ -496,7 +624,7 @@ fn bench_multi_commit_log(b: &mut Bencher) {
             let db_copy = db.clone();
             let table_names_copy = table_names.clone();
 
-            rt_copy.spawn(rt_copy.alloc(), async move {
+            let _ = rt_copy.spawn(async move {
                 let tr = db_copy
                     .transaction(Atom::from("test memory table"),
                                  true,
@@ -584,7 +712,7 @@ fn bench_log_table(b: &mut Bencher) {
 
     //异步构建数据库管理器
     let (sender, receiver) = bounded(1);
-    rt.spawn(rt.alloc(), async move {
+    let _ = rt.spawn(async move {
         let guid_gen = GuidGen::new(run_nanos(), 0);
         let commit_logger_builder = CommitLoggerBuilder::new(rt_copy.clone(), "./.commit_log");
         let commit_logger = commit_logger_builder
@@ -633,7 +761,7 @@ fn bench_log_table(b: &mut Bencher) {
             let db_copy = db.clone();
             let table_name_copy = table_name.clone();
 
-            rt_copy.spawn(rt_copy.alloc(), async move {
+            let _ = rt_copy.spawn(async move {
                 let tr = db_copy
                     .transaction(Atom::from("test log table"),
                                  true,
@@ -720,7 +848,7 @@ fn bench_multi_log_table(b: &mut Bencher) {
 
     //异步构建数据库管理器
     let (sender, receiver) = bounded(1);
-    rt.spawn(rt.alloc(), async move {
+    let _ = rt.spawn(async move {
         let guid_gen = GuidGen::new(run_nanos(), 0);
         let commit_logger_builder = CommitLoggerBuilder::new(rt_copy.clone(), "./.commit_log");
         let commit_logger = commit_logger_builder
@@ -774,7 +902,7 @@ fn bench_multi_log_table(b: &mut Bencher) {
             let db_copy = db.clone();
             let table_names_copy = table_names.clone();
 
-            rt_copy.spawn(rt_copy.alloc(), async move {
+            let _ = rt_copy.spawn(async move {
                 let tr = db_copy
                     .transaction(Atom::from("test log table"),
                                  true,
@@ -852,7 +980,7 @@ fn bench_multi_log_table(b: &mut Bencher) {
 #[bench]
 fn bench_iterator_table(b: &mut Bencher) {
     use std::thread;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     env_logger::init();
 
@@ -862,7 +990,7 @@ fn bench_iterator_table(b: &mut Bencher) {
 
     //异步构建数据库管理器
     let (sender, receiver) = bounded(1);
-    rt.spawn(rt.alloc(), async move {
+    let _ = rt.spawn(async move {
         let guid_gen = GuidGen::new(run_nanos(), 0);
         let commit_logger_builder = CommitLoggerBuilder::new(rt_copy.clone(), "./.commit_log");
         let commit_logger = commit_logger_builder
@@ -910,13 +1038,12 @@ fn bench_iterator_table(b: &mut Bencher) {
     b.iter(move || {
         let (s, r) = unbounded();
 
-        let now = Instant::now();
         for _ in 0..1000usize {
             let s_copy = s.clone();
             let db_copy = db.clone();
             let table_names_copy = table_names.clone();
 
-            rt_copy.spawn(rt_copy.alloc(), async move {
+            let _ = rt_copy.spawn(async move {
                 let tr = db_copy
                     .transaction(Atom::from("test log table"),
                                  true,
@@ -959,7 +1086,6 @@ fn bench_iterator_table(b: &mut Bencher) {
 
 #[bench]
 fn bench_sequence_upsert(b: &mut Bencher) {
-    use std::thread;
     use std::time::{Duration, Instant};
     use fastrand;
 
@@ -971,7 +1097,7 @@ fn bench_sequence_upsert(b: &mut Bencher) {
 
     //异步构建数据库管理器
     let (sender, receiver) = bounded(1);
-    rt.spawn(rt.alloc(), async move {
+    let _ = rt.spawn(async move {
         let guid_gen = GuidGen::new(run_nanos(), 0);
         let commit_logger_builder = CommitLoggerBuilder::new(rt_copy.clone(), "./.commit_log");
         let commit_logger = commit_logger_builder
@@ -1021,7 +1147,7 @@ fn bench_sequence_upsert(b: &mut Bencher) {
         let s_copy = s.clone();
 
         let now = Instant::now();
-        rt_copy.spawn(rt_copy.alloc(), async move {
+        let _ = rt_copy.spawn(async move {
             for _ in 0..1000 {
                 let table_name0_copy = table_name.clone();
                 let mut table_kv_list = Vec::new();
@@ -1097,7 +1223,6 @@ fn bench_sequence_upsert(b: &mut Bencher) {
 
 #[bench]
 fn bench_table_conflict(b: &mut Bencher) {
-    use std::thread;
     use std::time::{Duration, Instant};
     use fastrand;
 
@@ -1109,7 +1234,7 @@ fn bench_table_conflict(b: &mut Bencher) {
 
     //异步构建数据库管理器
     let (sender, receiver) = bounded(1);
-    rt.spawn(rt.alloc(), async move {
+    let _ = rt.spawn(async move {
         let guid_gen = GuidGen::new(run_nanos(), 0);
         let commit_logger_builder = CommitLoggerBuilder::new(rt_copy.clone(), "./.commit_log");
         let commit_logger = commit_logger_builder
@@ -1172,7 +1297,7 @@ fn bench_table_conflict(b: &mut Bencher) {
             let table_name1 = Atom::from("test_log1");
             let s_copy = s.clone();
 
-            rt_copy.spawn(rt_copy.alloc(), async move {
+            let _ = rt_copy.spawn(async move {
                 let table_name0_copy = table_name0.clone();
                 let table_name1_copy = table_name1.clone();
 
