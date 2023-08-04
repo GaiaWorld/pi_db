@@ -1112,6 +1112,7 @@ async fn collect_waits<
     Log: AsyncCommitLog<C = C, Cid = Guid>,
 >(table: &LogOrderedTable<C, Log>,
   timeout: Option<usize>) -> Result<(Duration, (usize, usize, usize)), (Duration, (usize, usize, usize))> {
+    info!("Collect log ordered table start0, table: {:?}", table.name().as_str());
     //等待指定的时间
     if let Some(timeout) = timeout {
         //需要等待指定时间后，再开始整理
@@ -1178,6 +1179,7 @@ async fn collect_waits<
             waits.push_back((wait_tr, confirm));
         }
 
+        info!("Collect log ordered table start1, table: {:?}, transactions: {}, keys: {}, bytes: {}",
         if let Err(e) = table
             .0
             .log_file
