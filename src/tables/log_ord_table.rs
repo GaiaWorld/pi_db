@@ -1180,6 +1180,10 @@ async fn collect_waits<
         }
 
         info!("Collect log ordered table start1, table: {:?}, transactions: {}, keys: {}, bytes: {}",
+            table.name().as_str(),
+            trs_len,
+            keys_len,
+            bytes_len);
         if let Err(e) = table
             .0
             .log_file
