@@ -481,6 +481,12 @@ impl<
         }
     }
 
+    /// 追加一个新的提交日志
+    pub async fn append_new_commit_log(&self) -> IOResult<usize> {
+        let commit_logger = self.0.tr_mgr.commit_logger();
+        commit_logger.append_check_point().await
+    }
+
     /// 异步准备整理指定名称的数据表，准备整理成功，才允许开始整理表
     pub async fn ready_collect_table(&self, table_name: &Atom) -> IOResult<()> {
         match self.0.tables.read().await.get(&table_name) {
