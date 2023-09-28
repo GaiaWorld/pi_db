@@ -454,6 +454,8 @@ impl<
             //本次事务的所有子事务已确认提交，则异步的确认本次事务已提交，并立即返回成功
             let confirmer = self.clone();
             let _ = (self.0).0.spawn(async move {
+                let last = COMMITED_LEN.fetch_add(1, Ordering::Relaxed);
+                println!("!!!!!!last commited len: {}", last);
                 //事务已确认提交
                 if let Err(e) = (confirmer.0)
                     .1
@@ -468,6 +470,8 @@ impl<
         Ok(())
     }
 }
+
+static COMMITED_LEN: AtomicUsize = AtomicUsize::new(0);
 
 ///
 /// 键值对数据库事务错误
