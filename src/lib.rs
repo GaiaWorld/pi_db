@@ -451,6 +451,7 @@ impl<
 
         //对子事务的确认提交计数
         if (self.0).4.fetch_sub(1, Ordering::SeqCst) <= 1 {
+            COMMITED_TRANSACTION_LEN.fetch_add(1, Ordering::SeqCst);
             //本次事务的所有子事务已确认提交，则异步的确认本次事务已提交，并立即返回成功
             let confirmer = self.clone();
             let _ = (self.0).0.spawn(async move {
@@ -468,6 +469,8 @@ impl<
         Ok(())
     }
 }
+
+pub static COMMITED_TRANSACTION_LEN: AtomicUsize = AtomicUsize::new(0);
 
 ///
 /// 键值对数据库事务错误
