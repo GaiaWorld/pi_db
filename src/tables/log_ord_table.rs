@@ -1213,8 +1213,5 @@ async fn collect_waits<
     }
     table.0.collecting.store(false, Ordering::Release); //设置为已整理结束
 
-    use crate::COMMITED_TRANSACTION_LEN;
-    println!("######COMMITED_TRANSACTION_LEN: {}", COMMITED_TRANSACTION_LEN.load(Ordering::SeqCst));
-
     Ok((now.elapsed(), (trs_len, keys_len, bytes_len)))
 }
