@@ -6,3 +6,4 @@ testlogfile
 **/.idea
 **/*.bat
 **/db
+**/specific_db
