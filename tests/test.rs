@@ -2037,6 +2037,44 @@ fn test_db_repair() {
     thread::sleep(Duration::from_millis(1000000000));
 }
 
+#[test]
+fn test_db_repair_by_specific() {
+    use std::thread;
+    use std::time::Duration;
+
+    env_logger::init();
+
+    let _handle = startup_global_time_loop(10);
+    let builder = MultiTaskRuntimeBuilder::default();
+    let rt = builder.build();
+    let rt_copy = rt.clone();
+
+    rt.spawn(async move {
+        let guid_gen = GuidGen::new(run_nanos(), 0);
+        let commit_logger_builder = CommitLoggerBuilder::new(rt_copy.clone(), "./specific_db/.commit_log");
+        let commit_logger = commit_logger_builder
+            .build()
+            .await
+            .unwrap();
+
+        let tr_mgr = Transaction2PcManager::new(rt_copy.clone(),
+                                                guid_gen,
+                                                commit_logger);
+
+        let mut builder = KVDBManagerBuilder::new(rt_copy.clone(), tr_mgr, "./specific_db");
+        match builder.startup().await {
+            Err(e) => {
+                panic!("!!!!!!startup db failed, reason: {:?}", e);
+            },
+            Ok(db) => {
+                println!("!!!!!!db tables: {:?}", db.tables().await);
+            },
+        }
+    });
+
+    thread::sleep(Duration::from_millis(1000000000));
+}
+
 //执行两次，第一次执行在数据落地前中止执行，然后执行test_commit_log_inspector，第二次执行则等待数据落地后再退出，然后执行test_log_table_inspector
 #[test]
 fn test_multi_tables_repair() {

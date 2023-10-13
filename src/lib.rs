@@ -455,7 +455,6 @@ impl<
             let confirmer = self.clone();
             let _ = (self.0).0.spawn(async move {
                 let last = COMMITED_LEN.fetch_add(1, Ordering::Relaxed);
-                println!("!!!!!!last commited len: {}", last);
                 //事务已确认提交
                 if let Err(e) = (confirmer.0)
                     .1
