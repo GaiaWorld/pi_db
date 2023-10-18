@@ -695,7 +695,7 @@ impl TransactionDebugLogger {
                                             format!("{:?}", tid).as_bytes(),
                                             format!("Commit confirm transaction failed, transaction not exist:\n\tcid: {:?}\n\ttable: {:?}\n\twritable: {:?}\n\trequire_persistence: {:?}\n",
                                                     cid,
-                                                    table,
+                                                    table.as_str(),
                                                     writable,
                                                     require_persistence).as_bytes());
                             }
