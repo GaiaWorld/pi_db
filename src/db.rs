@@ -30,12 +30,7 @@ use pi_guid::Guid;
 use pi_async_rt::{lock::spin_lock::SpinLock,
                   rt::{AsyncRuntime,
                        multi_thread::MultiTaskRuntime}};
-use pi_async_transaction::{AsyncTransaction,
-                           Transaction2Pc,
-                           UnitTransaction,
-                           SequenceTransaction,
-                           TransactionTree,
-                           AsyncCommitLog,
+use pi_async_transaction::{AsyncTransaction, Transaction2Pc, UnitTransaction, SequenceTransaction, TransactionTree, AsyncCommitLog, ErrorLevel, TransactionError,
                            manager_2pc::{Transaction2PcStatus, Transaction2PcManager}};
 use pi_async_file::file::create_dir;
 use pi_hash::XHashMap;
@@ -2633,6 +2628,11 @@ impl<
                         }
                     },
                 }
+            } else {
+                //指定名称的表不存在
+                return Err(KVTableTrError::new_transaction_error(ErrorLevel::Fatal,
+                                                                 format!("Upsert table failed, table: {:?}, reason: table not exist",
+                                                                     &table_kv.table.as_str())));
             }
         }
 

@@ -2050,6 +2050,11 @@ fn test_db_repair_by_specific() {
     let rt = builder.build();
     let rt_copy = rt.clone();
 
+    init_transaction_debug_logger(rt.clone(),
+                                  "./specific_db/log_table_debug",
+                                  10000,
+                                  10000);
+
     rt.spawn(async move {
         let guid_gen = GuidGen::new(run_nanos(), 0);
         let commit_logger_builder = CommitLoggerBuilder::new(rt_copy.clone(), "./specific_db/.commit_log");
