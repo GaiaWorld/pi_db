@@ -36,6 +36,8 @@ use crate::{Binary,
             KVActionLog,
             KVDBCommitConfirm,
             KVTableTrError,
+            TransactionDebugEvent,
+            transaction_debug_logger,
             db::{KVDBTransaction, KVDBChildTrList},
             tables::KVTable};
 use std::collections::VecDeque;
@@ -483,6 +485,22 @@ impl<
                     //将事务的当前操作记录，写入表的预提交表
                     prepare_locked.insert(tr.get_transaction_uid().unwrap(), actions);
                 }
+                //跟踪预提交
+                #[cfg(feature = "log_table_debug")]
+                {
+                    let output_len = if let Some(buf) = &write_buf {
+                        buf.len()
+                    } else {
+                        0
+                    };
+                    let event = TransactionDebugEvent::Begin(tr.get_transaction_uid().unwrap(),
+                                                             tr.get_status(),
+                                                             tr.is_writable(),
+                                                             tr.is_require_persistence(),
+                                                             output_len);
+                    let logger = transaction_debug_logger();
+                    logger.log(event);
+                }
 
                 Ok(write_buf)
             } else {
@@ -559,6 +577,22 @@ impl<
                             },
                             KVActionLog::Read => (),
                         }
+                    }
+                    //跟踪提交
+                    #[cfg(feature = "log_table_debug")]
+                    {
+                        let current_check_point = confirm
+                            .commit_logger()
+                            .current_check_point()
+                            .await
+                            - 1;
+                        let event = TransactionDebugEvent::Commit(tr.get_transaction_uid().unwrap(),
+                                                                  tr.get_commit_uid().unwrap(),
+                                                                  tr.get_status(),
+                                                                  size,
+                                                                  current_check_point);
+                        let logger = transaction_debug_logger();
+                        logger.log(event);
                     }
                     table_copy.0.waits.lock().await.push_back((tr, actions, confirm)); //注册待确认的已提交事务
 
@@ -1200,6 +1234,17 @@ async fn collect_waits<
 
     //写入日志文件成功，则调用指定事务的确认提交回调，并继续写入下一个事务
     for (wait_tr, confirm) in waits {
+        //跟踪提交
+        #[cfg(feature = "log_table_debug")]
+        {
+            let event = TransactionDebugEvent::CommitConfirm(wait_tr.get_transaction_uid().unwrap(),
+                                                             wait_tr.get_commit_uid().unwrap(),
+                                                             wait_tr.0.table.name(),
+                                                             wait_tr.is_writable(),
+                                                             wait_tr.is_require_persistence());
+            let logger = transaction_debug_logger();
+            logger.log(event);
+        }
         if let Err(e) = confirm(wait_tr.get_transaction_uid().unwrap(),
                                 wait_tr.get_commit_uid().unwrap(),
                                 Ok(())) {

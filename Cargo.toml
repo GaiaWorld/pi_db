@@ -1,6 +1,6 @@
 [package]
 name = "pi_db"
-version = "0.3.1"
+version = "0.5.0"
 authors = ["vmos <vmosone007@gmail.com>"]
 edition = "2018"
 description = "Full cache based database，support transaction"
@@ -11,6 +11,7 @@ keywords = ["pi", "database", "transaction"]
 [features]
 default = []
 trace = ["opentelemetry", "tracing-opentelemetry", "tracing", "tracing-subscriber"]
+log_table_debug = []
 
 [dependencies]
 parking_lot = "0.12"
@@ -23,8 +24,8 @@ dashmap = "5.5"
 log = "0.4"
 pi-async-rt = "0.1"
 pi_async_file = "0.5"
-pi_async_transaction = "0.3"
-pi_store = "0.3"
+pi_async_transaction = "0.5"
+pi_store = "0.5"
 pi_atom = "0.2"
 pi_guid = "0.1"
 pi_bon = "0.2"

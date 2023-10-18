@@ -1,12 +1,14 @@
 #![feature(fn_traits)]
 #![feature(unboxed_closures)]
+#![feature(once_cell)]
 
 use std::ops::Deref;
 use std::fmt::Debug;
 use std::hash::Hash;
-use std::cmp::Ordering as CmpOrdering;
 use std::convert::TryInto;
-use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+use std::cmp::Ordering as CmpOrdering;
+use std::sync::{Arc,
+                atomic::{AtomicUsize, Ordering}};
 
 use futures::{future::BoxFuture,
               stream::BoxStream};
@@ -440,6 +442,11 @@ impl<
         )))
     }
 
+    /// 获取键值对数据库事务的提交确认器的提交日志记录器
+    pub fn commit_logger(&self) -> &Log {
+        &(self.0).1
+    }
+
     // 确认一个键值对数据库事务的子事务的异步提交已完成
     #[inline(always)]
     fn confirm_commited(&self, tid: Guid, cid: Guid) -> Result<(), KVTableTrError> {
@@ -462,6 +469,12 @@ impl<
                     .await {
                     //提交日志的确认错误
                     warn!("Confirm commit log failed, transaction_uid: {:?}, commit_uid: {:?}, reason: {:?}", tid, cid, e);
+                }
+                #[cfg(feature = "log_table_debug")]
+                {
+                    let event = TransactionDebugEvent::End(tid.clone(), cid.clone());
+                    let logger = transaction_debug_logger();
+                    logger.log(event);
                 }
             });
         }
@@ -499,4 +512,240 @@ impl KVTableTrError {
     pub fn level(&self) -> ErrorLevel {
         self.level.clone()
     }
+}
+
+
+
+
+
+
+use std::sync::OnceLock;
+static TRANSACTION_DEBUG_LOGGER: OnceLock<TransactionDebugLogger> = OnceLock::new();
+
+pub fn init_transaction_debug_logger<P: AsRef<Path>>(rt: MultiTaskRuntime<()>,
+                                                     path: P,
+                                                     interval: usize) {
+    let logger = TransactionDebugLogger::new(rt, path);
+    if let Ok(_) = TRANSACTION_DEBUG_LOGGER.set(logger.clone()) {
+        logger.startup(interval);
+    }
+}
+
+pub fn transaction_debug_logger<'a>() -> &'a TransactionDebugLogger {
+    TRANSACTION_DEBUG_LOGGER
+        .get()
+        .unwrap()
+}
+
+use pi_atom::Atom;
+use pi_async_transaction::manager_2pc::Transaction2PcStatus;
+pub enum TransactionDebugEvent {
+    Begin(Guid, Transaction2PcStatus, bool, bool, usize),   //事务开始
+    Commit(Guid, Guid, Transaction2PcStatus, usize, usize), //事务提交
+    CommitConfirm(Guid, Guid, Atom, bool, bool),            //事务提交确认
+    End(Guid, Guid),                                        //事务结束
+}
+
+use std::path::Path;
+use std::time::Instant;
+use crossbeam_channel::{Sender, Receiver, unbounded, bounded};
+use dashmap::{DashMap, mapref::entry::Entry};
+use pi_store::log_store::log_file::{LogFile, LogMethod};
+
+pub struct TransactionDebugLogger(Arc<InnerTransactionDebugLogger>);
+
+unsafe impl Send for TransactionDebugLogger {}
+unsafe impl Sync for TransactionDebugLogger {}
+
+impl Clone for TransactionDebugLogger {
+    fn clone(&self) -> Self {
+        TransactionDebugLogger(self.0.clone())
+    }
+}
+
+impl TransactionDebugLogger {
+    pub fn new<P: AsRef<Path>>(rt: MultiTaskRuntime<()>,
+                               path: P) -> Self {
+        let (sender, receiver) = unbounded();
+        let times = DashMap::new();
+        let rt_copy = rt.clone();
+        let (s, r) = bounded(1);
+        let path = path.as_ref().to_path_buf();
+        rt.spawn(async move {
+            let log = LogFile
+            ::open(rt_copy.clone(),
+                   path,
+                   8096,
+                   128 * 1024 * 1024,
+                   None)
+                .await
+                .unwrap();
+            s.send(log);
+        });
+        let log = r.recv().unwrap();
+
+        let inner = InnerTransactionDebugLogger {
+            rt,
+            sender,
+            receiver,
+            times,
+            log,
+        };
+
+        TransactionDebugLogger(Arc::new(inner))
+    }
+
+    pub fn log(&self, event: TransactionDebugEvent) {
+        self.0
+            .sender
+            .send(event);
+    }
+
+    pub fn startup(self, mut interval: usize) {
+        if interval < 1000 {
+            interval = 1000;
+        }
+
+        let logger = self.clone();
+        self.0.rt.spawn(async move {
+            loop {
+                let events: Vec<TransactionDebugEvent> = logger.0.receiver.try_iter().collect();
+
+                let mut log_id = 0;
+                for event in events {
+                    match event {
+                        TransactionDebugEvent::Begin(tid, status, writable, require_persistence, output_size) => {
+                            match logger.0.times.entry(tid.clone()) {
+                                Entry::Occupied(o) => {
+                                    //事务ID冲突
+                                    log_id = logger
+                                        .0
+                                        .log
+                                        .append(LogMethod::PlainAppend,
+                                                format!("{:?}", tid).as_bytes(),
+                                                format!("Transaction id conflict:\n\tstatus: {:?}\n\twritable: {:?}\n\trequire_persistence: {:?}\n\toutput_size: {:?}\n",
+                                                        status,
+                                                        writable,
+                                                        require_persistence,
+                                                        output_size).as_bytes());
+                                },
+                                Entry::Vacant(v) => {
+                                    log_id = logger
+                                        .0
+                                        .log
+                                        .append(LogMethod::PlainAppend,
+                                                format!("{:?}", tid).as_bytes(),
+                                                format!("Begin transaction:\n\tstatus: {:?}\n\twritable: {:?}\n\trequire_persistence: {:?}\n\toutput_size: {:?}\n",
+                                                        status,
+                                                        writable,
+                                                        require_persistence,
+                                                        output_size).as_bytes());
+                                    v.insert(Instant::now());
+                                },
+                            }
+                        },
+                        TransactionDebugEvent::Commit(tid, cid, status, childs_len, log_index) => {
+                            if let Some(item) = logger.0.times.get(&tid) {
+                                //事务存在
+                                let time = item.value().elapsed();
+                                log_id = logger
+                                    .0
+                                    .log
+                                    .append(LogMethod::PlainAppend,
+                                            format!("{:?}", tid).as_bytes(),
+                                            format!("Commit transaction successed:\n\tlog_index: {:?}\n\tcid: {:?}\n\tstatus: {:?}\n\tchilds_len: {:?}\n\ttime: {:?}\n",
+                                                    log_index,
+                                                    cid,
+                                                    status,
+                                                    childs_len,
+                                                    time).as_bytes());
+                            } else {
+                                log_id = logger
+                                    .0
+                                    .log
+                                    .append(LogMethod::PlainAppend,
+                                            format!("{:?}", tid).as_bytes(),
+                                            format!("Commit transaction failed, transaction not exist:\n\tlog_index: {:?}\n\tcid: {:?}\n\tstatus: {:?}\n\tchilds_len: {:?}\n",
+                                                    log_index,
+                                                    cid,
+                                                    status,
+                                                    childs_len).as_bytes());
+                            }
+                        },
+                        TransactionDebugEvent::CommitConfirm(tid, cid, table, writable, require_persistence) => {
+                            if let Some(item) = logger.0.times.get(&tid) {
+                                //事务存在
+                                let time = item.value().elapsed();
+                                log_id = logger
+                                    .0
+                                    .log
+                                    .append(LogMethod::PlainAppend,
+                                            format!("{:?}", tid).as_bytes(),
+                                            format!("Commit confirm transaction successed:\n\tcid: {:?}\n\ttable: {:?}\n\twritable: {:?}\n\trequire_persistence: {:?}\n\ttime: {:?}\n",
+                                                    cid,
+                                                    table.as_str(),
+                                                    writable,
+                                                    require_persistence,
+                                                    time).as_bytes());
+                            } else {
+                                log_id = logger
+                                    .0
+                                    .log
+                                    .append(LogMethod::PlainAppend,
+                                            format!("{:?}", tid).as_bytes(),
+                                            format!("Commit confirm transaction failed, transaction not exist:\n\tcid: {:?}\n\ttable: {:?}\n\twritable: {:?}\n\trequire_persistence: {:?}\n",
+                                                    cid,
+                                                    table,
+                                                    writable,
+                                                    require_persistence).as_bytes());
+                            }
+                        },
+                        TransactionDebugEvent::End(tid, cid) => {
+                            if let Some((_tid, now)) = logger.0.times.remove(&tid) {
+                                //事务存在
+                                let time = now.elapsed();
+                                log_id = logger
+                                    .0
+                                    .log
+                                    .append(LogMethod::PlainAppend,
+                                            format!("{:?}", tid).as_bytes(),
+                                            format!("End transaction:\n\tcid: {:?}\n\ttime: {:?}\n",
+                                                    cid,
+                                                    time).as_bytes());
+                            } else {
+                                log_id = logger
+                                    .0
+                                    .log
+                                    .append(LogMethod::PlainAppend,
+                                            format!("{:?}", tid).as_bytes(),
+                                            format!("End transaction failed, transaction not exist:\n\tcid: {:?}\n",
+                                                    cid).as_bytes());
+                            }
+                        },
+                    }
+                }
+
+                let _ = logger
+                    .0
+                    .log
+                    .commit(log_id,
+                            false,
+                            false,
+                            Some(10000)).await;
+                logger
+                    .0
+                    .rt
+                    .timeout(interval)
+                    .await;
+            }
+        });
+    }
+}
+
+struct InnerTransactionDebugLogger {
+    rt:         MultiTaskRuntime<()>,               //运行时
+    sender:     Sender<TransactionDebugEvent>,      //事务事件发送器
+    receiver:   Receiver<TransactionDebugEvent>,    //事务事件接收器
+    times:      DashMap<Guid, Instant>,             //事务时间表
+    log:        LogFile,                            //日志文件
 }
