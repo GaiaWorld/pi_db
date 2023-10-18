@@ -589,6 +589,7 @@ impl<
                         let event = TransactionDebugEvent::Commit(tr.get_transaction_uid().unwrap(),
                                                                   tr.get_commit_uid().unwrap(),
                                                                   tr.get_status(),
+                                                                  tr.0.table.name(),
                                                                   size,
                                                                   current_check_point);
                         let logger = transaction_debug_logger();

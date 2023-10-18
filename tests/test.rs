@@ -4267,6 +4267,7 @@ fn test_log_table_debug() {
 
     init_transaction_debug_logger(rt.clone(),
                                   "./db/log_table_debug",
+                                  10000,
                                   10000);
 
     rt.spawn(async move {

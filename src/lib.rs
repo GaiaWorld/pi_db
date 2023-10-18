@@ -524,10 +524,11 @@ static TRANSACTION_DEBUG_LOGGER: OnceLock<TransactionDebugLogger> = OnceLock::ne
 
 pub fn init_transaction_debug_logger<P: AsRef<Path>>(rt: MultiTaskRuntime<()>,
                                                      path: P,
-                                                     interval: usize) {
+                                                     interval: usize,
+                                                     timeout:  usize) {
     let logger = TransactionDebugLogger::new(rt, path);
     if let Ok(_) = TRANSACTION_DEBUG_LOGGER.set(logger.clone()) {
-        logger.startup(interval);
+        logger.startup(interval, timeout);
     }
 }
 
@@ -540,10 +541,10 @@ pub fn transaction_debug_logger<'a>() -> &'a TransactionDebugLogger {
 use pi_atom::Atom;
 use pi_async_transaction::manager_2pc::Transaction2PcStatus;
 pub enum TransactionDebugEvent {
-    Begin(Guid, Transaction2PcStatus, bool, bool, usize),   //事务开始
-    Commit(Guid, Guid, Transaction2PcStatus, usize, usize), //事务提交
-    CommitConfirm(Guid, Guid, Atom, bool, bool),            //事务提交确认
-    End(Guid, Guid),                                        //事务结束
+    Begin(Guid, Transaction2PcStatus, bool, bool, usize),           //事务开始
+    Commit(Guid, Guid, Transaction2PcStatus, Atom, usize, usize),   //事务提交
+    CommitConfirm(Guid, Guid, Atom, bool, bool),                    //事务提交确认
+    End(Guid, Guid),                                                //事务结束
 }
 
 use std::path::Path;
@@ -601,9 +602,14 @@ impl TransactionDebugLogger {
             .send(event);
     }
 
-    pub fn startup(self, mut interval: usize) {
+    pub fn startup(self,
+                   mut interval: usize,
+                   mut timeout: usize) {
         if interval < 1000 {
             interval = 1000;
+        }
+        if timeout < 1000 {
+            timeout = 1000;
         }
 
         let logger = self.clone();
@@ -644,7 +650,7 @@ impl TransactionDebugLogger {
                                 },
                             }
                         },
-                        TransactionDebugEvent::Commit(tid, cid, status, childs_len, log_index) => {
+                        TransactionDebugEvent::Commit(tid, cid, status, table, actions_len, log_index) => {
                             if let Some(item) = logger.0.times.get(&tid) {
                                 //事务存在
                                 let time = item.value().elapsed();
@@ -653,11 +659,12 @@ impl TransactionDebugLogger {
                                     .log
                                     .append(LogMethod::PlainAppend,
                                             format!("{:?}", tid).as_bytes(),
-                                            format!("Commit transaction successed:\n\tlog_index: {:?}\n\tcid: {:?}\n\tstatus: {:?}\n\tchilds_len: {:?}\n\ttime: {:?}\n",
+                                            format!("Commit transaction successed:\n\tlog_index: {:?}\n\tcid: {:?}\n\tstatus: {:?}\n\ttable: {:?}\n\tactions_len: {:?}\n\ttime: {:?}\n",
                                                     log_index,
                                                     cid,
                                                     status,
-                                                    childs_len,
+                                                    table.as_str(),
+                                                    actions_len,
                                                     time).as_bytes());
                             } else {
                                 log_id = logger
@@ -665,11 +672,12 @@ impl TransactionDebugLogger {
                                     .log
                                     .append(LogMethod::PlainAppend,
                                             format!("{:?}", tid).as_bytes(),
-                                            format!("Commit transaction failed, transaction not exist:\n\tlog_index: {:?}\n\tcid: {:?}\n\tstatus: {:?}\n\tchilds_len: {:?}\n",
+                                            format!("Commit transaction failed, transaction not exist:\n\tlog_index: {:?}\n\tcid: {:?}\n\tstatus: {:?}\n\ttable: {:?}\n\tactions_len: {:?}\n",
                                                     log_index,
                                                     cid,
                                                     status,
-                                                    childs_len).as_bytes());
+                                                    table.as_str(),
+                                                    actions_len).as_bytes());
                             }
                         },
                         TransactionDebugEvent::CommitConfirm(tid, cid, table, writable, require_persistence) => {
@@ -731,7 +739,7 @@ impl TransactionDebugLogger {
                     .commit(log_id,
                             false,
                             false,
-                            Some(10000)).await;
+                            Some(timeout)).await;
                 logger
                     .0
                     .rt
