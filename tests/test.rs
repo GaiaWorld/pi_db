@@ -1,11 +1,15 @@
 use std::time::Instant;
+use std::path::PathBuf;
+use std::io::{Error, Result as IOResult, ErrorKind};
+use std::collections::{HashMap,
+                       btree_map::{BTreeMap, Entry}};
 
 use futures::stream::StreamExt;
 use crossbeam_channel::{unbounded, bounded};
 use env_logger;
 
 use pi_atom::Atom;
-use pi_guid::GuidGen;
+use pi_guid::{GuidGen, Guid};
 use pi_sinfo::EnumType;
 use pi_bon::{WriteBuffer, ReadBuffer, Encode, Decode, ReadBonErr};
 use pi_time::run_nanos;
@@ -13,7 +17,7 @@ use pi_async_rt::rt::{AsyncRuntime, startup_global_time_loop,
                       multi_thread::MultiTaskRuntimeBuilder};
 use pi_async_transaction::{ErrorLevel, Transaction2Pc,
                            manager_2pc::Transaction2PcManager};
-use pi_store::{log_store::log_file::{LogFile, LogMethod},
+use pi_store::{log_store::log_file::{PairLoader, LogFile, LogMethod},
                commit_logger::CommitLoggerBuilder};
 
 use pi_db::{Binary,
@@ -4614,6 +4618,347 @@ fn test_log_table_debug() {
     });
 
     thread::sleep(Duration::from_millis(1000000000));
+}
+
+#[test]
+fn test_append_new_commit_log() {
+    use std::thread;
+    use std::time::Duration;
+
+    env_logger::init();
+
+    let _handle = startup_global_time_loop(10);
+    let builder = MultiTaskRuntimeBuilder::default();
+    let rt = builder.build();
+    let rt_copy = rt.clone();
+
+    rt.spawn(async move {
+        let guid_gen = GuidGen::new(run_nanos(), 0);
+        let commit_logger_builder = CommitLoggerBuilder::new(rt_copy.clone(), "./db/.commit_log");
+        let commit_logger = commit_logger_builder
+            .build()
+            .await
+            .unwrap();
+
+        let tr_mgr = Transaction2PcManager::new(rt_copy.clone(),
+                                                guid_gen,
+                                                commit_logger);
+
+        let mut builder = KVDBManagerBuilder::new(rt_copy.clone(), tr_mgr, "./db");
+        match builder.startup().await {
+            Err(e) => {
+                panic!(e);
+            },
+            Ok(db) => {
+                println!("!!!!!!db table size: {:?}", db.table_size().await);
+
+                let table_name = Atom::from("test_log");
+                let tr = db.transaction(table_name.clone(), true, 500, 500).unwrap();
+                if let Err(e) = tr.create_table(table_name.clone(),
+                                                KVTableMeta::new(KVDBTableType::LogOrdTab,
+                                                                 true,
+                                                                 EnumType::U8,
+                                                                 EnumType::Str)).await {
+                    //创建有序内存表失败
+                    println!("!!!!!!create log ordered table failed, reason: {:?}", e);
+                }
+                let output = tr.prepare_modified().await.unwrap();
+                let _ = tr.commit_modified(output).await;
+
+                println!("!!!!!!db table size: {:?}", db.table_size().await);
+
+                //查询表信息
+                rt_copy.timeout(1500).await;
+                println!("");
+
+                println!("!!!!!!test_log is exist: {:?}", db.is_exist(&table_name).await);
+                println!("!!!!!!test_log is ordered table: {:?}", db.is_ordered_table(&table_name).await);
+                println!("!!!!!!test_log is persistent table: {:?}", db.is_persistent_table(&table_name).await);
+                println!("!!!!!!test_log table_dir: {:?}", db.table_path(&table_name).await);
+                println!("!!!!!!test_log table len: {:?}", db.table_record_size(&table_name).await);
+
+                //操作数据库事务
+                rt_copy.timeout(1500).await;
+                println!("");
+
+                let tr = db.transaction(Atom::from("test log table"), true, 500, 500).unwrap();
+
+                let _new_index = db.append_new_commit_log().await.unwrap();
+                let new_index = db.append_new_commit_log().await.unwrap();
+                println!("!!!!!!append new commit log ok, new_index: {}", new_index);
+
+                let r = tr.upsert(vec![
+                    TableKV {
+                        table: table_name.clone(),
+                        key: u8_to_binary(0),
+                        value: Some(Binary::new("Hello World!".as_bytes().to_vec()))
+                    }
+                ]).await;
+                println!("!!!!!!upsert result: {:?}", r);
+
+                rt_copy.timeout(1500).await;
+                println!("");
+
+                match tr.prepare_modified().await {
+                    Err(e) => {
+                        println!("prepare failed, reason: {:?}", e);
+                        if let Err(e) = tr.rollback_modified().await {
+                            println!("rollback failed, reason: {:?}", e);
+                        } else {
+                            println!("rollback ok for prepare");
+                        }
+                    },
+                    Ok(output) => {
+                        println!("prepare ok, output: {:?}", output);
+                        match tr.commit_modified(output).await {
+                            Err(e) => {
+                                println!("commit failed, reason: {:?}", e);
+                                if let ErrorLevel::Fatal = &e.level() {
+                                    println!("rollback failed, reason: commit fatal error");
+                                } else {
+                                    println!("rollbakc ok for commit");
+                                }
+                            },
+                            Ok(()) => {
+                                println!("commit ok");
+                            },
+                        }
+                    },
+                }
+            },
+        }
+    });
+
+    thread::sleep(Duration::from_millis(1000000000));
+}
+
+#[test]
+fn test_load_log_table_debug() {
+    use std::thread;
+    use std::time::Duration;
+
+    env_logger::init();
+
+    let _handle = startup_global_time_loop(10);
+    let builder = MultiTaskRuntimeBuilder::default();
+    let rt = builder.build();
+    let rt_copy = rt.clone();
+
+    rt.spawn(async move {
+        if let Ok(log) = LogFile::open(rt_copy,
+                                       "./tests/db/.log_table_debug",
+                                       8096,
+                                       128 * 1024 * 1024,
+                                       None)
+            .await {
+            let mut loader = LogTableDebugLoader::new();
+            match log.load_before(&mut loader,
+                                  None,
+                                  2 * 1024 * 1024,
+                                  true)
+                .await {
+                Err(e) => {
+                    println!("!!!!!!load failed, reason: {:?}", e);
+                },
+                Ok(_) => {
+                    println!("!!!!!!load ok, complated len: {}, incomplated len: {}",
+                             loader.complated.len(),
+                             loader.incomplated.len());
+                    for (tid, (_, index, _, _)) in loader.incomplated.iter() {
+                        println!("!!!!!!incomplated, tid: {:?}, log_index: {:?}", tid, index);
+                    }
+                },
+            }
+        }
+    });
+
+    thread::sleep(Duration::from_millis(1000000000));
+}
+
+struct LogTableDebugLoader {
+    log_path:       Option<PathBuf>,                                        //当前正在加载的日志文件路径
+    complated:      HashMap<Guid, (Guid, usize, usize, usize)>,             //完成的事务
+    incomplated:    BTreeMap<Guid, (Option<Guid>, usize, usize, usize)>,    //未完成的事务
+    buf:            Vec<(Vec<u8>, Vec<u8>)>,                                //当前加载完成的日志文件的缓冲
+}
+
+impl PairLoader for LogTableDebugLoader {
+    fn is_require(&self, _log_file: Option<&PathBuf>, _key: &Vec<u8>) -> bool {
+        //提交日志的所有日志都需要加载
+        true
+    }
+
+    fn load(&mut self,
+            log_file: Option<&PathBuf>,
+            _method: LogMethod,
+            key: Vec<u8>,
+            value: Option<Vec<u8>>) {
+        if let Some(log_file) = log_file {
+            if self.log_path.is_none() {
+                //正在加载首个日志文件的首个键值对，则设置当前正在加载的日志文件路径到提交日志加载器
+                self.log_path = Some(log_file.clone());
+            }
+
+            if self.log_path.as_ref().unwrap() != log_file {
+                //提交日志加载器正在加载的日志文件与正在加载的日志文件不相同，表示已加载完一个日志文件，则重置当前正在加载的日志文件路径到提交日志加载器
+                self.log_path = Some(log_file.clone());
+
+                //分析已加载完的事务跟踪日志
+                let mut is_remove = false;
+                while let Some((key, value)) = self.buf.pop() {
+                    //获取事务信息
+                    let key_string = String::from_utf8(key).unwrap();
+                    let vec: Vec<&str> = key_string.split("Guid(").collect();
+                    let vec: Vec<&str> = vec[1].split(")").collect();
+                    let tid = Guid(vec[0].parse().unwrap());
+                    match self.incomplated.entry(tid.clone()) {
+                        Entry::Occupied(mut o) => {
+                            //已存在
+                            let val = o.get_mut();
+                            if val.0.is_none() {
+                                let value_string = String::from_utf8(value).unwrap();
+                                if value_string.find("Commit transaction successed:\n\t").is_some() {
+                                    let vec_: Vec<&str> = value_string.split("\n\t").collect();
+                                    let cid = vec_[2]
+                                        .split("cid: Guid")
+                                        .collect::<Vec<&str>>()[1]
+                                        .trim_matches(|c| c == '(' || c == ')')
+                                        .parse()
+                                        .unwrap();
+                                    let log_index = vec_[1]
+                                        .split("log_index: ")
+                                        .collect::<Vec<&str>>()[1]
+                                        .parse()
+                                        .unwrap();
+                                    val.0 = Some(Guid(cid));
+                                    val.1 = log_index;
+                                    val.2 = 1;
+                                }
+                            } else {
+                                let value_string = String::from_utf8(value).unwrap();
+                                if value_string.find("Commit transaction successed:\n\t").is_some() {
+                                    let vec_: Vec<&str> = value_string.split("\n\t").collect();
+                                    let cid = vec_[2]
+                                        .split("cid: Guid")
+                                        .collect::<Vec<&str>>()[1]
+                                        .trim_matches(|c| c == '(' || c == ')')
+                                        .parse()
+                                        .unwrap();
+                                    let log_index = vec_[1]
+                                        .split("log_index: ")
+                                        .collect::<Vec<&str>>()[1]
+                                        .parse::<usize>()
+                                        .unwrap();
+                                    if val.0.as_ref().unwrap() == &Guid(cid) {
+                                        if val.1 == log_index {
+                                            val.2 += 1;
+                                        } else {
+                                            panic!("Load commit transaction log failed, tid: {:?}, log_index: {:?}, current: {:?}, reason: not matched log_index",
+                                                   tid,
+                                                   val.1,
+                                                   log_index);
+                                        }
+                                    } else {
+                                        panic!("Load commit transaction log failed, tid: {:?}, cid: {:?}, current: {:?}, reason: not matched cid",
+                                               tid,
+                                               val.0.as_ref(),
+                                               &cid);
+                                    }
+                                } else if value_string.find("Commit confirm transaction successed:\n\t").is_some() {
+                                    let vec_: Vec<&str> = value_string.split("\n\t").collect();
+                                    let cid = vec_[1]
+                                        .split("cid: Guid")
+                                        .collect::<Vec<&str>>()[1]
+                                        .trim_matches(|c| c == '(' || c == ')')
+                                        .parse()
+                                        .unwrap();
+                                    if val.0.as_ref().unwrap() == &Guid(cid) {
+                                        val.3 += 1;
+                                    } else {
+                                        panic!("Load commit confirm transaction failed, tid: {:?}, cid: {:?}, current: {:?}, reason: not matched cid",
+                                               tid,
+                                               val.0.as_ref(),
+                                               &cid);
+                                    }
+                                } else if value_string.find("End transaction:\n\t").is_some() {
+                                    let vec_: Vec<&str> = value_string.split("\n\t").collect();
+                                    let cid = vec_[1]
+                                        .split("cid: Guid")
+                                        .collect::<Vec<&str>>()[1]
+                                        .trim_matches(|c| c == '(' || c == ')')
+                                        .parse()
+                                        .unwrap();
+                                    if val.0.as_ref().unwrap() == &Guid(cid) {
+                                        if val.2 == val.3 {
+                                            self.complated.insert(tid.clone(), (Guid(cid), val.1, val.2, val.3));
+                                            is_remove = true;
+                                        } else {
+                                            panic!("Load end transaction failed, tid: {:?}, len: {:?}, current: {:?}, reason: not matched table size",
+                                                   tid,
+                                                   val.2,
+                                                   val.3);
+                                        }
+                                    } else {
+                                        panic!("Load end transaction failed, tid: {:?}, cid: {:?}, current: {:?}, reason: not matched cid",
+                                               tid,
+                                               val.0.as_ref(),
+                                               &cid);
+                                    }
+                                }
+                            }
+                        },
+                        Entry::Vacant(v) => {
+                            //未存在
+                            let value_string = String::from_utf8(value).unwrap();
+                            if value_string.find("Begin transaction:\n\t").is_some() {
+                                let vec_: Vec<&str> = value_string.split("\n\t").collect();
+                                let persistence = vec_[3]
+                                    .split("require_persistence: ")
+                                    .collect::<Vec<&str>>()[1];
+                                if persistence == "true" {
+                                    //只记录需要持久化的事务
+                                    v.insert((None, 0, 0, 0));
+                                }
+                            }
+                        },
+                    }
+
+                    if is_remove {
+                        //从未完成事务表中移除已完成的事务
+                        let _ = self.incomplated.remove(&tid);
+                        is_remove = false;
+                    }
+                }
+            }
+
+            if let Some(val) = value {
+                //缓冲当前日志文件中有值的事务
+                self.buf.push((key, val));
+            }
+        }
+    }
+}
+
+impl LogTableDebugLoader {
+    /// 构建一个事务跟踪日志加载器
+    pub fn new() -> Self {
+        LogTableDebugLoader {
+            log_path: None,
+            complated: HashMap::new(),
+            incomplated: BTreeMap::new(),
+            buf: Vec::new(),
+        }
+    }
+
+    /// 获取已完成事务表
+    pub fn complated(&self) -> &HashMap<Guid, (Guid, usize, usize, usize)> {
+        &self.complated
+    }
+
+    /// 获取未完成事务表
+    pub fn incomplated(&self) -> &BTreeMap<Guid, (Option<Guid>, usize, usize, usize)> {
+        &self.incomplated
+    }
 }
 
 // 将u8序列化为二进制数据
