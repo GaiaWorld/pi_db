@@ -386,7 +386,7 @@ impl<
 
     /// 异步获取指定名称的数据表所在目录的路径，返回空表示指定名称的表不存在
     pub async fn table_path(&self, table_name: &Atom) -> Option<PathBuf> {
-        match self.0.tables.read().await.get(&table_name) {
+        match self.0.tables.read().await.get(table_name) {
             None => None,
             Some(KVDBTable::MetaTab(table)) => {
                 if let Some(path) = table.path() {
@@ -421,7 +421,7 @@ impl<
 
     /// 异步判断指定名称的数据表是否可持久化，返回空表示指定名称的表不存在
     pub async fn is_persistent_table(&self, table_name: &Atom) -> Option<bool> {
-        match self.0.tables.read().await.get(&table_name) {
+        match self.0.tables.read().await.get(table_name) {
             None => None,
             Some(KVDBTable::MetaTab(table)) => {
                 Some(table.is_persistent())
@@ -440,7 +440,7 @@ impl<
 
     /// 异步判断指定名称的数据表是否有序，返回空表示指定名称的表不存在
     pub async fn is_ordered_table(&self, table_name: &Atom) -> Option<bool> {
-        match self.0.tables.read().await.get(&table_name) {
+        match self.0.tables.read().await.get(table_name) {
             None => None,
             Some(KVDBTable::MetaTab(table)) => {
                 Some(table.is_ordered())
@@ -459,7 +459,7 @@ impl<
 
     /// 异步获取指定名称的数据表的记录数，返回空表示指定名称的表不存在
     pub async fn table_record_size(&self, table_name: &Atom) -> Option<usize> {
-        match self.0.tables.read().await.get(&table_name) {
+        match self.0.tables.read().await.get(table_name) {
             None => None,
             Some(KVDBTable::MetaTab(table)) => {
                 Some(table.len())
@@ -484,7 +484,7 @@ impl<
 
     /// 异步准备整理指定名称的数据表，准备整理成功，才允许开始整理表
     pub async fn ready_collect_table(&self, table_name: &Atom) -> IOResult<()> {
-        match self.0.tables.read().await.get(&table_name) {
+        match self.0.tables.read().await.get(table_name) {
             None => (),
             Some(KVDBTable::MetaTab(table)) => {
                 if let Err(e) = table.ready_collect().await {
@@ -513,7 +513,7 @@ impl<
 
     /// 异步整理指定名称的数据表
     pub async fn collect_table(&self, table_name: &Atom) -> IOResult<()> {
-        match self.0.tables.read().await.get(&table_name) {
+        match self.0.tables.read().await.get(table_name) {
             None => (),
             Some(KVDBTable::MetaTab(table)) => {
                 if let Err(e) = table.collect().await {

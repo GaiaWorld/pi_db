@@ -5,7 +5,6 @@
 use std::ops::Deref;
 use std::fmt::Debug;
 use std::hash::Hash;
-use std::convert::TryInto;
 use std::cmp::Ordering as CmpOrdering;
 use std::sync::{Arc,
                 atomic::{AtomicUsize, Ordering}};
