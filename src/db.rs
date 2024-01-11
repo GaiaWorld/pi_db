@@ -11,7 +11,7 @@ use async_lock::RwLock;
 use dashmap::DashMap;
 use lazy_static::lazy_static;
 use bytes::BufMut;
-use log::info;
+use log::{info, error};
 
 #[cfg(feature = "trace")]
 use tracing::Instrument;
@@ -2630,6 +2630,8 @@ impl<
                 }
             } else {
                 //指定名称的表不存在
+                error!("Upsert table failed, table: {:?}, reason: table not exist",
+                    &table_kv.table.as_str());
                 return Err(KVTableTrError::new_transaction_error(ErrorLevel::Fatal,
                                                                  format!("Upsert table failed, table: {:?}, reason: table not exist",
                                                                      &table_kv.table.as_str())));
