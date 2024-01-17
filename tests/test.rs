@@ -4850,7 +4850,7 @@ impl PairLoader for LogTableDebugLoader {
                                         .parse::<usize>()
                                         .unwrap();
                                     if val.0.as_ref().unwrap() == &Guid(cid) {
-                                        if val.1 == log_index {
+                                        if val.1 <= log_index {
                                             val.2 += 1;
                                         } else {
                                             panic!("Load commit transaction log failed, tid: {:?}, log_index: {:?}, current: {:?}, reason: not matched log_index",
