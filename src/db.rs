@@ -12,6 +12,8 @@ use dashmap::DashMap;
 use lazy_static::lazy_static;
 use bytes::BufMut;
 use log::info;
+#[cfg(target_os = "linux")]
+use libc::malloc_trim;
 
 #[cfg(feature = "trace")]
 use tracing::Instrument;
@@ -332,6 +334,17 @@ impl<
         };
 
         Some(KVDBTransaction::RootTr(RootTransaction(Arc::new(inner))))
+    }
+
+    ///
+    /// 在整理数据表后清理内存缓冲区
+    ///
+    #[cfg(target_os = "linux")]
+    pub fn cleanup_buffer_after_collect_table(&self) -> bool {
+        match malloc_trim(0) {
+            0 => false,
+            _ => true,
+        }
     }
 
     ///
