@@ -1,6 +1,6 @@
 [package]
 name = "pi_db"
-version = "0.6.2"
+version = "0.7.0"
 authors = ["vmos <vmosone007@gmail.com>"]
 edition = "2018"
 description = "Full cache based database，support transaction"
@@ -21,12 +21,12 @@ async-lock = "3.0"
 async-stream = "0.3"
 bytes = "1.5"
 dashmap = "5.5"
+pi_atom = "0.5"
 log = "0.4"
 pi-async-rt = "0.1"
 pi_async_file = "0.6"
 pi_async_transaction = "0.6"
 pi_store = "0.6"
-pi_atom = "0.5"
 pi_guid = "0.1"
 pi_bon = "0.2"
 pi_sinfo = "0.2"
@@ -38,6 +38,9 @@ tracing-opentelemetry = { version = "0.18", optional = true }
 tracing = { version = "0.1", optional = true }
 tracing-subscriber = { version = "0.3", optional = true }
 lazy_static = "1.4"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "~0.2"
 
 [dev-dependencies]
 crossbeam-channel = "0.5"
