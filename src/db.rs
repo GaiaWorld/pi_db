@@ -341,7 +341,7 @@ impl<
     ///
     #[cfg(target_os = "linux")]
     pub fn cleanup_buffer_after_collect_table(&self) -> bool {
-        match malloc_trim(0) {
+        match unsafe { malloc_trim(0) } {
             0 => false,
             _ => true,
         }
