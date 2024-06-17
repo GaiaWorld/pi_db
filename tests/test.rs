@@ -29,6 +29,44 @@ use pi_db::{Binary,
             inspector::{CommitLogInspector, LogTableInspector}};
 
 #[test]
+fn test_table_meta() {
+    use std::sync::Arc;
+    use pi_sinfo::{EnumType, StructInfo, FieldInfo};
+
+    let name = Atom::from("Hello");
+    let name_hash = name.str_hash() as u32;
+    let mut struct_info = StructInfo::new(Atom::from("Hello"), name_hash);
+    let mut map = HashMap::new();
+    map.insert(Atom::from("default"), Atom::from(""));
+    let field_info = FieldInfo {
+        name: Atom::from("name"),
+        ftype: EnumType::Str,
+        notes: Some(map),
+        is_ignore_name: false,
+        is_ignore_ftype: false,
+        is_ignore_notes: true,
+    };
+    struct_info.fields = vec![field_info];
+    let meta0 = EnumType::Struct(Arc::new(struct_info));
+
+    let mut struct_info = StructInfo::new(Atom::from("Hello"), name_hash);
+    let mut map = HashMap::new();
+    map.insert(Atom::from("default"), Atom::from("hello"));
+    let field_info = FieldInfo {
+        name: Atom::from("name"),
+        ftype: EnumType::Str,
+        notes: Some(map),
+        is_ignore_name: false,
+        is_ignore_ftype: false,
+        is_ignore_notes: true,
+    };
+    struct_info.fields = vec![field_info];
+    let meta1 = EnumType::Struct(Arc::new(struct_info));
+
+    assert_eq!(meta0, meta1);
+}
+
+#[test]
 fn test_memory_table() {
     use std::thread;
     use std::time::Duration;
