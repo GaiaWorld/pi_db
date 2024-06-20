@@ -1,6 +1,5 @@
 use std::time::Instant;
 use std::path::PathBuf;
-use std::io::{Error, Result as IOResult, ErrorKind};
 use std::collections::{HashMap,
                        btree_map::{BTreeMap, Entry}};
 
@@ -894,12 +893,13 @@ fn test_load_log_table() {
                                                 commit_logger);
 
         let mut builder = KVDBManagerBuilder::new(rt_copy.clone(), tr_mgr, "./db");
+        let now = Instant::now();
         match builder.startup().await {
             Err(e) => {
                 panic!(e);
             },
             Ok(db) => {
-                println!("!!!!!!db table size: {:?}", db.table_size().await);
+                println!("!!!!!!db table size: {:?}, time: {:?}", db.table_size().await, now.elapsed());
 
                 let table_name = Atom::from("test_log");
                 let tr = db.transaction(table_name.clone(), true, 500, 500).unwrap();

@@ -1,3 +1,4 @@
+use std::mem::swap;
 use std::time::Instant;
 use std::convert::TryInto;
 use std::path::{Path, PathBuf};
@@ -30,7 +31,7 @@ use pi_atom::Atom;
 use pi_bon::{WriteBuffer, ReadBuffer, Encode, Decode, ReadBonErr};
 use pi_guid::Guid;
 use pi_async_rt::{lock::spin_lock::SpinLock,
-                  rt::{AsyncRuntime,
+                  rt::{AsyncRuntime, AsyncValueNonBlocking,
                        multi_thread::MultiTaskRuntime}};
 use pi_async_transaction::{AsyncTransaction, Transaction2Pc, UnitTransaction, SequenceTransaction, TransactionTree, AsyncCommitLog, ErrorLevel, TransactionError,
                            manager_2pc::{Transaction2PcStatus, Transaction2PcManager}};
@@ -201,6 +202,10 @@ impl<
                     false)
             .await
             .unwrap();
+        let mut table_metas_buf = Vec::with_capacity(8192);
+        let default_options = CreateTableOptions::LogOrdTab(512 * 1024 * 1024,
+                                                            2 * 1024 * 1024,
+                                                            2 * 1024 * 1024);
         while let Some((key, value)) = meta_iterator.next().await {
             let table_name = match binary_to_table(&key) {
                 Err(e) => {
@@ -219,10 +224,37 @@ impl<
             }
             let table_meta = KVTableMeta::from(value);
 
-            if let Err(e) = tr.create_table(table_name.clone(), table_meta.clone()).await {
+            if table_metas_buf.len() < 8192 {
+                //填充表元信息，并继续迭代下一个表元信息
+                if let KVDBTableType::LogOrdTab = table_meta.table_type() {
+                    table_metas_buf.push((table_name, table_meta, Some(default_options.clone())));
+                } else {
+                    table_metas_buf.push((table_name, table_meta, None));
+                }
+                continue;
+            }
+            let mut table_metas = Vec::with_capacity(table_metas_buf.len());
+            swap(&mut table_metas_buf, &mut table_metas);
+
+            //异步批量创建表
+            if let Err(e) = tr.create_multiple_tables(table_metas, true).await {
                 //加载指定的表失败，则立即返回错误原因
                 db_mgr.0.status.store(DB_UNSTARTUP_STATUS, Ordering::SeqCst);
-                return Err(Error::new(ErrorKind::Other, format!("Load table failed, tables_path: {:?}, table: {:?}, meta: {:?}, reason: {:?}", db_mgr.tables_path(), table_name, table_meta, e)));
+                return Err(Error::new(ErrorKind::Other,
+                                      format!("Load table failed, tables_path: {:?}, reason: {:?}",
+                                              db_mgr.tables_path(),
+                                              e)));
+            }
+        }
+        if table_metas_buf.len() > 0 {
+            //异步批量创建剩余的表
+            if let Err(e) = tr.create_multiple_tables(table_metas_buf, true).await {
+                //加载指定的表失败，则立即返回错误原因
+                db_mgr.0.status.store(DB_UNSTARTUP_STATUS, Ordering::SeqCst);
+                return Err(Error::new(ErrorKind::Other,
+                                      format!("Load table failed, tables_path: {:?}, reason: {:?}",
+                                              db_mgr.tables_path(),
+                                              e)));
             }
         }
 
@@ -1493,6 +1525,20 @@ impl<
         }
     }
 
+    /// 异步批量创建表，只允许在初始化加载表时使用
+    pub(crate) async fn create_multiple_tables(&self,
+                                               table_metas: Vec<(Atom, KVTableMeta, Option<CreateTableOptions>)>,
+                                               is_checksum: bool)
+        -> IOResult<()>
+    {
+        match self {
+            KVDBTransaction::RootTr(tr) => {
+                tr.create_multiple_tables(table_metas, is_checksum).await
+            },
+            _ => panic!("Create multiple table failed, reason: invalid root transaction"),
+        }
+    }
+
     /// 异步修复创建表，需要指定表名和表的元信息
     pub(crate) async fn repair_create_table(&self,
                                             name: Atom,
@@ -2083,7 +2129,8 @@ impl<
     async fn create_table_with_options(&self,
                                        name: Atom,
                                        meta: KVTableMeta,
-                                       options: CreateTableOptions) -> IOResult<()> {
+                                       options: CreateTableOptions) -> IOResult<()>
+    {
         //检查待创建的指定名称的表是否存在
         let meta_table_name = Atom::from(DEFAULT_DB_TABLES_META_DIR);
         let mut tables = self.0.db_mgr.0.tables.write().await;
@@ -2235,7 +2282,8 @@ impl<
     #[inline]
     async fn create_table(&self,
                           name: Atom,
-                          meta: KVTableMeta) -> IOResult<()> {
+                          meta: KVTableMeta) -> IOResult<()>
+    {
         self.create_table_with_options(name,
                                        meta,
                                        CreateTableOptions::LogOrdTab(512 * 1024 * 1024,
@@ -2243,11 +2291,237 @@ impl<
                                                                      2 * 1024 * 1024)).await
     }
 
+    /// 异步创建指定的多个表，表名可以是用文件分隔符分隔的路径，但必须是相对路径，且不允许使用".."
+    async fn create_multiple_tables(&self,
+                                    table_metas: Vec<(Atom, KVTableMeta, Option<CreateTableOptions>)>,
+                                    is_checksum: bool)
+        -> IOResult<()>
+    {
+        //创建表的操作，一定会创建元信息表事务，而元信息表事务是需要持久化的事务，则根事务也设置为需要持久化
+        self.require_persistence();
+
+        //检查待创建的指定名称的表是否存在
+        let mut require_create_tables = Vec::new();
+        let meta_table_name = Atom::from(DEFAULT_DB_TABLES_META_DIR);
+        {
+            let tables = self
+                .0
+                .db_mgr
+                .0
+                .tables
+                .read()
+                .await;
+
+            for (name, meta, options) in table_metas {
+                if tables.contains_key(&name) {
+                    //指定名称的表已存在
+                    if let Some(meta_table) = tables.get(&meta_table_name) {
+                        //元信息表存在，则获取元信息表事务，并查询指定表的元信息
+                        let mut childes_map = self.0.childs_map.lock();
+                        let meta_table_tr = if let Some(table_tr) = childes_map.get(&meta_table_name) {
+                            //元信息表的子事务存在
+                            table_tr.clone()
+                        } else {
+                            //元信息表的子事务不存在，则创建元信息表的事务，因为可能只是查询操作，所以初始化指定表的子事务为非持久化事务
+                            self.table_transaction(meta_table_name.clone(), meta_table, false, &mut *childes_map)
+                        };
+
+                        if let KVDBTransaction::MetaTabTr(tr) = &meta_table_tr {
+                            if let Some(value) = tr.query(table_to_binary(&name)).await {
+                                //指定名称的表的元信息存在
+                                let table_meta = KVTableMeta::from(value);
+                                if table_meta == meta {
+                                    //待创建表的名称与已存在的表相同，且元信息相同，则立即返回创建成功
+                                    return Ok(());
+                                } else {
+                                    //待创建表的名称与已存在的表相同，但元信息不同
+                                    if table_meta.is_persistence() {
+                                        match tables.get(&name) {
+                                            Some(KVDBTable::LogOrdTab(tab)) => {
+                                                if tab.len() > 0 {
+                                                    //已存在的同名表是持久化表，且元信息不同，且表中有记录，则表名冲突
+                                                    return Err(Error::new(ErrorKind::AlreadyExists,
+                                                                          format!("Create table failed, name: {:?}, meta: {:?}, reason: name conflict", name, meta)));
+                                                }
+                                            },
+                                            Some(KVDBTable::LogWTab(tab)) => {
+                                                if tab.len() > 0 {
+                                                    //已存在的同名表是持久化表，且元信息不同，且表中有记录，则表名冲突
+                                                    return Err(Error::new(ErrorKind::AlreadyExists,
+                                                                          format!("Create table failed, name: {:?}, meta: {:?}, reason: name conflict", name, meta)));
+                                                }
+                                            },
+                                            _ => (), //忽略内存表元信息的不同
+                                        }
+                                    }
+                                }
+                            } else {
+                                //指定名称的表的元信息不存在，则立即返回错误原因
+                                return Err(Error::new(ErrorKind::AlreadyExists,
+                                                      format!("Create table failed, name: {:?}, meta: {:?}, reason: name conflict and table meta not exist", name, meta)));
+                            }
+                        } else {
+                            //不是元信息表事务，则立即返回错误原因
+                            return Err(Error::new(ErrorKind::AlreadyExists,
+                                                  format!("Create table failed, name: {:?}, meta: {:?}, reason: invalid meta table transaction", name, meta)));
+                        }
+                    }
+                }
+
+                //记录需要创建的表
+                require_create_tables.push((name, meta, options));
+            }
+        }
+
+        //并发创建待创建的表
+        let result = AsyncValueNonBlocking::new();
+        let count = Arc::new(AtomicU64::new(require_create_tables.len() as u64));
+        for (name, meta, options) in require_create_tables.clone() {
+            let db_rt = self.0.db_mgr.0.rt.clone();
+            let tables_path = self
+                .0
+                .db_mgr
+                .0
+                .tables_path
+                .clone();
+            let tables = self
+                .0
+                .db_mgr
+                .0
+                .tables
+                .clone();
+            let result_copy = result.clone();
+            let count_copy = count.clone();
+
+            let _ = self.0.db_mgr.0.rt.spawn(async move {
+                //待创建的指定名称的表不存在，则创建指定名称的表，并将表的元信息注册到元信息表
+                match meta.table_type {
+                    KVDBTableType::MemOrdTab => {
+                        //创建一个有序内存表
+                        let table = MemoryOrderedTable::new(name.clone(),
+                                                            meta.persistence);
+
+                        //注册创建的有序内存表
+                        tables
+                            .write()
+                            .await
+                            .insert(name.clone(),
+                                    KVDBTable::MemOrdTab(table));
+                    },
+                    KVDBTableType::LogOrdTab => {
+                        //创建一个有序日志表
+                        let table_path = tables_path.join(name.as_str()); //通过键值对数据库的表所在目录的路径与表名，生成表所在目录的路径
+                        if let Some(CreateTableOptions::LogOrdTab(log_file_limit, block_limit, load_buf_len)) = options.clone() {
+                            //有序日志表的选项
+                            let table =
+                                LogOrderedTable::new(db_rt,
+                                                     table_path,
+                                                     name.clone(),
+                                                     log_file_limit,
+                                                     block_limit,
+                                                     None,
+                                                     load_buf_len as u64,
+                                                     is_checksum,
+                                                     16 * 1024 * 1024,
+                                                     60 * 1000).await;
+
+                            //注册创建的有序日志表
+                            tables
+                                .write()
+                                .await
+                                .insert(name.clone(),
+                                        KVDBTable::LogOrdTab(table));
+                        } else {
+                            //没有有序日志表的选项，则立即通知错误原因
+                            result_copy.set(Err(Error::new(ErrorKind::Other,
+                                                           format!("Create table failed, name: {:?}, meta: {:?}, options: {:?}, reason: invalid options",
+                                                                   name,
+                                                                   meta,
+                                                                   options))));
+                            return;
+                        }
+                    },
+                    KVDBTableType::LogWTab => {
+                        //创建一个只写日志表
+                        let table_path = tables_path.join(name.as_str()); //通过键值对数据库的表所在目录的路径与表名，生成表所在目录的路径
+                        let table =
+                            LogWriteTable::new(db_rt,
+                                               table_path,
+                                               name.clone(),
+                                               512 * 1024 * 1024,
+                                               2 * 1024 * 1024,
+                                               None,
+                                               2 * 1024 * 1024,
+                                               true,
+                                               16 * 1024 * 1024,
+                                               60 * 1000).await;
+
+                        //注册创建的只写日志表
+                        tables
+                            .write()
+                            .await
+                            .insert(name.clone(),
+                                    KVDBTable::LogWTab(table));
+                    },
+                }
+
+                if count_copy.fetch_sub(1, Ordering::AcqRel) <= 1 {
+                    //本次所有待创建的表都已创建成功，则立即通知创建成功
+                    result_copy.set(Ok(()));
+                }
+            });
+        }
+
+        //等待批量创建表全部成功
+        result.await?;
+
+        //注册表的元信息
+        let mut tables = self
+            .0
+            .db_mgr
+            .0
+            .tables
+            .write()
+            .await;
+        for (name, meta, _options) in require_create_tables {
+            if let Some(meta_table) = tables.get(&meta_table_name) {
+                let mut childes_map = self.0.childs_map.lock();
+                let meta_table_tr = if let Some(table_tr) = childes_map.get(&meta_table_name) {
+                    //元信息表的子事务存在，则设置子事务为需要持久化
+                    table_tr.require_persistence();
+                    table_tr.clone()
+                } else {
+                    //元信息表的子事务不存在，则创建元信息表的事务，因为需要创建表，所以初始化元信息表的子事务为持久化事务
+                    self.table_transaction(meta_table_name.clone(),
+                                           meta_table,
+                                           true,
+                                           &mut *childes_map)
+                };
+
+                if let KVDBTransaction::MetaTabTr(tr) = &meta_table_tr {
+                    if let Err(e) = tr.upsert(table_to_binary(&name),
+                                              Binary::from(meta.clone())).await {
+                        //写入表的元信息失败，则立即返回错误原因
+                        return Err(Error::new(ErrorKind::Other,
+                                              format!("Create table failed, name: {:?}, meta: {:?}, reason: {:?}", name, meta, e)));
+                    }
+                } else {
+                    //不是元信息表事务，则立即返回错误原因
+                    return Err(Error::new(ErrorKind::Other,
+                                          format!("Create table failed, name: {:?}, meta: {:?}, reason: invalid meta table transaction", name, meta)));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// 异步修复创建表，表名可以是用文件分隔符分隔的路径，但必须是相对路径，且不允许使用".."
     #[inline]
     async fn repair_create_table(&self,
                                  name: Atom,
-                                 meta: KVTableMeta) -> IOResult<()> {
+                                 meta: KVTableMeta) -> IOResult<()>
+    {
         //检查待创建的指定名称的表是否存在
         let meta_table_name = Atom::from(DEFAULT_DB_TABLES_META_DIR);
         let mut tables = self.0.db_mgr.0.tables.write().await;
