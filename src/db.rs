@@ -206,6 +206,7 @@ impl<
         let default_options = CreateTableOptions::LogOrdTab(512 * 1024 * 1024,
                                                             2 * 1024 * 1024,
                                                             2 * 1024 * 1024);
+        let now = Instant::now();
         while let Some((key, value)) = meta_iterator.next().await {
             let table_name = match binary_to_table(&key) {
                 Err(e) => {
@@ -257,6 +258,9 @@ impl<
                                               e)));
             }
         }
+        info!("Load db succeeded, tables: {:?}, time: {:?}",
+            db_mgr.table_size().await,
+            now.elapsed());
 
         //如果有未确认的提交日志，则尝试修复数据库表数据
         let now = Instant::now();
@@ -269,7 +273,7 @@ impl<
                 //尝试修复数据库表数据成功
                 if repaired_log_len > 0 {
                     //未确认的提交日志
-                    info!("Repair db ok, logs: {}, bytes: {}, time: {:?}",
+                    info!("Repair db succeeded, logs: {}, bytes: {}, time: {:?}",
                         repaired_log_len,
                         repaired_bytes_len,
                         now.elapsed());
@@ -278,7 +282,7 @@ impl<
         }
 
         db_mgr.0.status.store(DB_INITED_STATUS, Ordering::SeqCst); //设置数据库状态为已初始化
-        info!("Startup db ok, tables: {}", db_mgr.table_size().await);
+        info!("Startup db succeeded");
 
         Ok(db_mgr)
     }
