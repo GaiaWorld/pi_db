@@ -1,6 +1,8 @@
+#![feature(effects)]
 #![feature(fn_traits)]
-#![feature(unboxed_closures)]
 #![feature(once_cell)]
+#![feature(const_trait_impl)]
+#![feature(unboxed_closures)]
 
 use std::ops::Deref;
 use std::fmt::Debug;
@@ -207,6 +209,7 @@ pub enum KVDBTableType {
     MemOrdTab = 1,  //有序内存表
     LogOrdTab,      //有序日志表
     LogWTab,        //只写日志表
+    BtreeOrdTab,    //有序B树表
 }
 
 impl From<u8> for KVDBTableType {
@@ -215,6 +218,7 @@ impl From<u8> for KVDBTableType {
             1 => KVDBTableType::MemOrdTab,
             2 => KVDBTableType::LogOrdTab,
             3 => KVDBTableType::LogWTab,
+            4 => KVDBTableType::BtreeOrdTab,
             _ => panic!("From u8 to KVDBTableType failed, src: {}, reason: invalid src", src),
         }
     }

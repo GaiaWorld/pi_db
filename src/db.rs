@@ -54,7 +54,9 @@ use crate::{Binary,
                      log_ord_table::{LogOrderedTable,
                                      LogOrdTabTr},
                      log_write_table::{LogWriteTable,
-                                       LogWTabTr}},
+                                       LogWTabTr},
+                     b_tree_ord_table::{BtreeOrderedTable,
+                                        BtreeOrdTabTr}},
             utils::CreateTableOptions};
 
 ///
@@ -203,9 +205,11 @@ impl<
             .await
             .unwrap();
         let mut table_metas_buf = Vec::with_capacity(8192);
-        let default_options = CreateTableOptions::LogOrdTab(512 * 1024 * 1024,
-                                                            2 * 1024 * 1024,
-                                                            2 * 1024 * 1024);
+        let default_log_table_options = CreateTableOptions::LogOrdTab(512 * 1024 * 1024,
+                                                                      2 * 1024 * 1024,
+                                                                      2 * 1024 * 1024);
+        let default_b_tree_table_options = CreateTableOptions::BtreeOrdTab(16 * 1024 * 1024,
+                                                                           true);
         let now = Instant::now();
         while let Some((key, value)) = meta_iterator.next().await {
             let table_name = match binary_to_table(&key) {
@@ -227,10 +231,16 @@ impl<
 
             if table_metas_buf.len() < 8192 {
                 //填充表元信息，并继续迭代下一个表元信息
-                if let KVDBTableType::LogOrdTab = table_meta.table_type() {
-                    table_metas_buf.push((table_name, table_meta, Some(default_options.clone())));
-                } else {
-                    table_metas_buf.push((table_name, table_meta, None));
+                match table_meta.table_type() {
+                    KVDBTableType::LogOrdTab => {
+                        table_metas_buf.push((table_name, table_meta, Some(default_log_table_options.clone())));
+                    },
+                    KVDBTableType::BtreeOrdTab => {
+                        table_metas_buf.push((table_name, table_meta, Some(default_b_tree_table_options.clone())));
+                    },
+                    _ => {
+                        table_metas_buf.push((table_name, table_meta, None));
+                    },
                 }
                 continue;
             }
@@ -465,6 +475,13 @@ impl<
                     None
                 }
             },
+            Some(KVDBTable::BtreeOrdTab(table)) => {
+                if let Some(path) = table.path() {
+                    Some(path.to_path_buf())
+                } else {
+                    None
+                }
+            },
         }
     }
 
@@ -482,6 +499,9 @@ impl<
                 Some(table.is_persistent())
             },
             Some(KVDBTable::LogWTab(table)) => {
+                Some(table.is_persistent())
+            },
+            Some(KVDBTable::BtreeOrdTab(table)) => {
                 Some(table.is_persistent())
             },
         }
@@ -503,6 +523,9 @@ impl<
             Some(KVDBTable::LogWTab(table)) => {
                 Some(table.is_ordered())
             },
+            Some(KVDBTable::BtreeOrdTab(table)) => {
+                Some(table.is_ordered())
+            },
         }
     }
 
@@ -520,6 +543,9 @@ impl<
                 Some(table.len())
             },
             Some(KVDBTable::LogWTab(table)) => {
+                Some(table.len())
+            },
+            Some(KVDBTable::BtreeOrdTab(table)) => {
                 Some(table.len())
             },
         }
@@ -555,6 +581,11 @@ impl<
                     return Err(Error::new(ErrorKind::Other, format!("{:?}", e)));
                 }
             },
+            Some(KVDBTable::BtreeOrdTab(table)) => {
+                if let Err(e) = table.ready_collect().await {
+                    return Err(Error::new(ErrorKind::Other, format!("{:?}", e)));
+                }
+            },
         }
 
         Ok(())
@@ -580,6 +611,11 @@ impl<
                 }
             },
             Some(KVDBTable::LogWTab(table)) => {
+                if let Err(e) = table.collect().await {
+                    return Err(Error::new(ErrorKind::Other, format!("{:?}", e)));
+                }
+            },
+            Some(KVDBTable::BtreeOrdTab(table)) => {
                 if let Err(e) = table.collect().await {
                     return Err(Error::new(ErrorKind::Other, format!("{:?}", e)));
                 }
@@ -754,11 +790,12 @@ pub enum KVDBTransaction<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>,
 > {
-    RootTr(RootTransaction<C, Log>),    //键值对数据库的根事务
-    MetaTabTr(MetaTabTr<C, Log>),       //元信息表事务
-    MemOrdTabTr(MemOrdTabTr<C, Log>),   //有序内存表事务
-    LogOrdTabTr(LogOrdTabTr<C, Log>),   //有序日志表事务
-    LogWTabTr(LogWTabTr<C, Log>),       //只写日志表事务
+    RootTr(RootTransaction<C, Log>),        //键值对数据库的根事务
+    MetaTabTr(MetaTabTr<C, Log>),           //元信息表事务
+    MemOrdTabTr(MemOrdTabTr<C, Log>),       //有序内存表事务
+    LogOrdTabTr(LogOrdTabTr<C, Log>),       //有序日志表事务
+    LogWTabTr(LogWTabTr<C, Log>),           //只写日志表事务
+    BtreeOrdTabTr(BtreeOrdTabTr<C, Log>),   //有序B树表事务
 }
 
 unsafe impl<
@@ -794,6 +831,9 @@ impl<
             KVDBTransaction::LogWTabTr(tr) => {
                 tr.is_writable()
             },
+            KVDBTransaction::BtreeOrdTabTr(tr) => {
+                tr.is_writable()
+            }
         }
     }
 
@@ -813,6 +853,9 @@ impl<
                 tr.is_concurrent_commit()
             },
             KVDBTransaction::LogWTabTr(tr) => {
+                tr.is_concurrent_commit()
+            },
+            KVDBTransaction::BtreeOrdTabTr(tr) => {
                 tr.is_concurrent_commit()
             },
         }
@@ -836,6 +879,9 @@ impl<
             KVDBTransaction::LogWTabTr(tr) => {
                 tr.is_concurrent_rollback()
             },
+            KVDBTransaction::BtreeOrdTabTr(tr) => {
+                tr.is_concurrent_rollback()
+            },
         }
     }
 
@@ -854,6 +900,9 @@ impl<
                 tr.get_source()
             },
             KVDBTransaction::LogWTabTr(tr) => {
+                tr.get_source()
+            },
+            KVDBTransaction::BtreeOrdTabTr(tr) => {
                 tr.get_source()
             },
         }
@@ -877,6 +926,9 @@ impl<
             KVDBTransaction::LogWTabTr(tr) => {
                 tr.init()
             },
+            KVDBTransaction::BtreeOrdTabTr(tr) => {
+                tr.init()
+            },
         }
     }
 
@@ -896,6 +948,9 @@ impl<
                 tr.rollback()
             },
             KVDBTransaction::LogWTabTr(tr) => {
+                tr.rollback()
+            },
+            KVDBTransaction::BtreeOrdTabTr(tr) => {
                 tr.rollback()
             },
         }
@@ -932,6 +987,9 @@ impl<
             KVDBTransaction::LogWTabTr(tr) => {
                 tr.is_require_persistence()
             },
+            KVDBTransaction::BtreeOrdTabTr(tr) => {
+                tr.is_require_persistence()
+            },
         }
     }
 
@@ -950,6 +1008,9 @@ impl<
                 tr.require_persistence();
             },
             KVDBTransaction::LogWTabTr(tr) => {
+                tr.require_persistence();
+            },
+            KVDBTransaction::BtreeOrdTabTr(tr) => {
                 tr.require_persistence();
             },
         }
@@ -972,6 +1033,9 @@ impl<
             KVDBTransaction::LogWTabTr(tr) => {
                 tr.is_concurrent_prepare()
             },
+            KVDBTransaction::BtreeOrdTabTr(tr) => {
+                tr.is_concurrent_prepare()
+            },
         }
     }
 
@@ -990,6 +1054,9 @@ impl<
                 tr.is_enable_inherit_uid()
             },
             KVDBTransaction::LogWTabTr(tr) => {
+                tr.is_enable_inherit_uid()
+            },
+            KVDBTransaction::BtreeOrdTabTr(tr) => {
                 tr.is_enable_inherit_uid()
             },
         }
@@ -1012,6 +1079,9 @@ impl<
             KVDBTransaction::LogWTabTr(tr) => {
                 tr.get_transaction_uid()
             },
+            KVDBTransaction::BtreeOrdTabTr(tr) => {
+                tr.get_transaction_uid()
+            },
         }
     }
 
@@ -1030,6 +1100,9 @@ impl<
                 tr.set_transaction_uid(uid);
             },
             KVDBTransaction::LogWTabTr(tr) => {
+                tr.set_transaction_uid(uid);
+            },
+            KVDBTransaction::BtreeOrdTabTr(tr) => {
                 tr.set_transaction_uid(uid);
             },
         }
@@ -1052,6 +1125,9 @@ impl<
             KVDBTransaction::LogWTabTr(tr) => {
                 tr.get_prepare_uid()
             },
+            KVDBTransaction::BtreeOrdTabTr(tr) => {
+                tr.get_prepare_uid()
+            },
         }
     }
 
@@ -1070,6 +1146,9 @@ impl<
                 tr.set_prepare_uid(uid);
             },
             KVDBTransaction::LogWTabTr(tr) => {
+                tr.set_prepare_uid(uid);
+            },
+            KVDBTransaction::BtreeOrdTabTr(tr) => {
                 tr.set_prepare_uid(uid);
             },
         }
@@ -1092,6 +1171,9 @@ impl<
             KVDBTransaction::LogWTabTr(tr) => {
                 tr.get_commit_uid()
             },
+            KVDBTransaction::BtreeOrdTabTr(tr) => {
+                tr.get_commit_uid()
+            },
         }
     }
 
@@ -1110,6 +1192,9 @@ impl<
                 tr.set_commit_uid(uid);
             },
             KVDBTransaction::LogWTabTr(tr) => {
+                tr.set_commit_uid(uid);
+            },
+            KVDBTransaction::BtreeOrdTabTr(tr) => {
                 tr.set_commit_uid(uid);
             },
         }
@@ -1132,6 +1217,9 @@ impl<
             KVDBTransaction::LogWTabTr(tr) => {
                 tr.get_prepare_timeout()
             },
+            KVDBTransaction::BtreeOrdTabTr(tr) => {
+                tr.get_prepare_timeout()
+            },
         }
     }
 
@@ -1150,6 +1238,9 @@ impl<
                 tr.get_commit_timeout()
             },
             KVDBTransaction::LogWTabTr(tr) => {
+                tr.get_commit_timeout()
+            },
+            KVDBTransaction::BtreeOrdTabTr(tr) => {
                 tr.get_commit_timeout()
             },
         }
@@ -1210,6 +1301,12 @@ impl<
                         .instrument(span)
                         .boxed();
                 },
+                KVDBTransaction::BtreeOrdTabTr(tr) => {
+                    return tr
+                        .prepare()
+                        .instrument(span)
+                        .boxed();
+                },
             }
         }
 
@@ -1228,6 +1325,9 @@ impl<
                 tr.prepare()
             },
             KVDBTransaction::LogWTabTr(tr) => {
+                tr.prepare()
+            },
+            KVDBTransaction::BtreeOrdTabTr(tr) => {
                 tr.prepare()
             },
         }
@@ -1287,6 +1387,12 @@ impl<
                         .instrument(db_commit_span)
                         .boxed();
                 },
+                KVDBTransaction::BtreeOrdTabTr(tr) => {
+                    return tr
+                        .commit(confirm)
+                        .instrument(db_commit_span)
+                        .boxed();
+                },
             }
         }
 
@@ -1305,6 +1411,9 @@ impl<
                 tr.commit(confirm)
             },
             KVDBTransaction::LogWTabTr(tr) => {
+                tr.commit(confirm)
+            },
+            KVDBTransaction::BtreeOrdTabTr(tr) => {
                 tr.commit(confirm)
             },
         }
@@ -1335,6 +1444,9 @@ impl<
             KVDBTransaction::LogWTabTr(tr) => {
                 tr.is_unit()
             },
+            KVDBTransaction::BtreeOrdTabTr(tr) => {
+                tr.is_unit()
+            },
         }
     }
 
@@ -1353,6 +1465,9 @@ impl<
                 tr.get_status()
             },
             KVDBTransaction::LogWTabTr(tr) => {
+                tr.get_status()
+            },
+            KVDBTransaction::BtreeOrdTabTr(tr) => {
                 tr.get_status()
             },
         }
@@ -1375,6 +1490,9 @@ impl<
             KVDBTransaction::LogWTabTr(tr) => {
                 tr.set_status(status);
             },
+            KVDBTransaction::BtreeOrdTabTr(tr) => {
+                tr.set_status(status);
+            },
         }
     }
 
@@ -1393,6 +1511,9 @@ impl<
                 tr.qos()
             },
             KVDBTransaction::LogWTabTr(tr) => {
+                tr.qos()
+            },
+            KVDBTransaction::BtreeOrdTabTr(tr) => {
                 tr.qos()
             },
         }
@@ -1443,6 +1564,9 @@ impl<
             KVDBTransaction::LogWTabTr(tr) => {
                 tr.is_tree()
             },
+            KVDBTransaction::BtreeOrdTabTr(tr) => {
+                tr.is_tree()
+            },
         }
     }
 
@@ -1463,6 +1587,9 @@ impl<
             KVDBTransaction::LogWTabTr(tr) => {
                 tr.children_len()
             },
+            KVDBTransaction::BtreeOrdTabTr(tr) => {
+                tr.children_len()
+            },
         }
     }
 
@@ -1481,6 +1608,9 @@ impl<
                 tr.to_children()
             },
             KVDBTransaction::LogWTabTr(tr) => {
+                tr.to_children()
+            },
+            KVDBTransaction::BtreeOrdTabTr(tr) => {
                 tr.to_children()
             },
         }
@@ -2102,6 +2232,20 @@ impl<
 
                 table_tr
             },
+            KVDBTable::BtreeOrdTab(tab) => {
+                let tr = tab.transaction(self.get_source(),
+                                         self.is_writable(),
+                                         is_persistent,
+                                         self.get_prepare_timeout(),
+                                         self.get_commit_timeout());
+                let table_tr = KVDBTransaction::BtreeOrdTabTr(tr);
+
+                //注册到键值对数据库的根事务
+                childes_map.insert(name, table_tr.clone());
+                self.0.childs.lock().join(table_tr.clone());
+
+                table_tr
+            },
         }
     }
 }
@@ -2172,6 +2316,13 @@ impl<
                                         }
                                     },
                                     Some(KVDBTable::LogWTab(tab)) => {
+                                        if tab.len() > 0 {
+                                            //已存在的同名表是持久化表，且元信息不同，且表中有记录，则表名冲突
+                                            return Err(Error::new(ErrorKind::AlreadyExists,
+                                                                  format!("Create table failed, name: {:?}, meta: {:?}, reason: name conflict", name, meta)));
+                                        }
+                                    },
+                                    Some(KVDBTable::BtreeOrdTab(tab)) => {
                                         if tab.len() > 0 {
                                             //已存在的同名表是持久化表，且元信息不同，且表中有记录，则表名冲突
                                             return Err(Error::new(ErrorKind::AlreadyExists,
@@ -2251,6 +2402,31 @@ impl<
                 //注册创建的只写日志表
                 tables.insert(name.clone(), KVDBTable::LogWTab(table));
             },
+            KVDBTableType::BtreeOrdTab => {
+                //创建一个有序B树表
+                let table_path = self.0.db_mgr.0.tables_path.join(name.as_str()); //通过键值对数据库的表所在目录的路径与表名，生成表所在目录的路径
+                if let CreateTableOptions::BtreeOrdTab(cache_size, enable_compact) = options.clone() {
+                    //有序日志表的选项
+                    let table =
+                        BtreeOrderedTable::new(self.0.db_mgr.0.rt.clone(),
+                                               table_path,
+                                               name.clone(),
+                                               cache_size,
+                                               enable_compact,
+                                               1024 * 1024,
+                                               60 * 1000).await;
+
+                    //注册创建的有序日志表
+                    tables.insert(name.clone(), KVDBTable::BtreeOrdTab(table));
+                } else {
+                    //没有有序日志表的选项，则立即返回错误原因
+                    return Err(Error::new(ErrorKind::Other,
+                                          format!("Create table failed, name: {:?}, meta: {:?}, options: {:?}, reason: invalid options",
+                                                  name,
+                                                  meta,
+                                                  options)));
+                }
+            },
         }
 
         //注册表的元信息
@@ -2288,11 +2464,30 @@ impl<
                           name: Atom,
                           meta: KVTableMeta) -> IOResult<()>
     {
-        self.create_table_with_options(name,
-                                       meta,
-                                       CreateTableOptions::LogOrdTab(512 * 1024 * 1024,
-                                                                     2 * 1024 * 1024,
-                                                                     2 * 1024 * 1024)).await
+        match meta.table_type {
+            KVDBTableType::LogOrdTab => {
+                self.create_table_with_options(name,
+                                               meta,
+                                               CreateTableOptions::LogOrdTab(512 * 1024 * 1024,
+                                                                             2 * 1024 * 1024,
+                                                                             2 * 1024 * 1024))
+                    .await
+            },
+            KVDBTableType::BtreeOrdTab => {
+                self.create_table_with_options(name,
+                                               meta,
+                                               CreateTableOptions::BtreeOrdTab(16 * 1024 * 1024,
+                                                                               true))
+                    .await
+            },
+            _ => {
+                self.create_table_with_options(name,
+                                               meta,
+                                               CreateTableOptions::Empty)
+                    .await
+            },
+        }
+
     }
 
     /// 异步创建指定的多个表，表名可以是用文件分隔符分隔的路径，但必须是相对路径，且不允许使用".."
@@ -2349,6 +2544,13 @@ impl<
                                                 }
                                             },
                                             Some(KVDBTable::LogWTab(tab)) => {
+                                                if tab.len() > 0 {
+                                                    //已存在的同名表是持久化表，且元信息不同，且表中有记录，则表名冲突
+                                                    return Err(Error::new(ErrorKind::AlreadyExists,
+                                                                          format!("Create table failed, name: {:?}, meta: {:?}, reason: name conflict", name, meta)));
+                                                }
+                                            },
+                                            Some(KVDBTable::BtreeOrdTab(tab)) => {
                                                 if tab.len() > 0 {
                                                     //已存在的同名表是持久化表，且元信息不同，且表中有记录，则表名冲突
                                                     return Err(Error::new(ErrorKind::AlreadyExists,
@@ -2467,6 +2669,36 @@ impl<
                             .insert(name.clone(),
                                     KVDBTable::LogWTab(table));
                     },
+                    KVDBTableType::BtreeOrdTab => {
+                        //创建一个有序B树表
+                        let table_path = tables_path.join(name.as_str()); //通过键值对数据库的表所在目录的路径与表名，生成表所在目录的路径
+                        if let Some(CreateTableOptions::BtreeOrdTab(cache_size, enable_compact)) = options.clone() {
+                            //有序日志表的选项
+                            let table =
+                                BtreeOrderedTable::new(db_rt,
+                                                       table_path,
+                                                       name.clone(),
+                                                       cache_size,
+                                                       enable_compact,
+                                                       1024 * 1024,
+                                                       60 * 1000).await;
+
+                            //注册创建的有序日志表
+                            tables
+                                .write()
+                                .await
+                                .insert(name.clone(),
+                                        KVDBTable::BtreeOrdTab(table));
+                        } else {
+                            //没有有序日志表的选项，则立即通知错误原因
+                            result_copy.set(Err(Error::new(ErrorKind::Other,
+                                                           format!("Create table failed, name: {:?}, meta: {:?}, options: {:?}, reason: invalid options",
+                                                                   name,
+                                                                   meta,
+                                                                   options))));
+                            return;
+                        }
+                    },
                 }
 
                 if count_copy.fetch_sub(1, Ordering::AcqRel) <= 1 {
@@ -2577,6 +2809,21 @@ impl<
 
                 //注册创建的只写日志表
                 tables.insert(name.clone(), KVDBTable::LogWTab(table));
+            },
+            KVDBTableType::BtreeOrdTab => {
+                //尝试创建一个有序B树表
+                let table_path = self.0.db_mgr.0.tables_path.join(name.as_str()); //通过键值对数据库的表所在目录的路径与表名，生成表所在目录的路径
+                if let Some(table) =
+                    BtreeOrderedTable::try_new(self.0.db_mgr.0.rt.clone(),
+                                               table_path,
+                                               name.clone(),
+                                               16 * 1024 * 1024,
+                                               true,
+                                               1024 * 1024,
+                                               60 * 1000).await {
+                    //尝试创建成功，则注册创建的有序日志表
+                    tables.insert(name.clone(), KVDBTable::BtreeOrdTab(table));
+                }
             },
         }
 
@@ -2696,6 +2943,11 @@ impl<
                         let value = tr.dirty_query(table_kv.key).await;
                         result.push(value);
                     },
+                    KVDBTransaction::BtreeOrdTabTr(tr) => {
+                        //查询有序B树表的指定关键字的值
+                        let value = tr.dirty_query(table_kv.key).await;
+                        result.push(value);
+                    },
                 }
             } else {
                 //指定名称的表不存在
@@ -2746,6 +2998,11 @@ impl<
                     },
                     KVDBTransaction::LogWTabTr(tr) => {
                         //查询只写日志表的指定关键字的值
+                        let value = tr.query(table_kv.key).await;
+                        result.push(value);
+                    },
+                    KVDBTransaction::BtreeOrdTabTr(tr) => {
+                        //查询有序B树表的指定关键字的值
                         let value = tr.query(table_kv.key).await;
                         result.push(value);
                     },
@@ -2835,6 +3092,16 @@ impl<
                             }
                         }
                     },
+                    KVDBTransaction::BtreeOrdTabTr(tr) => {
+                        //插入或更新有序B树表的指定关键字的值
+                        if let Some(value) = table_kv.value {
+                            //有值则插入或更新
+                            if let Err(e) = tr.dirty_upsert(table_kv.key, value).await {
+                                //插入或更新有序B树表的指定关键字的值错误，则立即返回错误原因
+                                return Err(e);
+                            }
+                        }
+                    },
                 }
             }
         }
@@ -2914,6 +3181,16 @@ impl<
                             //有值则插入或更新
                             if let Err(e) = tr.upsert(table_kv.key, value).await {
                                 //插入或更新只写日志表的指定关键字的值错误，则立即返回错误原因
+                                return Err(e);
+                            }
+                        }
+                    },
+                    KVDBTransaction::BtreeOrdTabTr(tr) => {
+                        //插入或更新有序B树表的指定关键字的值
+                        if let Some(value) = table_kv.value {
+                            //有值则插入或更新
+                            if let Err(e) = tr.upsert(table_kv.key, value).await {
+                                //插入或更新有序B树表的指定关键字的值错误，则立即返回错误原因
                                 return Err(e);
                             }
                         }
@@ -3022,6 +3299,19 @@ impl<
                             },
                         }
                     },
+                    KVDBTransaction::BtreeOrdTabTr(tr) => {
+                        //删除有序B树表的指定关键字的值
+                        match tr.dirty_delete(table_kv.key).await {
+                            Err(e) => {
+                                //删除有序B树表的指定关键字的值错误，则立即返回错误原因
+                                return Err(e);
+                            },
+                            Ok(value) => {
+                                //删除有序B树表的指定关键字的值成功
+                                result.push(value);
+                            },
+                        }
+                    },
                 }
             } else {
                 //指定名称的表不存在
@@ -3122,6 +3412,19 @@ impl<
                             },
                         }
                     },
+                    KVDBTransaction::BtreeOrdTabTr(tr) => {
+                        //删除有序B树表的指定关键字的值
+                        match tr.delete(table_kv.key).await {
+                            Err(e) => {
+                                //删除有序B树表的指定关键字的值错误，则立即返回错误原因
+                                return Err(e);
+                            },
+                            Ok(value) => {
+                                //删除有序B树表的指定关键字的值成功
+                                result.push(value);
+                            },
+                        }
+                    },
                 }
             } else {
                 //指定名称的表不存在
@@ -3170,6 +3473,10 @@ impl<
                     //获取只写日志表的关键字的异步流
                     Some(tr.keys(key, descending))
                 },
+                KVDBTransaction::BtreeOrdTabTr(tr) => {
+                    //获取有序B树表的关键字的异步流
+                    Some(tr.keys(key, descending))
+                },
             }
         } else {
             //指定名称的表不存在
@@ -3213,6 +3520,10 @@ impl<
                 },
                 KVDBTransaction::LogWTabTr(tr) => {
                     //获取只写日志表的键值对异步流
+                    Some(tr.values(key, descending))
+                },
+                KVDBTransaction::BtreeOrdTabTr(tr) => {
+                    //获取有序B树表的键值对异步流
                     Some(tr.values(key, descending))
                 },
             }
@@ -3259,6 +3570,10 @@ impl<
                     //锁住只写日志表的指定关键字
                     tr.lock_key(key).await
                 },
+                KVDBTransaction::BtreeOrdTabTr(tr) => {
+                    //锁住有序B树表的指定关键字
+                    tr.lock_key(key).await
+                },
             }
         } else {
             //指定名称的表不存在
@@ -3301,6 +3616,10 @@ impl<
                 },
                 KVDBTransaction::LogWTabTr(tr) => {
                     //解锁只写日志表的指定关键字
+                    tr.unlock_key(key).await
+                },
+                KVDBTransaction::BtreeOrdTabTr(tr) => {
+                    //解锁有序B树表的指定关键字
                     tr.unlock_key(key).await
                 },
             }
@@ -3458,6 +3777,9 @@ impl<
                 KVDBTransaction::LogWTabTr(tr) => {
                     tr.prepare_repair(transaction_uid.clone());
                 },
+                KVDBTransaction::BtreeOrdTabTr(tr) => {
+                    tr.prepare_repair(transaction_uid.clone());
+                },
                 KVDBTransaction::RootTr(_) => {
                     //忽略根事务，并继续执行下一个子事务的预提交修复
                     continue;
@@ -3540,6 +3862,7 @@ pub enum KVDBTable<
     MemOrdTab(MemoryOrderedTable<C, Log>),  //有序内存表
     LogOrdTab(LogOrderedTable<C, Log>),     //有序日志表
     LogWTab(LogWriteTable<C, Log>),         //只写日志表
+    BtreeOrdTab(BtreeOrderedTable<C, Log>), //有序B树表
 }
 
 unsafe impl<
@@ -3563,6 +3886,7 @@ impl<
             Self::MemOrdTab(tab) => tab.is_persistent(),
             Self::LogOrdTab(tab) => tab.is_persistent(),
             Self::LogWTab(tab) => tab.is_persistent(),
+            Self::BtreeOrdTab(tab) => tab.is_persistent(),
         }
     }
 }

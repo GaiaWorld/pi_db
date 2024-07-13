@@ -1,11 +1,14 @@
 use std::mem;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-use std::sync::{Arc, atomic::{AtomicBool, AtomicUsize, Ordering}};
-use std::collections::hash_map::Entry as HashMapEntry;
+use std::sync::{Arc,
+                atomic::{AtomicBool, AtomicUsize, Ordering}};
+use std::collections::{VecDeque,
+                       hash_map::Entry as HashMapEntry};
 
 use parking_lot::Mutex;
-use futures::{future::{FutureExt, BoxFuture}, stream::{StreamExt, BoxStream}};
+use futures::{future::{FutureExt, BoxFuture},
+              stream::{StreamExt, BoxStream}};
 use async_lock::Mutex as AsyncMutex;
 use async_stream::stream;
 use log::{debug, info, error};
@@ -15,7 +18,7 @@ use pi_guid::Guid;
 use pi_hash::XHashMap;
 use pi_ordmap::{ordmap::{Iter, OrdMap, Keys, Entry}, asbtree::Tree};
 use pi_async_rt::{lock::spin_lock::SpinLock,
-               rt::{AsyncRuntime, multi_thread::MultiTaskRuntime}};
+                  rt::{AsyncRuntime, multi_thread::MultiTaskRuntime}};
 use pi_async_transaction::{AsyncTransaction,
                            Transaction2Pc,
                            UnitTransaction,
@@ -39,7 +42,6 @@ use crate::{Binary,
             transaction_debug_logger,
             db::{KVDBTransaction, KVDBChildTrList},
             tables::KVTable};
-use std::collections::VecDeque;
 
 ///
 /// 默认的日志文件延迟提交的超时时长，单位ms
@@ -119,7 +121,7 @@ impl<
                 },
                 Ok(writed_log_index) => {
                     //强制创建新的有序日志表可写日志文件成功
-                    info!("Ready collect log ordered table ok, time: {:?}, path: {:?}, table: {:?}, writed_log_index: {}",
+                    info!("Ready collect log ordered table succeeded, time: {:?}, path: {:?}, table: {:?}, writed_log_index: {}",
                         now.elapsed(),
                         table.0.log_file.path(),
                         table.0.name.as_str(),
@@ -140,11 +142,11 @@ impl<
                                            false).await {
                 Err(e) => {
                     //整理有序日志表的只读日志文件失败，则立即返回有序日志表整理错误
-                    return Err(KVTableTrError::new_transaction_error(ErrorLevel::Normal, format!("Collect log ordered table failed, path: {:?}, table: {:?}, reason: {:?}", table.0.log_file.path(), table.0.name.as_str(), e)));
+                    return Err(KVTableTrError::new_transaction_error(ErrorLevel::Normal, format!("Compact log ordered table failed, path: {:?}, table: {:?}, reason: {:?}", table.0.log_file.path(), table.0.name.as_str(), e)));
                 },
                 Ok((size, len)) => {
                     //整理有序日志表的只读日志文件成功
-                    info!("Collect log ordered table ok, time: {:?}, path: {:?}, table: {:?}, file_size: {}, file_len: {}",
+                    info!("Compact log ordered table succeeded, time: {:?}, path: {:?}, table: {:?}, file_size: {}, file_len: {}",
                         now.elapsed(),
                         table.0.log_file.path(),
                         table.0.name.as_str(),
@@ -221,7 +223,7 @@ impl<
                            path.as_ref(),
                            e);
                 }
-                info!("Load log ordered table ok, table: {:?}, path: {:?}, files: {}, keys: {}, bytes: {}, time: {:?}",
+                info!("Load log ordered table succeeded, table: {:?}, path: {:?}, files: {}, keys: {}, bytes: {}, time: {:?}",
                     name.as_str(),
                     path.as_ref(),
                     loader.log_files_len(),
@@ -243,7 +245,7 @@ impl<
                                     statistics);
                             },
                             Ok((collect_time, statistics)) => {
-                                debug!("Collect log ordered table ok, table: {:?}, time: {:?}, statistics: {:?}, reason: out of time",
+                                debug!("Collect log ordered table succeeded, table: {:?}, time: {:?}, statistics: {:?}, reason: out of time",
                                     table_copy.name().as_str(),
                                     collect_time,
                                     statistics);
@@ -610,7 +612,7 @@ impl<
                                     statistics);
                             },
                             Ok((collect_time, statistics)) => {
-                                info!("Collect log ordered table ok, table: {:?}, time: {:?}, statistics: {:?}, reason: out of size",
+                                info!("Collect log ordered table succeeded, table: {:?}, time: {:?}, statistics: {:?}, reason: out of size",
                                     table_copy.name().as_str(),
                                     collect_time,
                                     statistics);
@@ -1222,11 +1224,11 @@ async fn collect_waits<
             //写入日志文件失败，则立即中止本次整理
             table.0.collecting.store(false, Ordering::Release); //设置为已整理结束
             error!("Collect log ordered table failed, table: {:?}, transactions: {}, keys: {}, bytes: {}, reason: {:?}",
-            table.name().as_str(),
-            trs_len,
-            keys_len,
-            bytes_len,
-            e);
+                table.name().as_str(),
+                trs_len,
+                keys_len,
+                bytes_len,
+                e);
 
             return Err((now.elapsed(), (trs_len, keys_len, bytes_len)));
         }
@@ -1260,3 +1262,5 @@ async fn collect_waits<
 
     Ok((now.elapsed(), (trs_len, keys_len, bytes_len)))
 }
+
+

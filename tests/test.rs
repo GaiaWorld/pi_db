@@ -90,7 +90,7 @@ fn test_memory_table() {
         let mut builder = KVDBManagerBuilder::new(rt_copy.clone(), tr_mgr, "./db");
         match builder.startup().await {
             Err(e) => {
-                panic!(e);
+                panic!("{:?}", e);
             },
             Ok(db) => {
                 println!("!!!!!!db table size: {:?}", db.table_size().await);
@@ -396,7 +396,7 @@ fn test_memory_table_conflict() {
         let mut builder = KVDBManagerBuilder::new(rt_copy.clone(), tr_mgr, "./db");
         match builder.startup().await {
             Err(e) => {
-                panic!(e);
+                panic!("{:?}", e);
             },
             Ok(db) => {
                 println!("!!!!!!db table size: {:?}", db.table_size().await);
@@ -586,7 +586,7 @@ fn test_commit_log() {
         let mut builder = KVDBManagerBuilder::new(rt_copy.clone(), tr_mgr, "./db");
         match builder.startup().await {
             Err(e) => {
-                panic!(e);
+                panic!("{:?}", e);
             },
             Ok(db) => {
                 println!("!!!!!!db table size: {:?}", db.table_size().await);
@@ -896,7 +896,7 @@ fn test_load_log_table() {
         let now = Instant::now();
         match builder.startup().await {
             Err(e) => {
-                panic!(e);
+                panic!("{:?}", e);
             },
             Ok(db) => {
                 println!("!!!!!!db table size: {:?}, time: {:?}", db.table_size().await, now.elapsed());
@@ -954,7 +954,7 @@ fn test_log_table() {
         let mut builder = KVDBManagerBuilder::new(rt_copy.clone(), tr_mgr, "./db");
         match builder.startup().await {
             Err(e) => {
-                panic!(e);
+                panic!("{:?}", e);
             },
             Ok(db) => {
                 println!("!!!!!!db table size: {:?}", db.table_size().await);
@@ -1308,7 +1308,7 @@ fn test_log_table_read_only_while_writing() {
         let mut builder = KVDBManagerBuilder::new(rt_copy.clone(), tr_mgr, "./db");
         match builder.startup().await {
             Err(e) => {
-                panic!(e);
+                panic!("{:?}", e);
             },
             Ok(db) => {
                 println!("!!!!!!db table size: {:?}", db.table_size().await);
@@ -1432,7 +1432,7 @@ fn test_log_table_write_while_read_only() {
         let mut builder = KVDBManagerBuilder::new(rt_copy.clone(), tr_mgr, "./db");
         match builder.startup().await {
             Err(e) => {
-                panic!(e);
+                panic!("{:?}", e);
             },
             Ok(db) => {
                 println!("!!!!!!db table size: {:?}", db.table_size().await);
@@ -1534,6 +1534,8 @@ fn test_log_table_conflict() {
     use std::thread;
     use std::time::Duration;
 
+    env_logger::init();
+
     let _handle = startup_global_time_loop(100);
     let builder = MultiTaskRuntimeBuilder::default();
     let rt = builder.build();
@@ -1554,7 +1556,7 @@ fn test_log_table_conflict() {
         let mut builder = KVDBManagerBuilder::new(rt_copy.clone(), tr_mgr, "./db");
         match builder.startup().await {
             Err(e) => {
-                panic!(e);
+                panic!("{:?}", e);
             },
             Ok(db) => {
                 println!("!!!!!!db table size: {:?}", db.table_size().await);
@@ -1641,7 +1643,7 @@ fn test_log_table_conflict() {
                                     if let Err(e) = tr.rollback_modified().await {
                                         println!("rollback failed, reason: {:?}", e);
                                     } else {
-                                        rt_copy_.timeout(0).await;
+                                        rt_copy_.timeout(1).await;
                                         continue;
                                     }
                                 },
@@ -1654,7 +1656,7 @@ fn test_log_table_conflict() {
                                                 if let Err(e) = tr.rollback_modified().await {
                                                     println!("rollback failed, reason: {:?}", e);
                                                 } else {
-                                                    rt_copy_.timeout(0).await;
+                                                    rt_copy_.timeout(1).await;
                                                     continue;
                                                 }
                                             }
@@ -1746,7 +1748,7 @@ fn test_log_write_table() {
         let mut builder = KVDBManagerBuilder::new(rt_copy.clone(), tr_mgr, "./db");
         match builder.startup().await {
             Err(e) => {
-                panic!(e);
+                panic!("{:?}", e);
             },
             Ok(db) => {
                 println!("!!!!!!db table size: {:?}", db.table_size().await);
@@ -1894,6 +1896,715 @@ fn test_log_write_table() {
                             },
                         }
                     },
+                }
+            },
+        }
+    });
+
+    thread::sleep(Duration::from_millis(1000000000));
+}
+
+#[test]
+fn test_b_tree_table() {
+    use std::thread;
+    use std::time::Duration;
+
+    env_logger::init();
+
+    let _handle = startup_global_time_loop(100);
+    let builder = MultiTaskRuntimeBuilder::default();
+    let rt = builder.build();
+    let rt_copy = rt.clone();
+
+    rt.spawn(async move {
+        let guid_gen = GuidGen::new(run_nanos(), 0);
+        let commit_logger_builder = CommitLoggerBuilder::new(rt_copy.clone(), "./.commit_log");
+        let commit_logger = commit_logger_builder
+            .build()
+            .await
+            .unwrap();
+
+        let tr_mgr = Transaction2PcManager::new(rt_copy.clone(),
+                                                guid_gen,
+                                                commit_logger);
+
+        let mut builder = KVDBManagerBuilder::new(rt_copy.clone(), tr_mgr, "./db");
+        match builder.startup().await {
+            Err(e) => {
+                panic!("{:?}", e);
+            },
+            Ok(db) => {
+                println!("!!!!!!db table size: {:?}", db.table_size().await);
+
+                let table_name = Atom::from("test_log/a/b/c");
+                let tr = db.transaction(table_name.clone(), true, 500, 500).unwrap();
+                if let Err(e) = tr.create_table(table_name.clone(),
+                                                KVTableMeta::new(KVDBTableType::BtreeOrdTab,
+                                                                 true,
+                                                                 EnumType::U8,
+                                                                 EnumType::Str)
+                ).await {
+                    //创建有序B树表失败
+                    println!("!!!!!!create b-tree ordered table failed, reason: {:?}", e);
+                }
+                let output = tr.prepare_modified().await.unwrap();
+                let _ = tr.commit_modified(output).await;
+
+                println!("!!!!!!db table size: {:?}", db.table_size().await);
+
+                //查询表信息
+                rt_copy.timeout(1500).await;
+                println!("======0");
+
+                println!("!!!!!!test_log is exist: {:?}", db.is_exist(&table_name).await);
+                println!("!!!!!!test_log is ordered table: {:?}", db.is_ordered_table(&table_name).await);
+                println!("!!!!!!test_log is persistent table: {:?}", db.is_persistent_table(&table_name).await);
+                println!("!!!!!!test_log table_dir: {:?}", db.table_path(&table_name).await);
+                println!("!!!!!!test_log table len: {:?}", db.table_record_size(&table_name).await);
+
+                //操作数据库事务
+                rt_copy.timeout(1500).await;
+                println!("======1");
+
+                let tr = db.transaction(Atom::from("test log table"), true, 500, 500).unwrap();
+
+                if let Some(mut r) = tr.values(
+                    table_name.clone(),
+                    None,
+                    false
+                ).await {
+                    while let Some((key, value)) = r.next().await {
+                        println!("!!!!!!next key: {:?}, value: {:?}",
+                                 binary_to_u8(&key),
+                                 String::from_utf8_lossy(value.as_ref()).as_ref());
+                    }
+                }
+
+                rt_copy.timeout(1500).await;
+                println!("======2");
+
+                let r = tr.query(vec![
+                    TableKV {
+                        table: table_name.clone(),
+                        key: u8_to_binary(0),
+                        value: None
+                    }
+                ]).await;
+                println!("!!!!!!query result: {:?}", r);
+
+                let r = tr.upsert(vec![
+                    TableKV {
+                        table: table_name.clone(),
+                        key: u8_to_binary(0),
+                        value: Some(Binary::new("Hello World!".as_bytes().to_vec()))
+                    }
+                ]).await;
+                println!("!!!!!!upsert result: {:?}", r);
+
+                let r = tr.query(vec![
+                    TableKV {
+                        table: table_name.clone(),
+                        key: u8_to_binary(0),
+                        value: None
+                    }
+                ]).await;
+                println!("!!!!!!query result: {:?}", r);
+
+                let r = tr.delete(vec![
+                    TableKV {
+                        table: table_name.clone(),
+                        key: u8_to_binary(0),
+                        value: None
+                    }
+                ]).await;
+                println!("!!!!!!delete result: {:?}", r);
+
+                let r = tr.query(vec![
+                    TableKV {
+                        table: table_name.clone(),
+                        key: u8_to_binary(0),
+                        value: None
+                    }
+                ]).await;
+                println!("!!!!!!query result: {:?}", r);
+
+                let mut table_kv_list = Vec::new();
+                for key in 0..10u8 {
+                    table_kv_list.push(TableKV {
+                        table: table_name.clone(),
+                        key: u8_to_binary(key),
+                        value: Some(Binary::new("Hello World!".as_bytes().to_vec()))
+                    });
+                }
+                let r = tr.upsert(table_kv_list).await;
+                println!("!!!!!!batch upsert, result: {:?}", r);
+
+                rt_copy.timeout(1500).await;
+                println!("======3");
+
+                if let Some(mut r) = tr.keys(
+                    table_name.clone(),
+                    None,
+                    false
+                ).await {
+                    while let Some(key) = r.next().await {
+                        println!("!!!!!!next key: {:?}", binary_to_u8(&key));
+                    }
+                }
+
+                rt_copy.timeout(1500).await;
+                println!("======4");
+
+                if let Some(mut r) = tr.keys(
+                    table_name.clone(),
+                    None,
+                    true
+                ).await {
+                    while let Some(key) = r.next().await {
+                        println!("!!!!!!next key: {:?}", binary_to_u8(&key));
+                    }
+                }
+
+                rt_copy.timeout(1500).await;
+                println!("======5");
+
+                if let Some(mut r) = tr.keys(
+                    table_name.clone(),
+                    Some(u8_to_binary(6)),
+                    false
+                ).await {
+                    while let Some(key) = r.next().await {
+                        println!("!!!!!!next key: {:?}", binary_to_u8(&key));
+                    }
+                }
+
+                rt_copy.timeout(1500).await;
+                println!("======6");
+
+                if let Some(mut r) = tr.keys(
+                    table_name.clone(),
+                    Some(u8_to_binary(6)),
+                    true
+                ).await {
+                    while let Some(key) = r.next().await {
+                        println!("!!!!!!next key: {:?}", binary_to_u8(&key));
+                    }
+                }
+
+                rt_copy.timeout(1500).await;
+                println!("======7");
+
+                if let Some(mut r) = tr.values(
+                    table_name.clone(),
+                    None,
+                    false
+                ).await {
+                    while let Some((key, value)) = r.next().await {
+                        println!("!!!!!!next key: {:?}, value: {:?}",
+                                 binary_to_u8(&key),
+                                 String::from_utf8_lossy(value.as_ref()).as_ref());
+                    }
+                }
+
+                rt_copy.timeout(1500).await;
+                println!("======8");
+
+                if let Some(mut r) = tr.values(
+                    table_name.clone(),
+                    None,
+                    true
+                ).await {
+                    while let Some((key, value)) = r.next().await {
+                        println!("!!!!!!next key: {:?}, value: {:?}",
+                                 binary_to_u8(&key),
+                                 String::from_utf8_lossy(value.as_ref()).as_ref());
+                    }
+                }
+
+                rt_copy.timeout(1500).await;
+                println!("======9");
+
+                if let Some(mut r) = tr.values(
+                    table_name.clone(),
+                    Some(u8_to_binary(6)),
+                    false
+                ).await {
+                    while let Some((key, value)) = r.next().await {
+                        println!("!!!!!!next key: {:?}, value: {:?}",
+                                 binary_to_u8(&key),
+                                 String::from_utf8_lossy(value.as_ref()).as_ref());
+                    }
+                }
+
+                rt_copy.timeout(1500).await;
+                println!("======10");
+
+                if let Some(mut r) = tr.values(
+                    table_name.clone(),
+                    Some(u8_to_binary(6)),
+                    true
+                ).await {
+                    while let Some((key, value)) = r.next().await {
+                        println!("!!!!!!next key: {:?}, value: {:?}",
+                                 binary_to_u8(&key),
+                                 String::from_utf8_lossy(value.as_ref()).as_ref());
+                    }
+                }
+
+                rt_copy.timeout(1500).await;
+                println!("======11");
+
+                let mut table_kv_list = Vec::new();
+                for key in 0..10u8 {
+                    table_kv_list.push(TableKV {
+                        table: table_name.clone(),
+                        key: u8_to_binary(key),
+                        value: None,
+                    });
+                }
+                let r = tr.delete(table_kv_list).await;
+                println!("!!!!!!batch delete result: {:?}", r);
+
+                rt_copy.timeout(1500).await;
+                println!("======12");
+
+                if let Some(mut r) = tr.keys(
+                    table_name.clone(),
+                    None,
+                    false
+                ).await {
+                    while let Some(key) = r.next().await {
+                        println!("!!!!!!next key: {:?}", binary_to_u8(&key));
+                    }
+                }
+
+                rt_copy.timeout(1500).await;
+                println!("======13");
+
+                if let Some(mut r) = tr.values(
+                    table_name.clone(),
+                    None,
+                    false
+                ).await {
+                    while let Some((key, value)) = r.next().await {
+                        println!("!!!!!!next key: {:?}, value: {:?}",
+                                 binary_to_u8(&key),
+                                 String::from_utf8_lossy(value.as_ref()).as_ref());
+                    }
+                }
+
+                rt_copy.timeout(1500).await;
+                println!("======14");
+
+                let mut table_kv_list = Vec::new();
+                for key in 0..10u8 {
+                    table_kv_list.push(TableKV {
+                        table: table_name.clone(),
+                        key: u8_to_binary(key),
+                        value: Some(Binary::new("Hello World!".as_bytes().to_vec()))
+                    });
+                }
+                let r = tr.upsert(table_kv_list).await;
+                println!("!!!!!!batch upsert, result: {:?}", r);
+
+                rt_copy.timeout(1500).await;
+                println!("======15");
+
+                if let Some(mut r) = tr.values(
+                    table_name.clone(),
+                    None,
+                    false
+                ).await {
+                    while let Some((key, value)) = r.next().await {
+                        println!("!!!!!!next key: {:?}, value: {:?}",
+                                 binary_to_u8(&key),
+                                 String::from_utf8_lossy(value.as_ref()).as_ref());
+                    }
+                }
+
+                rt_copy.timeout(1500).await;
+                println!("======16");
+
+                match tr.prepare_modified().await {
+                    Err(e) => {
+                        println!("prepare failed, reason: {:?}", e);
+                        if let Err(e) = tr.rollback_modified().await {
+                            println!("rollback failed, reason: {:?}", e);
+                        } else {
+                            println!("rollback ok for prepare");
+                        }
+                    },
+                    Ok(output) => {
+                        println!("prepare ok, output: {:?}", output);
+                        match tr.commit_modified(output).await {
+                            Err(e) => {
+                                println!("commit failed, reason: {:?}", e);
+                                if let ErrorLevel::Fatal = &e.level() {
+                                    println!("rollback failed, reason: commit fatal error");
+                                } else {
+                                    println!("rollbakc ok for commit");
+                                }
+                            },
+                            Ok(()) => {
+                                println!("commit ok");
+                            },
+                        }
+                    },
+                }
+            },
+        }
+    });
+
+    thread::sleep(Duration::from_millis(1000000000));
+}
+
+#[test]
+fn test_b_tree_table_read_write() {
+    use std::thread;
+    use std::time::Duration;
+
+    env_logger::init();
+
+    let _handle = startup_global_time_loop(100);
+    let builder = MultiTaskRuntimeBuilder::default();
+    let rt = builder.build();
+    let rt_copy = rt.clone();
+
+    rt.spawn(async move {
+        let guid_gen = GuidGen::new(run_nanos(), 0);
+        let commit_logger_builder = CommitLoggerBuilder::new(rt_copy.clone(), "./.commit_log");
+        let commit_logger = commit_logger_builder
+            .build()
+            .await
+            .unwrap();
+
+        let tr_mgr = Transaction2PcManager::new(rt_copy.clone(),
+                                                guid_gen,
+                                                commit_logger);
+
+        let mut builder = KVDBManagerBuilder::new(rt_copy.clone(), tr_mgr, "./db");
+        match builder.startup().await {
+            Err(e) => {
+                panic!("{:?}", e);
+            },
+            Ok(db) => {
+                println!("!!!!!!db table size: {:?}", db.table_size().await);
+
+                let table_name = Atom::from("test_log/a/b/c");
+                let tr = db.transaction(table_name.clone(), true, 500, 500).unwrap();
+                if let Err(e) = tr.create_table(table_name.clone(),
+                                                KVTableMeta::new(KVDBTableType::BtreeOrdTab,
+                                                                 true,
+                                                                 EnumType::Usize,
+                                                                 EnumType::Usize)).await {
+                    //创建有序内存表失败
+                    println!("!!!!!!create b-tree ordered table failed, reason: {:?}", e);
+                }
+                let output = tr.prepare_modified().await.unwrap();
+                let _ = tr.commit_modified(output).await;
+
+                println!("!!!!!!db table size: {:?}", db.table_size().await);
+
+                //查询表信息
+                rt_copy.timeout(1500).await;
+                println!("");
+
+                println!("!!!!!!test_log is exist: {:?}", db.is_exist(&table_name).await);
+                println!("!!!!!!test_log is ordered table: {:?}", db.is_ordered_table(&table_name).await);
+                println!("!!!!!!test_log is persistent table: {:?}", db.is_persistent_table(&table_name).await);
+                println!("!!!!!!test_log table_dir: {:?}", db.table_path(&table_name).await);
+                println!("!!!!!!test_log table len: {:?}", db.table_record_size(&table_name).await);
+
+                //操作数据库事务
+                rt_copy.timeout(1500).await;
+                println!("");
+
+                let (sender, receiver) = unbounded();
+                let db_copy = db.clone();
+                let table_name_copy = table_name.clone();
+                let sender_copy = sender.clone();
+                let start = Instant::now();
+                let _ = rt_copy.spawn(async move {
+                    for index in 0..1000 {
+                        let tr = db_copy.transaction(Atom::from("test b-tree table"), true, 500, 500).unwrap();
+
+                        let _r = tr.upsert(vec![
+                            TableKV {
+                                table: table_name_copy.clone(),
+                                key: usize_to_binary(index),
+                                value: Some(usize_to_binary(index))
+                            }
+                        ]).await;
+
+                        match tr.prepare_modified().await {
+                            Err(_e) => {
+                                if let Err(e) = tr.rollback_modified().await {
+                                    println!("rollback failed, reason: {:?}", e);
+                                }
+                            },
+                            Ok(output) => {
+                                if let Err(e) = tr.commit_modified(output).await {
+                                    if let ErrorLevel::Fatal = &e.level() {
+                                        println!("rollback failed, reason: commit fatal error");
+                                    } else {
+                                        if let Err(e) = tr.rollback_modified().await {
+                                            println!("rollback failed, reason: {:?}", e);
+                                        }
+                                    }
+                                } else {
+                                    sender_copy.send(());
+                                }
+                            },
+                        }
+                    }
+                });
+
+                let mut count = 0;
+                loop {
+                    match receiver.recv_timeout(Duration::from_millis(10000)) {
+                        Err(e) => {
+                            println!(
+                                "!!!!!!recv timeout, len: {}, timer_len: {}, e: {:?}",
+                                rt_copy.wait_len(),
+                                rt_copy.len(),
+                                e
+                            );
+                            continue;
+                        },
+                        Ok(_result) => {
+                            count += 1;
+                            if count >= 1000 {
+                                println!("======> insert finish, time: {:?}, count: {}", start.elapsed(), count);
+                                break;
+                            }
+                        },
+                    }
+                }
+
+                let start = Instant::now();
+                for index in 0..10 {
+                    let tr = db.transaction(Atom::from("test b-tree table"), false, 500, 500).unwrap();
+
+                    let r = tr.query(vec![
+                        TableKV {
+                            table: table_name.clone(),
+                            key: usize_to_binary(index),
+                            value: None
+                        }
+                    ]).await;
+                    assert_eq!(binary_to_usize((&r[0]).as_ref().unwrap()).unwrap(), index);
+                }
+                println!("======> query finish, time: {:?}", start.elapsed());
+
+                let start = Instant::now();
+                let tr = db.transaction(Atom::from("test b-tree table"), false, 500, 500).unwrap();
+
+                let mut count = 0;
+                let mut values = tr.values(table_name.clone(), None, false).await.unwrap();
+                while let Some((_key, value)) = values.next().await {
+                    assert_eq!(binary_to_usize(&value).unwrap(), count);
+                    count += 1;
+                }
+
+                println!("======> iterator finish, count: {:?}, time: {:?}", count, start.elapsed());
+
+                let start = Instant::now();
+                if let Err(e) = db.collect_table(&table_name).await {
+                    panic!("{:?}", e);
+                }
+                println!("======> Compact finish, time: {:?}", start.elapsed());
+            },
+        }
+    });
+
+    thread::sleep(Duration::from_millis(1000000000));
+}
+
+// 测试BtreeTable写冲突
+#[test]
+fn test_b_tree_table_conflict() {
+    use std::thread;
+    use std::time::Duration;
+
+    env_logger::init();
+
+    let _handle = startup_global_time_loop(100);
+    let builder = MultiTaskRuntimeBuilder::default();
+    let rt = builder.build();
+    let rt_copy = rt.clone();
+
+    rt.spawn(async move {
+        let guid_gen = GuidGen::new(run_nanos(), 0);
+        let commit_logger_builder = CommitLoggerBuilder::new(rt_copy.clone(), "./.commit_log");
+        let commit_logger = commit_logger_builder
+            .build()
+            .await
+            .unwrap();
+
+        let tr_mgr = Transaction2PcManager::new(rt_copy.clone(),
+                                                guid_gen,
+                                                commit_logger);
+
+        let mut builder = KVDBManagerBuilder::new(rt_copy.clone(), tr_mgr, "./db");
+        match builder.startup().await {
+            Err(e) => {
+                panic!("{:?}", e);
+            },
+            Ok(db) => {
+                println!("!!!!!!db table size: {:?}", db.table_size().await);
+
+                let table_name = Atom::from("test_log/a/b/c");
+                let tr = db.transaction(table_name.clone(), true, 500, 500).unwrap();
+                if let Err(e) = tr.create_table(table_name.clone(),
+                                                KVTableMeta::new(KVDBTableType::BtreeOrdTab,
+                                                                 true,
+                                                                 EnumType::Usize,
+                                                                 EnumType::Usize)).await {
+                    //创建有序内存表失败
+                    println!("!!!!!!create b-tree ordered table failed, reason: {:?}", e);
+                }
+                let output = tr.prepare_modified().await.unwrap();
+                let _ = tr.commit_modified(output).await;
+
+                println!("!!!!!!db table size: {:?}", db.table_size().await);
+
+                //查询表信息
+                rt_copy.timeout(1500).await;
+                println!("");
+
+                println!("!!!!!!test_log is exist: {:?}", db.is_exist(&table_name).await);
+                println!("!!!!!!test_log is ordered table: {:?}", db.is_ordered_table(&table_name).await);
+                println!("!!!!!!test_log is persistent table: {:?}", db.is_persistent_table(&table_name).await);
+                println!("!!!!!!test_log table_dir: {:?}", db.table_path(&table_name).await);
+                println!("!!!!!!test_log table len: {:?}", db.table_record_size(&table_name).await);
+
+                //操作数据库事务
+                rt_copy.timeout(1500).await;
+                println!("");
+
+                {
+                    let tr = db.transaction(table_name.clone(), true, 500, 500).unwrap();
+
+                    let _r = tr.upsert(vec![
+                        TableKV {
+                            table: table_name.clone(),
+                            key: usize_to_binary(0),
+                            value: Some(usize_to_binary(0))
+                        }
+                    ]).await;
+
+                    if let Ok(output) = tr.prepare_modified().await {
+                        tr.commit_modified(output).await.is_ok();
+                    }
+                }
+
+                let (sender, receiver) = unbounded();
+                let start = Instant::now();
+                for _ in 0..1000 {
+                    let rt_copy_ = rt_copy.clone();
+                    let db_copy = db.clone();
+                    let table_name_copy = table_name.clone();
+                    let sender_copy = sender.clone();
+
+                    rt_copy.spawn(async move {
+                        let now = Instant::now();
+                        let mut is_ok = false;
+
+                        while now.elapsed().as_millis() <= 120000 {
+                            let tr = db_copy.transaction(Atom::from("test b-tree table"), true, 500, 500).unwrap();
+                            let r = tr.query(vec![
+                                TableKV {
+                                    table: table_name_copy.clone(),
+                                    key: usize_to_binary(0),
+                                    value: None
+                                }
+                            ]).await;
+                            let last_value = binary_to_usize((&r[0]).as_ref().unwrap()).unwrap();
+
+                            let new_value = last_value + 1;
+                            let _r = tr.upsert(vec![
+                                TableKV {
+                                    table: table_name_copy.clone(),
+                                    key: usize_to_binary(0),
+                                    value: Some(usize_to_binary(new_value))
+                                }
+                            ]).await;
+
+                            match tr.prepare_modified().await {
+                                Err(_e) => {
+                                    if let Err(e) = tr.rollback_modified().await {
+                                        println!("rollback failed, reason: {:?}", e);
+                                    } else {
+                                        rt_copy_.timeout(1).await;
+                                        continue;
+                                    }
+                                },
+                                Ok(output) => {
+                                    match tr.commit_modified(output).await {
+                                        Err(e) => {
+                                            if let ErrorLevel::Fatal = &e.level() {
+                                                println!("rollback failed, reason: commit fatal error");
+                                            } else {
+                                                if let Err(e) = tr.rollback_modified().await {
+                                                    println!("rollback failed, reason: {:?}", e);
+                                                } else {
+                                                    rt_copy_.timeout(1).await;
+                                                    continue;
+                                                }
+                                            }
+                                        },
+                                        Ok(()) => {
+                                            is_ok = true;
+                                            break;
+                                        },
+                                    }
+                                },
+                            }
+                        }
+
+                        if !is_ok {
+                            println!("writed timeout");
+                        }
+
+                        sender_copy.send(());
+                    });
+                }
+
+                let mut count = 0;
+                loop {
+                    match receiver.recv_timeout(Duration::from_millis(10000)) {
+                        Err(e) => {
+                            println!(
+                                "!!!!!!recv timeout, len: {}, timer_len: {}, e: {:?}",
+                                rt_copy.wait_len(),
+                                rt_copy.len(),
+                                e
+                            );
+                            continue;
+                        },
+                        Ok(_result) => {
+                            count += 1;
+                            if count >= 1000 {
+                                println!("!!!!!!time: {:?}, count: {}", start.elapsed(), count);
+                                break;
+                            }
+                        },
+                    }
+                }
+
+                {
+                    let tr = db.transaction(Atom::from("test b-tree table"), true, 500, 500).unwrap();
+
+                    let r = tr.query(vec![
+                        TableKV {
+                            table: table_name.clone(),
+                            key: usize_to_binary(0),
+                            value: None
+                        }
+                    ]).await;
+                    let last_value = binary_to_usize((&r[0]).as_ref().unwrap()).unwrap();
+
+                    assert_eq!(last_value, 1000);
                 }
             },
         }
@@ -3032,7 +3743,7 @@ fn test_query_conflict() {
         let mut builder = KVDBManagerBuilder::new(rt_copy.clone(), tr_mgr, "./db");
         match builder.startup().await {
             Err(e) => {
-                panic!(e);
+                panic!("{:?}", e);
             },
             Ok(db) => {
                 println!("!!!!!!db table size: {:?}", db.table_size().await);
@@ -3240,7 +3951,7 @@ fn test_dirty_query_conflict() {
         let mut builder = KVDBManagerBuilder::new(rt_copy.clone(), tr_mgr, "./db");
         match builder.startup().await {
             Err(e) => {
-                panic!(e);
+                panic!("{:?}", e);
             },
             Ok(db) => {
                 println!("!!!!!!db table size: {:?}", db.table_size().await);
@@ -3448,7 +4159,7 @@ fn test_upsert_conflict() {
         let mut builder = KVDBManagerBuilder::new(rt_copy.clone(), tr_mgr, "./db");
         match builder.startup().await {
             Err(e) => {
-                panic!(e);
+                panic!("{:?}", e);
             },
             Ok(db) => {
                 println!("!!!!!!db table size: {:?}", db.table_size().await);
@@ -3670,7 +4381,7 @@ fn test_dirty_upsert_conflict() {
         let mut builder = KVDBManagerBuilder::new(rt_copy.clone(), tr_mgr, "./db");
         match builder.startup().await {
             Err(e) => {
-                panic!(e);
+                panic!("{:?}", e);
             },
             Ok(db) => {
                 println!("!!!!!!db table size: {:?}", db.table_size().await);
@@ -3892,7 +4603,7 @@ fn test_delete_conflict() {
         let mut builder = KVDBManagerBuilder::new(rt_copy.clone(), tr_mgr, "./db");
         match builder.startup().await {
             Err(e) => {
-                panic!(e);
+                panic!("{:?}", e);
             },
             Ok(db) => {
                 println!("!!!!!!db table size: {:?}", db.table_size().await);
@@ -4110,7 +4821,7 @@ fn test_dirty_delete_conflict() {
         let mut builder = KVDBManagerBuilder::new(rt_copy.clone(), tr_mgr, "./db");
         match builder.startup().await {
             Err(e) => {
-                panic!(e);
+                panic!("{:?}", e);
             },
             Ok(db) => {
                 println!("!!!!!!db table size: {:?}", db.table_size().await);
@@ -4332,7 +5043,7 @@ fn test_log_table_debug() {
         let mut builder = KVDBManagerBuilder::new(rt_copy.clone(), tr_mgr, "./db");
         match builder.startup().await {
             Err(e) => {
-                panic!(e);
+                panic!("{:?}", e);
             },
             Ok(db) => {
                 println!("!!!!!!db table size: {:?}", db.table_size().await);
@@ -4685,7 +5396,7 @@ fn test_append_new_commit_log() {
         let mut builder = KVDBManagerBuilder::new(rt_copy.clone(), tr_mgr, "./db");
         match builder.startup().await {
             Err(e) => {
-                panic!(e);
+                panic!("{:?}", e);
             },
             Ok(db) => {
                 println!("!!!!!!db table size: {:?}", db.table_size().await);
