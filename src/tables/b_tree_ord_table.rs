@@ -939,6 +939,11 @@ impl<
 
         async move {
             if let Some(inner_transaction) = &mut *tr.0.inner_transaction.lock() {
+                if !inner_transaction.is_writable() {
+                    //不是可写内部事务，则中止修改操作，并立即返回
+                    return Ok(());
+                }
+
                 if let Err(e) = inner_transaction.upsert(key.clone(), value.clone()) {
                     Err(KVTableTrError::new_transaction_error(ErrorLevel::Normal, e))
                 } else {
@@ -967,6 +972,11 @@ impl<
 
         async move {
             if let Some(inner_transaction) = &mut *tr.0.inner_transaction.lock() {
+                if !inner_transaction.is_writable() {
+                    //不是可写内部事务，则中止删除操作，并立即返回
+                    return Ok(None);
+                }
+
                 match inner_transaction.delete(&key) {
                     Err(e) => {
                         Err(KVTableTrError::new_transaction_error(ErrorLevel::Normal, e))
