@@ -1539,6 +1539,8 @@ fn bench_b_tree_table(b: &mut Bencher) {
             if let Some((key, value)) = stream.next().await {
                 assert_eq!(binary_to_usize(&key).unwrap(), index);
                 assert_eq!(String::from_utf8_lossy(value.as_ref()).as_ref(), "Hello World!");
+            } else {
+                panic!("assert failed");
             }
         }
         println!("======> assert ok");
