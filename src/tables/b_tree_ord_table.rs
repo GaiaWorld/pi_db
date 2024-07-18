@@ -10,7 +10,8 @@ use std::ops::Deref;
 use pi_async_rt::{rt::{AsyncRuntime,
                        multi_thread::MultiTaskRuntime},
                   lock::spin_lock::SpinLock};
-use async_lock::Mutex as AsyncMutex;
+use async_lock::{Mutex as AsyncMutex, RwLock as AsyncRwLock};
+use async_channel::{Sender, Receiver, bounded};
 use pi_async_transaction::{AsyncCommitLog,
                            TransactionError,
                            Transaction2Pc,
@@ -31,7 +32,7 @@ use pi_atom::Atom;
 use pi_guid::Guid;
 use pi_hash::XHashMap;
 use pi_bon::ReadBuffer;
-use log::{trace, debug, error, info};
+use log::{trace, debug, error, warn, info};
 use pi_store::log_store::log_file::LogMethod;
 
 use crate::{Binary, KVAction, KVActionLog, KVDBCommitConfirm, KVTableTrError, TableTrQos, TransactionDebugEvent, transaction_debug_logger,
@@ -253,6 +254,8 @@ impl<
                                      name: Atom,
                                      cache_size: usize,
                                      enable_compact: bool,
+                                     write_conflict_limit: usize,
+                                     write_conflict_timeout: usize,
                                      waits_limit: usize,
                                      wait_timeout: usize) -> Self
     {
@@ -261,6 +264,8 @@ impl<
                       name,
                       cache_size,
                       enable_compact,
+                      write_conflict_limit,
+                      write_conflict_timeout,
                       waits_limit,
                       wait_timeout)
             .await
@@ -273,6 +278,8 @@ impl<
                                                 name: Atom,
                                                 mut cache_size: usize,
                                                 enable_compact: bool,
+                                                write_conflict_limit: usize,
+                                                write_conflict_timeout: usize,
                                                 waits_limit: usize,
                                                 wait_timeout: usize) -> Option<Self>
     {
@@ -343,6 +350,7 @@ impl<
                 let prepare = Mutex::new(XHashMap::default());
                 let write_lock_allocator = AtomicU64::new(INIT_LOCK_WRITE_UID);
                 let write_lock = AtomicU64::new(UNLOCKED_WRITE_FLAG);
+                let write_conflict_commits = AsyncRwLock::new(VecDeque::new());
                 let waits = AsyncMutex::new(VecDeque::new());
                 let waits_size = AtomicUsize::new(0);
                 let collecting = AtomicBool::new(false);
@@ -356,6 +364,9 @@ impl<
                     write_lock_allocator,
                     write_lock,
                     enable_compact: AtomicBool::new(enable_compact),
+                    write_conflict_commits,
+                    write_conflict_limit,
+                    write_conflict_timeout,
                     waits,
                     waits_size,
                     waits_limit,
@@ -370,13 +381,26 @@ impl<
                     enable_compact,
                     now.elapsed());
 
+                //启动有序B树表的提交写冲突事务的定时整理
+                let table_copy = table.clone();
+                let _ = table.0.rt.spawn(async move {
+                    let table_ref = &table_copy;
+                    loop {
+                        collect_write_conflict(table_ref,
+                                               Some(table_copy.0.write_conflict_timeout))
+                            .await;
+                    }
+                });
+
                 //启动有序B树表的提交待确认事务的定时整理
                 let table_copy = table.clone();
                 let _ = table.0.rt.spawn(async move {
                     let table_ref = &table_copy;
                     loop {
                         match collect_waits(table_ref,
-                                            Some(table_copy.0.wait_timeout)).await {
+                                            Some(table_copy.0.wait_timeout))
+                            .await
+                        {
                             Err((collect_time, statistics)) => {
                                 error!("Collect b-tree ordered table failed, table: {:?}, time: {:?}, statistics: {:?}, reason: out of time",
                                     table_copy.name().as_str(),
@@ -465,6 +489,12 @@ struct InnerBtreeOrderedTable<
     write_lock:             AtomicU64,
     //是否允许对有序B树表进行整理压缩
     enable_compact:         AtomicBool,
+    //写冲突事务缓冲
+    write_conflict_commits:  AsyncRwLock<VecDeque<(XHashMap<Binary, KVActionLog>, Sender<IOResult<XHashMap<Binary, KVActionLog>>>)>>,
+    //等待异步提交的写冲突事务缓冲的大小限制
+    write_conflict_limit:   usize,
+    //等待提交的写冲突事务缓冲的超时时长，单位毫秒
+    write_conflict_timeout: usize,
     //等待异步写日志文件的已提交的有序日志事务列表
     waits:                  AsyncMutex<VecDeque<(BtreeOrdTabTr<C, Log>, XHashMap<Binary, KVActionLog>, <BtreeOrdTabTr<C, Log> as Transaction2Pc>::CommitConfirm)>>,
     //等待异步写日志文件的已提交的有序日志事务的键值对大小
@@ -734,7 +764,7 @@ impl<
 
         let is_write_conflict = inner_transaction.is_write_conflict();
         if inner_transaction.is_writable() {
-            //非持久化的提交内部事务
+            //非持久化的提交内部写事务
             if let Err(e) = inner_transaction.commit() {
                 //内部事务提交失败
                 let result = Err(KVTableTrError::new_transaction_error(ErrorLevel::Fatal,
@@ -756,6 +786,16 @@ impl<
                     .table
                     .try_unlock_write(write_lock_uid);
             }
+        } else {
+            //关闭内部非写事务
+            if let Err(e) = inner_transaction.close() {
+                warn!("Commit b-tree ordered table failed, table: {:?}, source: {:?}, transaction_uid: {:?}, prepare_uid: {:?}, reason: {:?}",
+                    self.0.table.name().as_str(),
+                    self.0.source,
+                    self.get_transaction_uid(),
+                    self.get_prepare_uid(),
+                    e);
+            }
         }
 
         //根据写缓冲区大小确定是否持久化提交
@@ -776,101 +816,63 @@ impl<
 
                 //更新有序B树表的根节点
                 if let Some(actions) = table_prepare.remove(&transaction_uid) {
-                    //从有序B树表的预提交表中移除当前事务的操作记录
+                    //有序B树表提交日志写成功后，从有序B树表的预提交表中移除当前事务的操作记录
                     actions
                 } else {
                     XHashMap::default()
                 }
             };
 
-            if is_write_conflict {
-                //是内部写冲突事务，则强制获取写锁
-                let write_lock_uid = loop {
-                    if let Some(lock) = tr.0.table.try_lock_write() {
-                        //尝试获取锁成功
-                        break lock;
-                    } else {
-                        //尝试获取锁失败，则稍候重试
-                        tr
-                            .0
-                            .table
-                            .0
-                            .rt
-                            .timeout(0)
-                            .await;
-                        continue;
-                    }
+            let actions = if is_write_conflict {
+                //当前事务是写冲突事务，则将当前缓冲事务加入当前表的写冲突事务缓冲区，并异步等待写冲突事务的修改和非持久化提交完成
+                let (sender, receiver) = bounded(1);
+                let write_conflict_commits_len = {
+                    let mut locked = tr
+                        .0
+                        .table
+                        .0
+                        .write_conflict_commits
+                        .write()
+                        .await;
+                    locked.push_back((actions, sender));
+                    locked.len()
                 };
 
-                //立即开始内部写事务
-                let mut new_inner_transaction = match tr.0.table.0.inner.read().begin_write() {
+                if write_conflict_commits_len >= tr.0.table.0.write_conflict_limit {
+                    //当前表的写冲突事务缓冲区的数量已达限制，则强制异步整理当前表的写冲突事务缓冲区
+                    let table = tr.0.table.clone();
+                    tr.0.table.0.rt.spawn(async move {
+                        collect_write_conflict(&table, None);
+                    });
+                }
+
+                match receiver.recv().await {
                     Err(e) => {
-                        let _ = tr.0.table.try_unlock_write(write_lock_uid);
                         return Err(KVTableTrError::new_transaction_error(ErrorLevel::Fatal,
-                                                                         format!("Commit b-tree ordered table failed, table: {:?}, source: {:?}, transaction_uid: {:?}, prepare_uid: {:?}, reason: {:?}",
-                                                                                 tr.0.table.name().as_str(),
-                                                                                 tr.0.source,
-                                                                                 tr.get_transaction_uid(),
-                                                                                 tr.get_prepare_uid(),
+                                                                         format!("Conflict commit b-tree ordered table failed, table: {:?}, source: {:?}, transaction_uid: {:?}, prepare_uid: {:?}, reason: {:?}",
+                                                                                 self.0.table.name().as_str(),
+                                                                                 self.0.source,
+                                                                                 self.get_transaction_uid(),
+                                                                                 self.get_prepare_uid(),
                                                                                  e)));
                     },
-                    Ok(mut transaction) => {
-                        transaction.set_durability(Durability::None);
-                        InnerTransaction::Writable(transaction, tr.0.table.name())
+                    Ok(Err(e)) => {
+                        return Err(KVTableTrError::new_transaction_error(ErrorLevel::Fatal,
+                                                                         format!("Conflict commit b-tree ordered table failed, table: {:?}, source: {:?}, transaction_uid: {:?}, prepare_uid: {:?}, reason: {:?}",
+                                                                                 self.0.table.name().as_str(),
+                                                                                 self.0.source,
+                                                                                 self.get_transaction_uid(),
+                                                                                 self.get_prepare_uid(),
+                                                                                 e)));
                     },
-                };
-
-                //立即在新的内部写事务上执行修改或删除操作
-                for (key, action) in actions.iter() {
-                    match action {
-                        KVActionLog::Write(None) | KVActionLog::DirtyWrite(None) => {
-                            //删除指定关键字
-                            if let Err(e) = new_inner_transaction.delete(key) {
-                                //删除失败
-                                return Err(KVTableTrError::new_transaction_error(ErrorLevel::Fatal,
-                                                                                 format!("Commit b-tree ordered table failed, table: {:?}, source: {:?}, transaction_uid: {:?}, prepare_uid: {:?}, reason: {:?}",
-                                                                                         tr.0.table.name().as_str(),
-                                                                                         tr.0.source,
-                                                                                         tr.get_transaction_uid(),
-                                                                                         tr.get_prepare_uid(),
-                                                                                         e)));
-                            }
-                        },
-                        KVActionLog::Write(Some(value)) | KVActionLog::DirtyWrite(Some(value)) => {
-                            //插入或更新指定关键字
-                            if let Err(e) = new_inner_transaction.upsert(key.clone(), value.clone()) {
-                                //修改失败
-                                return Err(KVTableTrError::new_transaction_error(ErrorLevel::Fatal,
-                                                                                 format!("Commit b-tree ordered table failed, table: {:?}, source: {:?}, transaction_uid: {:?}, prepare_uid: {:?}, reason: {:?}",
-                                                                                         self.0.table.name().as_str(),
-                                                                                         self.0.source,
-                                                                                         self.get_transaction_uid(),
-                                                                                         self.get_prepare_uid(),
-                                                                                         e)));
-                            }
-                        },
-                        KVActionLog::Read => (), //忽略读操作
-                    }
+                    Ok(Ok(actions)) => {
+                        actions
+                    },
                 }
-
-                //非持久化提交新的内部写事务
-                if let Err(e) = new_inner_transaction.commit() {
-                    //内部事务提交失败
-                    return Err(KVTableTrError::new_transaction_error(ErrorLevel::Fatal,
-                                                                     format!("Commit b-tree ordered table failed, table: {:?}, source: {:?}, transaction_uid: {:?}, prepare_uid: {:?}, reason: {:?}",
-                                                                             tr.0.table.name().as_str(),
-                                                                             tr.0.source,
-                                                                             tr.get_transaction_uid(),
-                                                                             tr.get_prepare_uid(),
-                                                                             e)));
-                }
-
-                //安全的强制解除表的写锁
-                let _ = tr
-                    .0
-                    .table
-                    .try_unlock_write(write_lock_uid);
-            }
+            } else {
+                //当前事务是非写冲突事务
+                actions
+            };
 
             if tr.is_require_persistence() {
                 let rt = tr.0.table.0.rt.clone();
@@ -1124,7 +1126,7 @@ impl<
             if let Some(inner_transaction) = &*transaction.0.inner_transaction.lock() {
                 match inner_transaction {
                     InnerTransaction::OnlyRead(trans, name) => {
-                        let table = if let Ok(table) = trans.open_table::<Binary, Binary>(TableDefinition::new(name.as_str())) {
+                        let table = if let Ok(table) = trans.open_table(DEFAULT_TABLE_NAME) {
                             table
                         } else {
                             return;
@@ -1149,7 +1151,7 @@ impl<
                         }
                     },
                     InnerTransaction::WriteConflict(trans, name) => {
-                        let table = if let Ok(table) = trans.open_table::<Binary, Binary>(TableDefinition::new(name.as_str())) {
+                        let table = if let Ok(table) = trans.open_table(DEFAULT_TABLE_NAME) {
                             table
                         } else {
                             return;
@@ -1174,7 +1176,7 @@ impl<
                         }
                     },
                     InnerTransaction::Writable(trans, name) => {
-                        let table = if let Ok(table) = trans.open_table::<Binary, Binary>(TableDefinition::new(name.as_str())) {
+                        let table = if let Ok(table) = trans.open_table(DEFAULT_TABLE_NAME) {
                             table
                         } else {
                             return;
@@ -1215,7 +1217,7 @@ impl<
             if let Some(inner_transaction) = &*transaction.0.inner_transaction.lock() {
                 match inner_transaction {
                     InnerTransaction::OnlyRead(trans, name) => {
-                        let table = if let Ok(table) = trans.open_table::<Binary, Binary>(TableDefinition::new(name.as_str())) {
+                        let table = if let Ok(table) = trans.open_table(DEFAULT_TABLE_NAME) {
                             table
                         } else {
                             return;
@@ -1240,7 +1242,7 @@ impl<
                         }
                     },
                     InnerTransaction::WriteConflict(trans, name) => {
-                        let table = if let Ok(table) = trans.open_table::<Binary, Binary>(TableDefinition::new(name.as_str())) {
+                        let table = if let Ok(table) = trans.open_table(DEFAULT_TABLE_NAME) {
                             table
                         } else {
                             return;
@@ -1265,7 +1267,7 @@ impl<
                         }
                     },
                     InnerTransaction::Writable(trans, name) => {
-                        let table = if let Ok(table) = trans.open_table::<Binary, Binary>(TableDefinition::new(name.as_str())) {
+                        let table = if let Ok(table) = trans.open_table(DEFAULT_TABLE_NAME) {
                             table
                         } else {
                             return;
@@ -1562,7 +1564,7 @@ impl InnerTransaction {
     pub fn query(&self, key: &Binary) -> Option<Binary> {
         match self {
             InnerTransaction::OnlyRead(transaction, name) => {
-                if let Ok(table) = transaction.open_table::<Binary, Binary>(TableDefinition::new(name.as_str())) {
+                if let Ok(table) = transaction.open_table(DEFAULT_TABLE_NAME) {
                     match table.get(key) {
                         Err(e) => {
                             error!("Get inner transaction table value failed, table: {:?}, key: {:?}, reason: {:?}",
@@ -1584,7 +1586,7 @@ impl InnerTransaction {
                 }
             },
             InnerTransaction::WriteConflict(transaction, name) => {
-                if let Ok(table) = transaction.open_table::<Binary, Binary>(TableDefinition::new(name.as_str())) {
+                if let Ok(table) = transaction.open_table(DEFAULT_TABLE_NAME) {
                     match table.get(key) {
                         Err(e) => {
                             error!("Get inner transaction table value failed, table: {:?}, key: {:?}, reason: {:?}",
@@ -1606,7 +1608,7 @@ impl InnerTransaction {
                 }
             },
             InnerTransaction::Writable(transaction, name) => {
-                if let Ok(table) = transaction.open_table::<Binary, Binary>(TableDefinition::new(name.as_str())) {
+                if let Ok(table) = transaction.open_table(DEFAULT_TABLE_NAME) {
                     match table.get(key) {
                         Err(e) => {
                             error!("Get inner transaction table value failed, table: {:?}, key: {:?}, reason: {:?}",
@@ -1646,7 +1648,7 @@ impl InnerTransaction {
                                        key)))
             },
             InnerTransaction::Writable(transaction, name) => {
-                match transaction.open_table::<Binary, Binary>(TableDefinition::new(name.as_str())) {
+                match transaction.open_table(DEFAULT_TABLE_NAME) {
                     Err(e) => {
                         Err(Error::new(ErrorKind::Other, format!("Upsert inner transaction table value failed, table: {:?}, key: {:?}, reason: {:?}",
                                                                  name.as_str(),
@@ -1686,7 +1688,7 @@ impl InnerTransaction {
                                        name.as_str(), key)))
             },
             InnerTransaction::Writable(transaction, name) => {
-                match transaction.open_table::<Binary, Binary>(TableDefinition::new(name.as_str())) {
+                match transaction.open_table(DEFAULT_TABLE_NAME) {
                     Err(e) => {
                         Err(Error::new(ErrorKind::Other, format!("Delete inner transaction failed, table: {:?}, key: {:?}, reason: {:?}",
                                                                  name.as_str(),
@@ -1914,6 +1916,160 @@ impl InnerTransaction {
             Ok(())
         }
     }
+
+    // 关闭非可写事务
+    pub fn close(self) -> IOResult<()> {
+        match self {
+            InnerTransaction::OnlyRead(transaction, name) => {
+                if let Err(e) = transaction.close() {
+                    Err(Error::new(ErrorKind::Other,
+                                   format!("Rollback inner transaction failed, table: {:?}, reason: {:?}",
+                                           name.as_str(),
+                                           e)))
+                } else {
+                    Ok(())
+                }
+            },
+            InnerTransaction::WriteConflict(transaction, name) => {
+                if let Err(e) = transaction.close() {
+                    Err(Error::new(ErrorKind::Other,
+                                   format!("Rollback inner transaction failed, table: {:?}, reason: {:?}",
+                                           name.as_str(),
+                                           e)))
+                } else {
+                    Ok(())
+                }
+            },
+            _ => Ok(()),
+        }
+    }
+}
+
+async fn collect_write_conflict<
+    C: Clone + Send + 'static,
+    Log: AsyncCommitLog<C = C, Cid = Guid>,
+>(table: &BtreeOrderedTable<C, Log>, timeout: Option<usize>) {
+    if let Some(timeout) = timeout {
+        //需要等待指定时间后，再开始整理
+        table.0.rt.timeout(timeout).await;
+    }
+
+    //已达当前表的写冲突事务缓冲上限，则非持久化提交当前表的写冲突事务缓冲区中的所有写冲突事务
+    let write_confilct_commits: Vec<(XHashMap<Binary, KVActionLog>, Sender<IOResult<XHashMap<Binary, KVActionLog>>>)> = table
+        .0
+        .write_conflict_commits
+        .write()
+        .await
+        .drain(..)
+        .collect();
+    let (mut actions_vec, mut senders_vec): (Vec<XHashMap<Binary, KVActionLog>>, Vec<Sender<IOResult<XHashMap<Binary, KVActionLog>>>>) = write_confilct_commits.into_iter().unzip();
+
+    let write_lock_uid = loop {
+        if let Some(lock) = table.try_lock_write() {
+            //尝试获取锁成功
+            break lock;
+        } else {
+            //尝试获取锁失败，则稍候重试
+            table
+                .0
+                .rt
+                .timeout(0)
+                .await;
+            continue;
+        }
+    };
+
+    //立即开始内部写事务
+    let r = table.0.inner.read().begin_write();
+    if r.is_err() {
+        if let Err(e) = r {
+            //创建写事务失败，则通知所有异步等待非持久化提交成功的写冲突事务
+            let _ = table.try_unlock_write(write_lock_uid);
+
+            for sender in senders_vec {
+                sender
+                    .send(Err(Error::new(ErrorKind::Other,
+                                         format!("Conflict commit b-tree ordered table failed, table: {:?}, reason: {:?}",
+                                                 table.name().as_str(),
+                                                 e))))
+                    .await;
+            }
+
+            return;
+        }
+    }
+    let mut transaction = r.unwrap();
+    transaction.set_durability(Durability::None);
+    let mut new_inner_transaction = InnerTransaction::Writable(transaction, table.name());
+
+    //立即在新的内部写事务上执行写冲突事务的修改或删除操作
+    for actions in &actions_vec {
+        for (key, action) in actions.iter() {
+            match action {
+                KVActionLog::Write(None) | KVActionLog::DirtyWrite(None) => {
+                    //删除指定关键字
+                    if let Err(e) = new_inner_transaction.delete(key) {
+                        //删除失败，则通知所有异步等待非持久化提交成功的写冲突事务
+                        for sender in senders_vec {
+                            sender
+                                .send(Err(Error::new(ErrorKind::Other,
+                                                     format!("Conflict delete b-tree ordered table failed, table: {:?}, reason: {:?}",
+                                                             table.name().as_str(),
+                                                             e))))
+                                .await;
+                        }
+
+                        return;
+                    }
+                },
+                KVActionLog::Write(Some(value)) | KVActionLog::DirtyWrite(Some(value)) => {
+                    //插入或更新指定关键字
+                    if let Err(e) = new_inner_transaction.upsert(key.clone(), value.clone()) {
+                        //修改失败，则通知所有异步等待非持久化提交成功的写冲突事务
+                        for sender in senders_vec {
+                            sender
+                                .send(Err(Error::new(ErrorKind::Other,
+                                                     format!("Conflict upsert b-tree ordered table failed, table: {:?}, reason: {:?}",
+                                                             table.name().as_str(),
+                                                             e))))
+                                .await;
+                        }
+
+                        return;
+                    }
+                },
+                KVActionLog::Read => (), //忽略读操作
+            }
+        }
+    }
+
+    //非持久化提交新的内部写事务
+    if let Err(e) = new_inner_transaction.commit() {
+        //内部事务提交失败，则通知其它异步等待非持久化提交成功的写冲突事务
+        for sender in senders_vec {
+            sender
+                .send(Err(Error::new(ErrorKind::Other,
+                                     format!("Conflict commit b-tree ordered table failed, table: {:?}, reason: {:?}",
+                                             table.name().as_str(),
+                                             e))))
+                .await;
+        }
+
+        return;
+    }
+
+    //安全的强制解除表的写锁
+    let _ = table
+        .try_unlock_write(write_lock_uid);
+
+    //通知所有异步等待非持久化提交成功的写冲突事务
+    for (sender,
+        actions) in senders_vec.into_iter().zip(actions_vec.into_iter())
+    {
+        sender
+            .send(Ok(actions))
+            .await;
+    }
 }
 
 // 异步整理有序B树表中等待写入redb的事务，
@@ -1924,7 +2080,6 @@ async fn collect_waits<
 >(table: &BtreeOrderedTable<C, Log>, timeout: Option<usize>)
     -> Result<(Duration, (usize, usize, usize)), (Duration, (usize, usize, usize))>
 {
-    //等待指定的时间
     if let Some(timeout) = timeout {
         //需要等待指定时间后，再开始整理
         table.0.rt.timeout(timeout).await;
@@ -1994,6 +2149,7 @@ async fn collect_waits<
                             e);
                     },
                     Ok(mut transaction) => {
+                        transaction.set_durability(Durability::Immediate);
                         if let Err(e) = transaction.commit() {
                             //写入redb失败，则立即中止本次整理
                             let _ = table.try_unlock_write(lock); //立即释放当前B树表的写锁
@@ -2028,7 +2184,7 @@ async fn collect_waits<
         if let Err(e) = confirm(wait_tr.get_transaction_uid().unwrap(),
                                 wait_tr.get_commit_uid().unwrap(),
                                 Ok(())) {
-            error!("Commit b-tree ordered table failed, able: {:?}, source: {:?}, transaction_uid: {:?}, prepare_uid: {:?}, reason: {:?}",
+            error!("Commit b-tree ordered table failed, table: {:?}, source: {:?}, transaction_uid: {:?}, prepare_uid: {:?}, reason: {:?}",
                 wait_tr.0.table.name().as_str(),
                 wait_tr.0.source,
                 wait_tr.get_transaction_uid(),

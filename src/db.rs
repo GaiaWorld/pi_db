@@ -2413,6 +2413,8 @@ impl<
                                                name.clone(),
                                                cache_size,
                                                enable_compact,
+                                               100,
+                                               10,
                                                1024 * 1024,
                                                60 * 1000).await;
 
@@ -2680,6 +2682,8 @@ impl<
                                                        name.clone(),
                                                        cache_size,
                                                        enable_compact,
+                                                       100,
+                                                       10,
                                                        1024 * 1024,
                                                        60 * 1000).await;
 
@@ -2819,6 +2823,8 @@ impl<
                                                name.clone(),
                                                16 * 1024 * 1024,
                                                true,
+                                               100,
+                                               10,
                                                1024 * 1024,
                                                60 * 1000).await {
                     //尝试创建成功，则注册创建的有序日志表

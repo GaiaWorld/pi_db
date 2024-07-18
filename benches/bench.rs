@@ -1448,6 +1448,7 @@ fn bench_b_tree_table(b: &mut Bencher) {
 
     let rt_copy = rt.clone();
     let db = receiver.recv().unwrap();
+    let db_copy = db.clone();
     b.iter(move || {
         let (s, r) = unbounded();
         let table_name = Atom::from("test_log/a/b/c");
@@ -1529,7 +1530,21 @@ fn bench_b_tree_table(b: &mut Bencher) {
         println!("time: {:?}", Instant::now() - now);
     });
 
-    thread::sleep(Duration::from_millis(60000));
+    rt.spawn(async move {
+        let mut transaction = db_copy
+            .transaction(Atom::from("test_log/a/b/c"), false, 5000, 5000)
+            .unwrap();
+        let mut stream = transaction.values(Atom::from("test_log/a/b/c"), None, false).await.unwrap();
+        for index in 0..100 {
+            if let Some((key, value)) = stream.next().await {
+                assert_eq!(binary_to_usize(&key).unwrap(), index);
+                assert_eq!(String::from_utf8_lossy(value.as_ref()).as_ref(), "Hello World!");
+            }
+        }
+        println!("======> assert ok");
+    });
+
+    thread::sleep(Duration::from_millis(70000));
 }
 
 #[bench]

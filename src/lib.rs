@@ -31,10 +31,24 @@ pub mod utils;
 ///
 /// 二进制数据
 ///
-#[derive(Debug, Clone, Hash)]
+#[derive(Debug, Hash)]
 pub struct Binary(Arc<Vec<u8>>);
 
 unsafe impl Send for Binary {}
+
+impl Drop for Binary {
+    fn drop(&mut self) {
+        if Arc::strong_count(&self.0) <= 1 {
+            println!("======> Drop Binary");
+        }
+    }
+}
+
+impl Clone for Binary {
+    fn clone(&self) -> Self {
+        Binary(self.0.clone())
+    }
+}
 
 impl AsRef<[u8]> for Binary {
     fn as_ref(&self) -> &[u8] {
