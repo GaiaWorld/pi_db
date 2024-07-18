@@ -2,13 +2,14 @@ use std::mem::swap;
 use std::time::Instant;
 use std::convert::TryInto;
 use std::path::{Path, PathBuf};
-use std::collections::{VecDeque, HashMap};
+use std::collections::{VecDeque, HashMap, BTreeMap};
 use std::io::{Error, Result as IOResult, ErrorKind};
-use std::sync::{Arc, atomic::{AtomicBool, AtomicU64, Ordering}};
+use std::sync::{Arc,
+                atomic::{AtomicBool, AtomicU64, Ordering}};
 
 use futures::{future::{FutureExt, BoxFuture}, stream::BoxStream, StreamExt};
 use crossbeam_channel::bounded;
-use async_lock::RwLock;
+use async_lock::{Mutex, RwLock};
 use dashmap::DashMap;
 use lazy_static::lazy_static;
 use bytes::BufMut;
@@ -93,6 +94,16 @@ const DB_CLOSEING_STATUS: u64 = 3;
 /// 数据库已关闭状态
 ///
 const DB_CLOSED_STATUS: u64 = 4;
+
+///
+/// 启动数据库的源
+///
+const STARTUP_DB_SOURCE: &str = "Startup db";
+
+///
+/// 修复数据库时的源
+///
+const REPAIR_DB_SOURCE: &str = "Repair db";
 
 #[cfg(feature = "trace")]
 lazy_static! {
@@ -193,7 +204,7 @@ impl<
 
         //根据元信息表的元信息，加载其它表，加载操作使用的事务，不需要预提交和提交
         let mut tr = db_mgr
-            .transaction(Atom::from("Startup db"),
+            .transaction(Atom::from(STARTUP_DB_SOURCE),
                          true,
                          1000,
                          1000)
@@ -631,6 +642,8 @@ impl<
         //构建重播回调
         let db_mgr = self.clone();
 
+        let tables = Arc::new(Mutex::new(BTreeMap::new()));
+        let tables_copy = tables.clone();
         let replay_callback = move |commit_uid: Guid, prepare_output: Vec<u8>| -> IOResult<()> {
             //异步执行重播
             let db_mgr_copy = db_mgr.clone();
@@ -638,6 +651,7 @@ impl<
             let meta_table_name = Atom::from(DEFAULT_DB_TABLES_META_DIR);
             let (sender, receiver) = bounded(1);
 
+            let tables_clone = tables_copy.clone();
             let boxed = async move {
                 let bytes_len = prepare_output.len(); //获取日志缓冲区长度
                 let mut offset = 0; //日志缓冲区偏移
@@ -646,11 +660,11 @@ impl<
                 let transaciton_uid = Guid(uid);
                 offset += 16; //移动缓冲区指针
 
-                if let Some(tr) =
-                db_mgr_copy.transaction(Atom::from("Repair db"),
-                                        true,
-                                        5000,
-                                        5000) {
+                if let Some(tr) = db_mgr_copy.transaction(Atom::from(REPAIR_DB_SOURCE),
+                                                          true,
+                                                          5000,
+                                                          5000)
+                {
                     //创建数据库事务成功，则迭代日志缓冲区中，本次未确认的提交日志中执行写操作的表和相关键值对
                     //迭代完成后，则可以恢复本次未确认的提交日志对表的内存键值对的修改，并生成对应的键值对操作记录
                     while offset < bytes_len {
@@ -697,6 +711,10 @@ impl<
                             }
                         } else {
                             //未确认的提交日志操作的表是其它表，则执行本次未确认的提交日志中指定表的键值对写操作
+                            tables_clone
+                                .lock()
+                                .await
+                                .insert(table.clone(), ());
                             for write in writes {
                                 if write.exist_value() {
                                     //有值，则执行插入或更新操作
@@ -723,7 +741,11 @@ impl<
                     //指定本次重播事务的事务唯一id后执行预提交修复
                     if let Err(e) = tr.prepare_repair(transaciton_uid.clone()).await {
                         //预提交重播事务失败，则立即返回错误原因
-                        let _ = sender.send(Err(Error::new(ErrorKind::Other, format!("Repair db failed, transaction_uid: {:?}, commit_uid: {:?}, reason: {:?}", transaciton_uid, commit_uid_copy, e))));
+                        let _ = sender.send(Err(Error::new(ErrorKind::Other,
+                                                           format!("Repair db failed, transaction_uid: {:?}, commit_uid: {:?}, reason: {:?}",
+                                                                   transaciton_uid,
+                                                                   commit_uid_copy,
+                                                                   e))));
                         return;
                     }
 
@@ -733,7 +755,11 @@ impl<
                                        commit_uid_copy.clone(),
                                        prepare_output).await {
                         //提交重播事务失败，则立即返回错误原因
-                        let _ = sender.send(Err(Error::new(ErrorKind::Other, format!("Repair db failed, transaction_uid: {:?}, commit_uid: {:?}, reason: {:?}", transaciton_uid, commit_uid_copy, e))));
+                        let _ = sender.send(Err(Error::new(ErrorKind::Other,
+                                                           format!("Repair db failed, transaction_uid: {:?}, commit_uid: {:?}, reason: {:?}",
+                                                                   transaciton_uid,
+                                                                   commit_uid_copy,
+                                                                   e))));
                         return;
                     }
 
@@ -764,6 +790,14 @@ impl<
 
         //所有未确认的提交日志已完成重播，则立即返回数据库修复成功
         let _ = self.0.tr_mgr.finish_replay().await?; //通知事务管理器，已完成重播
+
+        for table in tables.lock().await.keys() {
+            if let Some(KVDBTable::BtreeOrdTab(tab)) = self.get_table(table).await {
+                //当前表存在且为有序B树表，则立即整理
+                tab.collect().await;
+            }
+        }
+
         return Ok(replay_result);
     }
 }
@@ -2233,6 +2267,21 @@ impl<
                 table_tr
             },
             KVDBTable::BtreeOrdTab(tab) => {
+                // let tr = if self.get_source().as_str() == REPAIR_DB_SOURCE {
+                //     //正在修复数据库
+                //     tab.transaction_repair(self.get_source(),
+                //                            self.is_writable(),
+                //                            is_persistent,
+                //                            self.get_prepare_timeout(),
+                //                            self.get_commit_timeout())
+                // } else {
+                //     //不是正在修复数据库
+                //     tab.transaction(self.get_source(),
+                //                     self.is_writable(),
+                //                     is_persistent,
+                //                     self.get_prepare_timeout(),
+                //                     self.get_commit_timeout())
+                // };
                 let tr = tab.transaction(self.get_source(),
                                          self.is_writable(),
                                          is_persistent,

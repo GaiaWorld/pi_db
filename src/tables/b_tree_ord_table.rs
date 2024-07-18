@@ -422,6 +422,21 @@ impl<
         }
     }
 
+    /// 创建修复用事务
+    pub(crate) fn transaction_repair(&self,
+                                     source: Atom,
+                                     is_writable: bool,
+                                     is_persistent: bool,
+                                     prepare_timeout: u64,
+                                     commit_timeout: u64) -> <Self as KVTable>::Tr {
+        BtreeOrdTabTr::with_repair(source,
+                                   is_writable,
+                                   is_persistent,
+                                   prepare_timeout,
+                                   commit_timeout,
+                                   self.clone())
+    }
+
     /// 尝试获取当前B树表的唯一写锁，成功返回写锁的唯一ID，失败返回空
     pub(crate) fn try_lock_write(&self) -> Option<u64> {
         if self.0.write_lock.load(Ordering::Acquire) == UNLOCKED_WRITE_FLAG {
@@ -762,7 +777,8 @@ impl<
             }.boxed();
         };
 
-        let is_write_conflict = inner_transaction.is_write_conflict();
+        let is_write_conflict = inner_transaction.is_write_conflict()
+            || inner_transaction.is_repair(); //写冲突事务或修复表事务都是写冲突
         if inner_transaction.is_writable() {
             //非持久化的提交内部写事务
             if let Err(e) = inner_transaction.commit() {
@@ -1061,7 +1077,7 @@ impl<
                     }
                 }
 
-                //可写事务或写冲突事务需要记录修改操作
+                //可写事务，写冲突事务或修复表事务需要记录修改操作
                 let _ = tr.0.actions.lock().insert(key.clone(), KVActionLog::Write(Some(value.clone()))); //记录对指定关键字的最新插入或更新操作
                 Ok(())
             } else {
@@ -1104,7 +1120,7 @@ impl<
                     None
                 };
 
-                //可写事务或写冲突事务需要记录删除操作
+                //可写事务，写冲突事务或修复表事务需要记录删除操作
                 let _ = tr.0.actions.lock().insert(key.clone(), KVActionLog::Write(None)); //记录对指定关键字的最新删除操作
                 Ok(last_value)
             } else {
@@ -1200,6 +1216,10 @@ impl<
                             }
                         }
                     },
+                    InnerTransaction::Repair(_trans, _name) => {
+                        //修复时不允许迭代
+                        return;
+                    },
                 }
             }
         };
@@ -1290,6 +1310,10 @@ impl<
                                 }
                             }
                         }
+                    },
+                    InnerTransaction::Repair(_trans, _name) => {
+                        //修复时不允许迭代
+                        return;
                     },
                 }
             }
@@ -1391,6 +1415,45 @@ impl<
         BtreeOrdTabTr(Arc::new(inner))
     }
 
+    //构建一个用于修复表的有序B树表事务
+    fn with_repair(source: Atom,
+                   is_writable: bool,
+                   is_persistent: bool,
+                   prepare_timeout: u64,
+                   commit_timeout: u64,
+                   table: BtreeOrderedTable<C, Log>) -> Self {
+        let table_name = table.name();
+        let mut write_lock = None;
+        //当前有正在执行的写事务，则构建一个只读的写冲突内部事务，后续有任何写操作将直接返回冲突
+        let inner_transaction = match table.0.inner.read().begin_read() {
+            Err(e) => {
+                panic!("Create b-tree ordered table inner repair transaction failed, table: {:?}, reason: {:?}",
+                       table_name.as_str(),
+                       e);
+            },
+            Ok(transaction) => {
+                InnerTransaction::Repair(transaction, table_name)
+            },
+        };
+
+        let inner = InnerBtreeOrdTabTr {
+            source,
+            tid: SpinLock::new(None),
+            cid: SpinLock::new(None),
+            status: SpinLock::new(Transaction2PcStatus::default()),
+            writable: is_writable,
+            persistence: AtomicBool::new(is_persistent),
+            prepare_timeout,
+            commit_timeout,
+            table,
+            actions: SpinLock::new(XHashMap::default()),
+            write_lock,
+            inner_transaction: SpinLock::new(Some(inner_transaction)),
+        };
+
+        BtreeOrdTabTr(Arc::new(inner))
+    }
+
     // 检查有序B树表的预提交表的读写冲突
     fn check_prepare_conflict(&self,
                               prepare: &mut XHashMap<Guid, XHashMap<Binary, KVActionLog>>,
@@ -1445,23 +1508,21 @@ impl<
         //获取事务的当前操作记录，并重置事务的当前操作记录
         let actions = mem::replace(&mut *self.0.actions.lock(), XHashMap::default());
 
-        //在事务对应的表的根节点，执行操作记录中的所有写操作
         if let Some(inner_transaction) = &mut *self.0.inner_transaction.lock() {
-            for (key, action) in &actions {
-                match action {
-                    KVActionLog::Write(Some(value)) | KVActionLog::DirtyWrite(Some(value)) => {
-                        //执行插入或更新指定关键字的值的操作
-                        if let Err(e) = inner_transaction.upsert(key.clone(), value.clone()) {
-                            panic!("{:?}", e);
-                        }
-                    },
-                    KVActionLog::Write(None) | KVActionLog::DirtyWrite(None) => {
-                        //执行删除指定关键字的值的操作
-                        if let Err(e) = inner_transaction.delete(&key) {
-                            panic!("{:?}", e);
-                        }
-                    },
-                    KVActionLog::Read => (), //忽略读操作
+            if inner_transaction.is_writable() {
+                //当前事务是写事务，则在事务对应的表的根节点，执行操作记录中的所有写操作
+                for (key, action) in &actions {
+                    match action {
+                        KVActionLog::Write(Some(value)) | KVActionLog::DirtyWrite(Some(value)) => {
+                            //执行插入或更新指定关键字的值的操作
+                            inner_transaction.upsert(key.clone(), value.clone());
+                        },
+                        KVActionLog::Write(None) | KVActionLog::DirtyWrite(None) => {
+                            //执行删除指定关键字的值的操作
+                            inner_transaction.delete(key);
+                        },
+                        KVActionLog::Read => (), //忽略读操作
+                    }
                 }
             }
         }
@@ -1529,7 +1590,8 @@ impl<
 pub(crate) enum InnerTransaction {
     OnlyRead(ReadTransaction, Atom),        //只读事务
     Writable(WriteTransaction, Atom),       //可写事务
-    WriteConflict(ReadTransaction, Atom),   //写冲突事务，不可写
+    WriteConflict(ReadTransaction, Atom),   //写冲突事务
+    Repair(ReadTransaction, Atom),          //修复表事务
 }
 
 impl InnerTransaction {
@@ -1554,6 +1616,15 @@ impl InnerTransaction {
     // 判断是否是写冲突事务
     pub fn is_write_conflict(&self) -> bool {
         if let InnerTransaction::WriteConflict(_, _) = self {
+            true
+        } else {
+            false
+        }
+    }
+
+    // 判断是否是修复表事务
+    pub fn is_repair(&self) -> bool {
+        if let InnerTransaction::Repair(_, _) = self {
             true
         } else {
             false
@@ -1629,6 +1700,10 @@ impl InnerTransaction {
                     None
                 }
             },
+            InnerTransaction::Repair(_trans, _name) => {
+                //修复时不允许查询
+                None
+            },
         }
     }
 
@@ -1669,6 +1744,10 @@ impl InnerTransaction {
                         }
                     },
                 }
+            },
+            InnerTransaction::Repair(_trans, _name) => {
+                //修复事务不允许直接修改，会被转化为一个可写事务
+                Ok(())
             },
         }
     }
@@ -1713,6 +1792,10 @@ impl InnerTransaction {
                         }
                     },
                 }
+            },
+            InnerTransaction::Repair(_trans, _name) => {
+                //修复事务不允许直接删除，会被转化为一个可写事务
+                Ok(None)
             },
         }
     }
@@ -1776,6 +1859,10 @@ impl InnerTransaction {
                 InnerTransaction::Writable(_, _) => {
                     None
                 },
+                InnerTransaction::Repair(_trans, _name) => {
+                    //修复事务不允许迭代
+                    None
+                },
             }
         } else {
             //未指定关键字
@@ -1811,6 +1898,10 @@ impl InnerTransaction {
                     Some(iterator)
                 },
                 InnerTransaction::Writable(_, _) => {
+                    None
+                },
+                InnerTransaction::Repair(_trans, _name) => {
+                    //修复事务不允许迭代
                     None
                 },
             }
@@ -1854,6 +1945,10 @@ impl InnerTransaction {
                         },
                     }
                 },
+                InnerTransaction::Repair(_trans, _name) => {
+                    //修复事务不允许迭代
+                    None
+                },
             }
         } else {
             //未指定关键字
@@ -1876,6 +1971,10 @@ impl InnerTransaction {
                             Some(iterator)
                         },
                     }
+                },
+                InnerTransaction::Repair(_trans, _name) => {
+                    //修复事务不允许迭代
+                    None
                 },
             }
         }
