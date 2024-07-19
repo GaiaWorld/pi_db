@@ -307,7 +307,7 @@ impl<
 
         //在Linux下启动完成后清理一次内存
         #[cfg(target_os = "linux")]
-        db_copy.cleanup_buffer_after_collect_table();
+        db_mgr.cleanup_buffer_after_collect_table();
 
         Ok(db_mgr)
     }
