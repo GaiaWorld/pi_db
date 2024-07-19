@@ -60,11 +60,11 @@ const DEFAULT_CACHE_SIZE: usize = 16 * 1024 * 1024;
 
 // 默认的全局有序B树表的内存清理时间间隔
 #[cfg(target_os = "linux")]
-const DEFAULT_GLOBAL_B_TREE_ORDERED_TABLE_CLEANUP_INTERVAL: usize = 90000;
+pub(crate) const DEFAULT_GLOBAL_B_TREE_ORDERED_TABLE_CLEANUP_INTERVAL: usize = 90000;
 
 // 有序B树表的清理标记
 #[cfg(target_os = "linux")]
-static GLOBAL_B_TREE_ORDERED_TABLE_CLEANUP_FLAG: AtomicBool = AtomicBool::new(false);
+pub(crate) static GLOBAL_B_TREE_ORDERED_TABLE_CLEANUP_FLAG: AtomicBool = AtomicBool::new(false);
 
 impl Value for Binary {
     type SelfType<'a>
@@ -424,27 +424,6 @@ impl<
                         }
                     }
                 });
-
-                //在Linux环境中启动全局有序B树表清理的定时任务
-                #[cfg(target_os = "linux")]
-                {
-                    if let Ok(_) = crate::tables::b_tree_ord_table::GLOBAL_B_TREE_ORDERED_TABLE_CLEANUP_FLAG
-                        .compare_exchange(false,
-                                          true,
-                                          Ordering::AcqRel,
-                                          Ordering::Relaxed) {
-                        //全局只启动一次
-                        let rt = table.0.rt.clone();
-                        let _ = table.0.rt.spawn(async move {
-                            loop {
-                                rt.timeout(DEFAULT_GLOBAL_B_TREE_ORDERED_TABLE_CLEANUP_INTERVAL).await;
-                                let now = Instant::now();
-                                db_copy.cleanup_buffer_after_collect_table();
-                                info!("Cleanup memory for global b-tree table finish, time: {:?}", now.elapsed());
-                            }
-                        });
-                    }
-                }
 
                 Some(table)
             },
