@@ -2,8 +2,10 @@
 
 extern crate test;
 
-use std::thread;
 use test::Bencher;
+
+use std::thread;
+use std::time::Instant;
 
 use futures::stream::StreamExt;
 use crossbeam_channel::{unbounded, bounded};
@@ -1530,8 +1532,9 @@ fn bench_b_tree_table(b: &mut Bencher) {
         println!("time: {:?}", Instant::now() - now);
     });
 
+    let db_clone = db_copy.clone();
     rt.spawn(async move {
-        let mut transaction = db_copy
+        let mut transaction = db_clone
             .transaction(Atom::from("test_log/a/b/c"), false, 5000, 5000)
             .unwrap();
         let mut stream = transaction.values(Atom::from("test_log/a/b/c"), None, false).await.unwrap();
@@ -1546,7 +1549,16 @@ fn bench_b_tree_table(b: &mut Bencher) {
         println!("======> assert ok");
     });
 
-    thread::sleep(Duration::from_millis(70000));
+    thread::sleep(Duration::from_millis(65000));
+
+    #[cfg(target_os = "linux")]
+    {
+        let now = Instant::now();
+        db_copy.cleanup_buffer_after_collect_table();
+        println!("!!!!!!cleanup finish, time: {:?}", now.elapsed());
+    }
+
+    thread::sleep(Duration::from_millis(10000));
 }
 
 #[bench]

@@ -305,6 +305,10 @@ impl<
         db_mgr.0.status.store(DB_INITED_STATUS, Ordering::SeqCst); //设置数据库状态为已初始化
         info!("Startup db succeeded");
 
+        //在Linux下启动完成后清理一次内存
+        #[cfg(target_os = "linux")]
+        db_copy.cleanup_buffer_after_collect_table();
+
         Ok(db_mgr)
     }
 }
