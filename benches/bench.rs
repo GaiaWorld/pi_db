@@ -1543,22 +1543,13 @@ fn bench_b_tree_table(b: &mut Bencher) {
                 assert_eq!(binary_to_usize(&key).unwrap(), index);
                 assert_eq!(String::from_utf8_lossy(value.as_ref()).as_ref(), "Hello World!");
             } else {
-                panic!("assert failed");
+                panic!("assert failed, index: {:?}", index);
             }
         }
         println!("======> assert ok");
     });
 
-    thread::sleep(Duration::from_millis(65000));
-
-    #[cfg(target_os = "linux")]
-    {
-        let now = Instant::now();
-        db_copy.cleanup_buffer_after_collect_table();
-        println!("!!!!!!cleanup finish, time: {:?}", now.elapsed());
-    }
-
-    thread::sleep(Duration::from_millis(10000));
+    thread::sleep(Duration::from_millis(70000));
 }
 
 #[bench]

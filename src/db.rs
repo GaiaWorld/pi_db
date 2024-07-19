@@ -60,9 +60,6 @@ use crate::{Binary,
                                         BtreeOrdTabTr}},
             utils::CreateTableOptions};
 
-#[cfg(target_os = "linux")]
-use crate::tables::b_tree_ord_table::{DEFAULT_GLOBAL_B_TREE_ORDERED_TABLE_CLEANUP_INTERVAL, GLOBAL_B_TREE_ORDERED_TABLE_CLEANUP_FLAG};
-
 ///
 /// 默认的数据库表元信息目录名
 ///
@@ -2476,8 +2473,6 @@ impl<
                                                name.clone(),
                                                cache_size,
                                                enable_compact,
-                                               100,
-                                               10,
                                                1024 * 1024,
                                                60 * 1000).await;
 
@@ -2745,8 +2740,6 @@ impl<
                                                        name.clone(),
                                                        cache_size,
                                                        enable_compact,
-                                                       100,
-                                                       10,
                                                        1024 * 1024,
                                                        60 * 1000).await;
 
@@ -2886,8 +2879,6 @@ impl<
                                                name.clone(),
                                                16 * 1024 * 1024,
                                                true,
-                                               100,
-                                               10,
                                                1024 * 1024,
                                                60 * 1000).await {
                     //尝试创建成功，则注册创建的有序日志表

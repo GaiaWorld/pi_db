@@ -1,6 +1,6 @@
 use std::{mem, thread};
 use std::path::{Path, PathBuf};
-use std::collections::VecDeque;
+use std::collections::{VecDeque, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use std::sync::{Arc,
@@ -33,6 +33,8 @@ use pi_guid::Guid;
 use pi_hash::XHashMap;
 use pi_bon::ReadBuffer;
 use log::{trace, debug, error, warn, info};
+use pi_ordmap::asbtree::Tree;
+use pi_ordmap::ordmap::{Entry, OrdMap};
 use pi_store::log_store::log_file::LogMethod;
 
 use crate::{Binary, KVAction, KVActionLog, KVDBCommitConfirm, KVTableTrError, TableTrQos, TransactionDebugEvent, transaction_debug_logger,
@@ -46,25 +48,11 @@ const DEFAULT_TABLE_FILE_NAME: &str = "table.dat";
 // 默认的表名
 const DEFAULT_TABLE_NAME: TableDefinition<Binary, Binary> = TableDefinition::new("$default");
 
-// 初始写锁唯一ID
-const INIT_LOCK_WRITE_UID: u64 = 1;
-
-// 未锁住写标记
-const UNLOCKED_WRITE_FLAG: u64 = 0;
-
 // 最小缓存大小
 const MIN_CACHE_SIZE: usize = 32 * 1024;
 
 // 默认缓存大小
 const DEFAULT_CACHE_SIZE: usize = 16 * 1024 * 1024;
-
-// 默认的全局有序B树表的内存清理时间间隔
-#[cfg(target_os = "linux")]
-pub(crate) const DEFAULT_GLOBAL_B_TREE_ORDERED_TABLE_CLEANUP_INTERVAL: usize = 90000;
-
-// 有序B树表的清理标记
-#[cfg(target_os = "linux")]
-pub(crate) static GLOBAL_B_TREE_ORDERED_TABLE_CLEANUP_FLAG: AtomicBool = AtomicBool::new(false);
 
 impl Value for Binary {
     type SelfType<'a>
@@ -188,20 +176,22 @@ impl<
         let table = self.clone();
 
         async move {
-            //尝试获取写锁
-            let write_lock_uid = loop {
-                match table.try_lock_write() {
-                    None => {
-                        //当前写锁还未释放，则稍候重试
-                        table.0.rt.timeout(10).await;
-                        continue;
-                    },
-                    Some(lock_uid) => break lock_uid,
+            //检查是否正在异步整理，如果并未开始异步整理，则设置为正在异步整理，并继续有序B树表的压缩
+            loop {
+                if let Err(_) = table.0.collecting.compare_exchange(false,
+                                                                    true,
+                                                                    Ordering::Acquire,
+                                                                    Ordering::Relaxed) {
+                    //正在异步整理，则稍候重试
+                    table.0.rt.timeout(1000).await;
+                    continue;
                 }
-            };
+
+                break;
+            }
 
             //将所有未持久的事务，强制持久化提交
-            let mut locked = self.0.inner.write(); //避免外部产生新的事务
+            let mut locked = self.0.inner.write(); //避免外部产生其它事务
             let mut transaction = match locked.begin_write() {
                 Err(e) => {
                     //创建写事务失败，则立即返回错误原因
@@ -220,7 +210,6 @@ impl<
                                                                          table.name().as_str(),
                                                                          e)));
             }
-            let _ = table.try_unlock_write(write_lock_uid); //持久化提交成功，则释放写锁
 
             //开始B树表的压缩
             let mut retry_count = 3; //可以重试3次
@@ -262,8 +251,6 @@ impl<
                                      name: Atom,
                                      cache_size: usize,
                                      enable_compact: bool,
-                                     write_conflict_limit: usize,
-                                     write_conflict_timeout: usize,
                                      waits_limit: usize,
                                      wait_timeout: usize) -> Self
     {
@@ -272,8 +259,6 @@ impl<
                       name,
                       cache_size,
                       enable_compact,
-                      write_conflict_limit,
-                      write_conflict_timeout,
                       waits_limit,
                       wait_timeout)
             .await
@@ -286,8 +271,6 @@ impl<
                                                 name: Atom,
                                                 mut cache_size: usize,
                                                 enable_compact: bool,
-                                                write_conflict_limit: usize,
-                                                write_conflict_timeout: usize,
                                                 waits_limit: usize,
                                                 wait_timeout: usize) -> Option<Self>
     {
@@ -319,7 +302,7 @@ impl<
             .set_repair_callback(move |session| {
                 if count == 0 {
                     //开始修复
-                    info!("Repairing b-tree ordered table, table: {:?}, cache_size: {:?}, enable_compact: {:?}",
+                    info!("Repairing inner b-tree ordered table, table: {:?}, cache_size: {:?}, enable_compact: {:?}",
                         name_copy,
                         cache_size,
                         enable_compact);
@@ -328,12 +311,12 @@ impl<
                 let progress = session.progress();
                 if progress < 1.0 {
                     //正在修复
-                    trace!("Repairing b-tree ordered table, table: {:?}, progress: {:?}",
+                    trace!("Repairing inner b-tree ordered table, table: {:?}, progress: {:?}",
                         name_copy,
                         progress);
                 } else {
                     //修复完成
-                    info!("Repair b-tree ordered table succeeded, table: {:?}, cache_size: {:?}, enable_compact: {:?}",
+                    info!("Repair inner b-tree ordered table succeeded, table: {:?}, cache_size: {:?}, enable_compact: {:?}",
                         name_copy,
                         cache_size,
                         enable_compact);
@@ -355,10 +338,8 @@ impl<
             },
             Ok(db) => {
                 let inner = RwLock::new(db);
+                let cache = Mutex::new(OrdMap::new(None));
                 let prepare = Mutex::new(XHashMap::default());
-                let write_lock_allocator = AtomicU64::new(INIT_LOCK_WRITE_UID);
-                let write_lock = AtomicU64::new(UNLOCKED_WRITE_FLAG);
-                let write_conflict_commits = AsyncRwLock::new(VecDeque::new());
                 let waits = AsyncMutex::new(VecDeque::new());
                 let waits_size = AtomicUsize::new(0);
                 let collecting = AtomicBool::new(false);
@@ -367,14 +348,10 @@ impl<
                     name: name.clone(),
                     path: path.clone(),
                     inner,
+                    cache,
                     prepare,
                     rt,
-                    write_lock_allocator,
-                    write_lock,
                     enable_compact: AtomicBool::new(enable_compact),
-                    write_conflict_commits,
-                    write_conflict_limit,
-                    write_conflict_timeout,
                     waits,
                     waits_size,
                     waits_limit,
@@ -388,17 +365,6 @@ impl<
                     cache_size,
                     enable_compact,
                     now.elapsed());
-
-                //启动有序B树表的提交写冲突事务的定时整理
-                let table_copy = table.clone();
-                let _ = table.0.rt.spawn(async move {
-                    let table_ref = &table_copy;
-                    loop {
-                        collect_write_conflict(table_ref,
-                                               Some(table_copy.0.write_conflict_timeout))
-                            .await;
-                    }
-                });
 
                 //启动有序B树表的提交待确认事务的定时整理
                 let table_copy = table.clone();
@@ -429,66 +395,6 @@ impl<
             },
         }
     }
-
-    /// 创建修复用事务
-    pub(crate) fn transaction_repair(&self,
-                                     source: Atom,
-                                     is_writable: bool,
-                                     is_persistent: bool,
-                                     prepare_timeout: u64,
-                                     commit_timeout: u64) -> <Self as KVTable>::Tr {
-        BtreeOrdTabTr::with_repair(source,
-                                   is_writable,
-                                   is_persistent,
-                                   prepare_timeout,
-                                   commit_timeout,
-                                   self.clone())
-    }
-
-    /// 尝试获取当前B树表的唯一写锁，成功返回写锁的唯一ID，失败返回空
-    pub(crate) fn try_lock_write(&self) -> Option<u64> {
-        if self.0.write_lock.load(Ordering::Acquire) == UNLOCKED_WRITE_FLAG {
-            //当前没有写锁
-            let write_lock_uid = self
-                .0
-                .write_lock_allocator
-                .fetch_add(1, Ordering::Release);
-            if let Ok(UNLOCKED_WRITE_FLAG) = self.0.write_lock.compare_exchange(UNLOCKED_WRITE_FLAG,
-                                                                                write_lock_uid,
-                                                                                Ordering::AcqRel,
-                                                                                Ordering::Acquire) {
-                //写锁成功
-                Some(write_lock_uid)
-            } else {
-                //当前已有写锁
-                None
-            }
-        } else {
-            //当前已有写锁
-            None
-        }
-    }
-
-    // 安全的尝试解除表的写锁，成功返回真
-    pub(crate) fn try_unlock_write(&self, write_lock_uid: u64) -> bool {
-        match self.0.write_lock.compare_exchange(write_lock_uid,
-                                                 UNLOCKED_WRITE_FLAG,
-                                                 Ordering::AcqRel,
-                                                 Ordering::Relaxed) {
-            Err(UNLOCKED_WRITE_FLAG) => {
-                //当前没有写锁，则忽略解锁
-                true
-            },
-            Err(_) => {
-                //解锁失败
-                false
-            },
-            Ok(_) => {
-                //解锁成功
-                true
-            },
-        }
-    }
 }
 
 // 内部有序B树数据表
@@ -502,22 +408,14 @@ struct InnerBtreeOrderedTable<
     path:                   PathBuf,
     //有序B树表的实例
     inner:                  RwLock<Database>,
+    //有序B树表的临时缓存，缓存有序B树表两次持久化之间写入的数据，并在有序B树表持久化后清除缓存的数据
+    cache:                  Mutex<OrdMap<Tree<Binary, Option<Binary>>>>,
     //有序B树表的预提交表
     prepare:                Mutex<XHashMap<Guid, XHashMap<Binary, KVActionLog>>>,
     //异步运行时
     rt:                     MultiTaskRuntime<()>,
-    //写锁唯一ID分配器
-    write_lock_allocator:   AtomicU64,
-    //写锁
-    write_lock:             AtomicU64,
     //是否允许对有序B树表进行整理压缩
     enable_compact:         AtomicBool,
-    //写冲突事务缓冲
-    write_conflict_commits:  AsyncRwLock<VecDeque<(XHashMap<Binary, KVActionLog>, Sender<IOResult<XHashMap<Binary, KVActionLog>>>)>>,
-    //等待异步提交的写冲突事务缓冲的大小限制
-    write_conflict_limit:   usize,
-    //等待提交的写冲突事务缓冲的超时时长，单位毫秒
-    write_conflict_timeout: usize,
     //等待异步写日志文件的已提交的有序日志事务列表
     waits:                  AsyncMutex<VecDeque<(BtreeOrdTabTr<C, Log>, XHashMap<Binary, KVActionLog>, <BtreeOrdTabTr<C, Log> as Transaction2Pc>::CommitConfirm)>>,
     //等待异步写日志文件的已提交的有序日志事务的键值对大小
@@ -583,34 +481,10 @@ impl<
         let tr = self.clone();
 
         async move {
-            //移除事务在有序B树表的预提交表中的操作记录
-            let mut result = Ok(());
-            if let Some(inner_transaction) = self.0.inner_transaction.lock().take() {
-                //有内部事务
-                if let Err(e) = inner_transaction.rollback() {
-                    //内部事务回滚失败
-                    result = Err(KVTableTrError::new_transaction_error(ErrorLevel::Fatal,
-                                                                       format!("Rollback b-tree ordered table failed, table: {:?}, source: {:?}, transaction_uid: {:?}, prepare_uid: {:?}, reason: {:?}",
-                                                                               self.0.table.name().as_str(),
-                                                                               self.0.source,
-                                                                               self.get_transaction_uid(),
-                                                                               self.get_prepare_uid(),
-                                                                               e)));
-                }
-
-                if let Some(write_lock_uid) = self.0.write_lock {
-                    //当前是唯一的可写事务，则安全的强制解除表的写锁
-                    let _ = self
-                        .0
-                        .table
-                        .try_unlock_write(write_lock_uid);
-                }
-            }
-
             let transaction_uid = tr.get_transaction_uid().unwrap();
             let _ = tr.0.table.0.prepare.lock().remove(&transaction_uid);
 
-            result
+            Ok(())
         }.boxed()
     }
 }
@@ -685,16 +559,6 @@ impl<
         async move {
             if tr.is_writable() {
                 //可写事务预提交
-                if tr.0.inner_transaction.lock().is_none() {
-                    //没有内部事务，则立即返回错误原因
-                    return Err(KVTableTrError::new_transaction_error(ErrorLevel::Fatal,
-                                                                     format!("Prepare b-tree ordered table failed, table: {:?}, source: {:?}, transaction_uid: {:?}, prepare_uid: {:?}, reason: empty inner transaction",
-                                                                             self.0.table.name().as_str(),
-                                                                             self.0.source,
-                                                                             self.get_transaction_uid(),
-                                                                             self.get_prepare_uid())));
-                }
-
                 #[allow(unused_assignments)]
                 let mut write_buf = None; //默认的写操作缓冲区
 
@@ -728,6 +592,15 @@ impl<
                                                     action) {
                             //尝试表的预提交失败，则立即返回错误原因
                             return Err(e);
+                        }
+
+                        if !action.is_dirty_writed() {
+                            //非脏写操作需要对根节点冲突进行检查
+                            if let Err(e) = tr
+                                .check_root_conflict(key) {
+                                //尝试表的预提交失败，则立即返回错误原因
+                                return Err(e);
+                            }
                         }
 
                         //指定关键字的操作预提交成功，则将写操作写入预提交缓冲区
@@ -768,63 +641,9 @@ impl<
     fn commit(&self, confirm: <Self as Transaction2Pc>::CommitConfirm)
               -> BoxFuture<Result<<Self as AsyncTransaction>::Output, <Self as AsyncTransaction>::Error>>
     {
-        //提交日志已写成功，则取出内部事务
-        let inner_transaction = if let Some(inner_transaction) = self.0.inner_transaction.lock().take() {
-            //有内部事务
-            inner_transaction
-        } else {
-            //无内部事务
-            let result = Err(KVTableTrError::new_transaction_error(ErrorLevel::Fatal,
-                                                                   format!("Commit b-tree ordered table failed, table: {:?}, source: {:?}, transaction_uid: {:?}, prepare_uid: {:?}, reason: require inner transaction",
-                                                                           self.0.table.name().as_str(),
-                                                                           self.0.source,
-                                                                           self.get_transaction_uid(),
-                                                                           self.get_prepare_uid())));
-            return async move {
-                result
-            }.boxed();
-        };
-
-        let is_write_conflict = inner_transaction.is_write_conflict()
-            || inner_transaction.is_repair(); //写冲突事务或修复表事务都是写冲突
-        if inner_transaction.is_writable() {
-            //非持久化的提交内部写事务
-            if let Err(e) = inner_transaction.commit() {
-                //内部事务提交失败
-                let result = Err(KVTableTrError::new_transaction_error(ErrorLevel::Fatal,
-                                                                       format!("Commit b-tree ordered table failed, table: {:?}, source: {:?}, transaction_uid: {:?}, prepare_uid: {:?}, reason: {:?}",
-                                                                               self.0.table.name().as_str(),
-                                                                               self.0.source,
-                                                                               self.get_transaction_uid(),
-                                                                               self.get_prepare_uid(),
-                                                                               e)));
-                return async move {
-                    result
-                }.boxed();
-            }
-
-            if let Some(write_lock_uid) = self.0.write_lock {
-                //当前是唯一的可写事务，则安全的强制解除表的写锁
-                let _ = self
-                    .0
-                    .table
-                    .try_unlock_write(write_lock_uid);
-            }
-        } else {
-            //关闭内部非写事务
-            if let Err(e) = inner_transaction.close() {
-                warn!("Commit b-tree ordered table failed, table: {:?}, source: {:?}, transaction_uid: {:?}, prepare_uid: {:?}, reason: {:?}",
-                    self.0.table.name().as_str(),
-                    self.0.source,
-                    self.get_transaction_uid(),
-                    self.get_prepare_uid(),
-                    e);
-            }
-        }
-
-        //根据写缓冲区大小确定是否持久化提交
+        //提交日志已写成功
         let tr = self.clone();
-        let table_copy = tr.0.table.clone();
+
         async move {
             //移除事务在有序B树表的预提交表中的操作记录
             let transaction_uid = tr.get_transaction_uid().unwrap();
@@ -837,71 +656,46 @@ impl<
                     .0
                     .prepare
                     .lock();
+                let actions = table_prepare.get(&transaction_uid); //获取有序B树表，本次事务预提交成功的相关操作记录
 
-                //更新有序B树表的根节点
-                if let Some(actions) = table_prepare.remove(&transaction_uid) {
-                    //有序B树表提交日志写成功后，从有序B树表的预提交表中移除当前事务的操作记录
-                    actions
+                //更新有序B树表的临时缓存的根节点
+                if let Some(actions) = actions {
+                    {
+                        let mut locked = tr.0.table.0.cache.lock();
+                        if !locked.ptr_eq(&tr.0.cache_ref) {
+                            //有序B树表的临时缓存的根节点在当前事务执行过程中已改变，
+                            //一般是因为其它事务更新了与当前事务无关的关键字，
+                            //则将当前事务的修改直接作用在当前有序B树表的临时缓存中
+                            for (key, action) in actions.iter() {
+                                match action {
+                                    KVActionLog::Write(None) | KVActionLog::DirtyWrite(None) => {
+                                        //删除指定关键字
+                                        let _ = locked.delete(key, false);
+                                    },
+                                    KVActionLog::Write(Some(value)) | KVActionLog::DirtyWrite(Some(value)) => {
+                                        //插入或更新指定关键字
+                                        let _ = locked.upsert(key.clone(), Some(value.clone()), false);
+                                    },
+                                    KVActionLog::Read => (), //忽略读操作
+                                }
+                            }
+                        } else {
+                            //有序B树表的临时缓存的根节点在当前事务执行过程中未改变，则用本次事务修改并提交成功的根节点替换有序B树表的临时缓存的根节点
+                            *locked = tr.0.cache_mut.lock().clone();
+                        }
+                    }
+
+                    //有序B树表提交完成后，从有序B树表的预提交表中移除当前事务的操作记录
+                    table_prepare.remove(&transaction_uid).unwrap()
                 } else {
                     XHashMap::default()
                 }
             };
 
-            let actions = if is_write_conflict {
-                //当前事务是写冲突事务，则将当前缓冲事务加入当前表的写冲突事务缓冲区，并异步等待写冲突事务的修改和非持久化提交完成
-                let (sender, receiver) = bounded(1);
-                let write_conflict_commits_len = {
-                    let mut locked = tr
-                        .0
-                        .table
-                        .0
-                        .write_conflict_commits
-                        .write()
-                        .await;
-                    locked.push_back((actions, sender));
-                    locked.len()
-                };
-
-                if write_conflict_commits_len >= tr.0.table.0.write_conflict_limit {
-                    //当前表的写冲突事务缓冲区的数量已达限制，则强制异步整理当前表的写冲突事务缓冲区
-                    let table = tr.0.table.clone();
-                    tr.0.table.0.rt.spawn(async move {
-                        collect_write_conflict(&table, None);
-                    });
-                }
-
-                match receiver.recv().await {
-                    Err(e) => {
-                        return Err(KVTableTrError::new_transaction_error(ErrorLevel::Fatal,
-                                                                         format!("Conflict commit b-tree ordered table failed, table: {:?}, source: {:?}, transaction_uid: {:?}, prepare_uid: {:?}, reason: {:?}",
-                                                                                 self.0.table.name().as_str(),
-                                                                                 self.0.source,
-                                                                                 self.get_transaction_uid(),
-                                                                                 self.get_prepare_uid(),
-                                                                                 e)));
-                    },
-                    Ok(Err(e)) => {
-                        return Err(KVTableTrError::new_transaction_error(ErrorLevel::Fatal,
-                                                                         format!("Conflict commit b-tree ordered table failed, table: {:?}, source: {:?}, transaction_uid: {:?}, prepare_uid: {:?}, reason: {:?}",
-                                                                                 self.0.table.name().as_str(),
-                                                                                 self.0.source,
-                                                                                 self.get_transaction_uid(),
-                                                                                 self.get_prepare_uid(),
-                                                                                 e)));
-                    },
-                    Ok(Ok(actions)) => {
-                        actions
-                    },
-                }
-            } else {
-                //当前事务是非写冲突事务
-                actions
-            };
-
             if tr.is_require_persistence() {
-                let rt = tr.0.table.0.rt.clone();
-                let _ = rt.spawn(async move {
-                    //持久化的有序B树表事务，则异步将表的修改写入redb后，再确认提交成功
+                //持久化的有序B树表事务，则异步将表的修改写入日志文件后，再确认提交成功
+                let table_copy = tr.0.table.clone();
+                let _ = self.0.table.0.rt.spawn(async move {
                     let mut size = 0;
                     for (key, action) in &actions {
                         match action {
@@ -925,11 +719,11 @@ impl<
 
                     let last_waits_size = table_copy.0.waits_size.fetch_add(size, Ordering::SeqCst); //更新待确认的已提交事务的大小计数
                     if last_waits_size + size >= table_copy.0.waits_limit {
-                        //如果当前已注册的待确认的已提交事务大小已达限制，则立即整理，并重置待确认的已提交事务的大小计数
+                        //如果当前已注册的待确认的已提交事务大小已达限制，则立即整理
                         table_copy
                             .0
                             .waits_size
-                            .store(0, Ordering::Relaxed);
+                            .store(0, Ordering::Relaxed); //重置待确认的已提交事务的大小计数
 
                         match collect_waits(&table_copy,
                                             None).await {
@@ -1050,11 +844,21 @@ impl<
                 let _ = actions_locked.insert(key.clone(), KVActionLog::Read);
             }
 
-            if let Some(inner_transaction) = &*tr.0.inner_transaction.lock() {
-                inner_transaction.query(&key)
+            if let Some(Some(value)) = tr.0.cache_mut.lock().get(&key) {
+                //指定关键字在临时缓存中存在
+                return Some(value.clone());
             } else {
-                None
+                //指定关键字在临时缓存中不存在，则直接从内部表中获取
+                if let Ok(trans) = tr.0.table.0.inner.read().begin_read() {
+                    if let Ok(inner_table) = trans.open_table(DEFAULT_TABLE_NAME) {
+                        if let Ok(Some(value)) = inner_table.get(&key) {
+                            return Some(value.value());
+                        }
+                    }
+                }
             }
+
+            None
         }.boxed()
     }
 
@@ -1072,28 +876,13 @@ impl<
         let tr = self.clone();
 
         async move {
-            if let Some(inner_transaction) = &mut *tr.0.inner_transaction.lock() {
-                if inner_transaction.is_only_read() {
-                    //是只读事务，则中止修改操作，并立即返回
-                    return Ok(());
-                }
+            //记录对指定关键字的最新插入或更新操作
+            let _ = tr.0.actions.lock().insert(key.clone(), KVActionLog::DirtyWrite(Some(value.clone())));
 
-                if inner_transaction.is_writable() {
-                    //是可写事务，则直接在内部事务中修改指定关键字
-                    if let Err(e) = inner_transaction.upsert(key.clone(), value.clone()) {
-                        return Err(KVTableTrError::new_transaction_error(ErrorLevel::Normal, e));
-                    }
-                }
+            //插入或更新指定的键值对
+            let _ = tr.0.cache_mut.lock().upsert(key, Some(value), false);
 
-                //可写事务，写冲突事务或修复表事务需要记录修改操作
-                let _ = tr.0.actions.lock().insert(key.clone(), KVActionLog::Write(Some(value.clone()))); //记录对指定关键字的最新插入或更新操作
-                Ok(())
-            } else {
-                Err(KVTableTrError::new_transaction_error(ErrorLevel::Normal,
-                                                          format!("Upsert b-tree ordered table value failed, table: {:?}, key: {:?}, reason: require inner transaction",
-                                                                  self.0.table.name().as_str(),
-                                                                  key)))
-            }
+            Ok(())
         }.boxed()
     }
 
@@ -1109,34 +898,21 @@ impl<
         let tr = self.clone();
 
         async move {
-            if let Some(inner_transaction) = &mut *tr.0.inner_transaction.lock() {
-                if !inner_transaction.is_only_read() {
-                    //不是可写内部事务，则中止删除操作，并立即返回
-                    return Ok(None);
-                }
+            //记录对指定关键字的最新删除操作，并增加写操作计数
+            let _ = tr.0.actions.lock().insert(key.clone(), KVActionLog::Write(None));
 
-                let last_value = if inner_transaction.is_writable() {
-                    //是可写事务，则直接在内部事务中删除指定关键字
-                    match inner_transaction.delete(&key) {
-                        Err(e) => {
-                            return Err(KVTableTrError::new_transaction_error(ErrorLevel::Normal, e));
-                        },
-                        Ok(last_value) => last_value,
-                    }
-                } else {
-                    //是写冲突事务，则暂时忽略删除操作
-                    None
-                };
+            if let Some(Some(Some(value))) = tr.0.cache_mut.lock().delete(&key, false) {
+                //指定关键字存在，则标记删除
+                let _ = tr
+                    .0
+                    .cache_mut
+                    .lock()
+                    .upsert(key, None, false);
 
-                //可写事务，写冲突事务或修复表事务需要记录删除操作
-                let _ = tr.0.actions.lock().insert(key.clone(), KVActionLog::Write(None)); //记录对指定关键字的最新删除操作
-                Ok(last_value)
-            } else {
-                Err(KVTableTrError::new_transaction_error(ErrorLevel::Normal,
-                                                          format!("Delete b-tree ordered table value failed, table: {:?}, key: {:?}, reason: require inner transaction",
-                                                                  self.0.table.name().as_str(),
-                                                                  key)))
+                return Ok(Some(value));
             }
+
+            Ok(None)
         }.boxed()
     }
 
@@ -1146,88 +922,86 @@ impl<
         -> BoxStream<'a, <Self as KVAction>::Key>
     {
         let transaction = self.clone();
+
         let stream = stream! {
-            if let Some(inner_transaction) = &*transaction.0.inner_transaction.lock() {
-                match inner_transaction {
-                    InnerTransaction::OnlyRead(trans, name) => {
-                        let table = if let Ok(table) = trans.open_table(DEFAULT_TABLE_NAME) {
-                            table
-                        } else {
-                            return;
-                        };
+            let trans = match transaction.0.table.0.inner.read().begin_read() {
+                Err(e) => {
+                    return;
+                },
+                Ok(trans) => {
+                    trans
+                },
+            };
 
-                        if let Some(mut iterator) = inner_transaction
-                            .values_by_read(&table, key, descending)
-                        {
-                            if descending {
-                                //倒序
-                                while let Some(Ok((key, _value))) = iterator.next_back() {
-                                    //从迭代器获取到上一个关键字
-                                    yield key.value();
-                                }
-                            } else {
-                                //顺序
-                                while let Some(Ok((key, _value))) = iterator.next() {
-                                    //从迭代器获取到下一个关键字
-                                    yield key.value();
-                                }
-                            }
-                        }
-                    },
-                    InnerTransaction::WriteConflict(trans, name) => {
-                        let table = if let Ok(table) = trans.open_table(DEFAULT_TABLE_NAME) {
-                            table
-                        } else {
-                            return;
-                        };
+            let mut ignores = HashMap::new();
+            if let Some(key) = &key {
+                //指定了关键字
+                let mut values = transaction
+                    .0
+                    .cache_mut
+                    .lock()
+                    .iter(Some(key), descending);
+                while let Some(Entry(key, value)) = values.next() {
+                    //从迭代器获取关键字
+                    ignores.insert(key, ()); //存在或不存在都要记录
+                    if let Some(value) = value {
+                        yield key.clone();
+                    } else {
+                        continue;
+                    }
+                }
+            } else {
+                //未指定关键字
+                let mut keys = transaction
+                    .0
+                    .cache_mut
+                    .lock()
+                    .iter(None, descending);
+                while let Some(Entry(key, value)) = keys.next() {
+                    //从迭代器获取关键字
+                    ignores.insert(key, ()); //存在或不存在都要记录
+                    if let Some(value) = value {
+                        yield key.clone();
+                    } else {
+                        continue;
+                    }
+                }
+            }
 
-                        if let Some(mut iterator) = inner_transaction
-                            .values_by_read(&table, key, descending)
-                        {
-                            if descending {
-                                //倒序
-                                while let Some(Ok((key, _value))) = iterator.next_back() {
-                                    //从迭代器获取到上一个关键字
-                                    yield key.value();
-                                }
-                            } else {
-                                //顺序
-                                while let Some(Ok((key, _value))) = iterator.next() {
-                                    //从迭代器获取到下一个关键字
-                                    yield key.value();
-                                }
-                            }
+             let table = if let Ok(table) = trans.open_table(DEFAULT_TABLE_NAME)
+            {
+                table
+            } else {
+                return;
+            };
+            let mut inner_transaction = InnerTransaction::OnlyRead(trans, transaction.0.table.name());
+            if let Some(mut iterator) = inner_transaction
+                .values_by_read(&table, key, descending)
+            {
+                if descending {
+                    //倒序
+                    while let Some(Ok((key, _value))) = iterator.next_back() {
+                        //从迭代器获取到上一个关键字
+                        let key = key.value();
+                        if ignores.contains_key(&key) {
+                            //已迭代过了，则继续迭代上一个关键字
+                            continue;
                         }
-                    },
-                    InnerTransaction::Writable(trans, name) => {
-                        let table = if let Ok(table) = trans.open_table(DEFAULT_TABLE_NAME) {
-                            table
-                        } else {
-                            return;
-                        };
 
-                        if let Some(mut iterator) = inner_transaction
-                            .values_by_write(&table, key, descending)
-                        {
-                            if descending {
-                                //倒序
-                                while let Some(Ok((key, _value))) = iterator.next_back() {
-                                    //从迭代器获取到上一个关键字
-                                    yield key.value();
-                                }
-                            } else {
-                                //顺序
-                                while let Some(Ok((key, _value))) = iterator.next() {
-                                    //从迭代器获取到下一个关键字
-                                    yield key.value();
-                                }
-                            }
+                        yield key;
+                    }
+                } else {
+                    //顺序
+                    while let Some(Ok((key, _value))) = iterator.next() {
+                        //从迭代器获取到下一个关键字
+                        let key = key.value();
+                        if ignores.contains_key(&key) {
+                            //已迭代过了，则继续迭代下一个关键字
+                            continue;
                         }
-                    },
-                    InnerTransaction::Repair(_trans, _name) => {
-                        //修复时不允许迭代
-                        return;
-                    },
+
+                        yield key;
+                    }
                 }
             }
         };
@@ -1241,88 +1015,86 @@ impl<
         -> BoxStream<'a, (<Self as KVAction>::Key, <Self as KVAction>::Value)>
     {
         let transaction = self.clone();
+
         let stream = stream! {
-            if let Some(inner_transaction) = &*transaction.0.inner_transaction.lock() {
-                match inner_transaction {
-                    InnerTransaction::OnlyRead(trans, name) => {
-                        let table = if let Ok(table) = trans.open_table(DEFAULT_TABLE_NAME) {
-                            table
-                        } else {
-                            return;
-                        };
+            let trans = match transaction.0.table.0.inner.read().begin_read() {
+                Err(e) => {
+                    return;
+                },
+                Ok(trans) => {
+                    trans
+                },
+            };
 
-                        if let Some(mut iterator) = inner_transaction
-                            .values_by_read(&table, key, descending)
-                        {
-                            if descending {
-                                //倒序
-                                while let Some(Ok((key, value))) = iterator.next_back() {
-                                    //从迭代器获取到上一个键值对
-                                    yield (key.value(), value.value());
-                                }
-                            } else {
-                                //顺序
-                                while let Some(Ok((key, value))) = iterator.next() {
-                                    //从迭代器获取到下一个键值对
-                                    yield (key.value(), value.value());
-                                }
-                            }
-                        }
-                    },
-                    InnerTransaction::WriteConflict(trans, name) => {
-                        let table = if let Ok(table) = trans.open_table(DEFAULT_TABLE_NAME) {
-                            table
-                        } else {
-                            return;
-                        };
+            let mut ignores = HashMap::new();
+            if let Some(key) = &key {
+                //指定了关键字
+                let mut values = transaction
+                    .0
+                    .cache_mut
+                    .lock()
+                    .iter(Some(key), descending);
+                while let Some(Entry(key, value)) = values.next() {
+                    //从迭代器获取关键字
+                    ignores.insert(key.clone(), ()); //存在或不存在都要记录
+                    if let Some(value) = value {
+                        yield (key.clone(), value.clone());
+                    } else {
+                        continue;
+                    }
+                }
+            } else {
+                //未指定关键字
+                let mut values = transaction
+                    .0
+                    .cache_mut
+                    .lock()
+                    .iter(None, descending);
+                while let Some(Entry(key, value)) = values.next() {
+                    //从迭代器获取关键字
+                    ignores.insert(key.clone(), ()); //存在或不存在都要记录
+                    if let Some(value) = value {
+                        yield (key.clone(), value.clone());
+                    } else {
+                        continue;
+                    }
+                }
+            }
 
-                        if let Some(mut iterator) = inner_transaction
-                            .values_by_read(&table, key, descending)
-                        {
-                            if descending {
-                                //倒序
-                                while let Some(Ok((key, value))) = iterator.next_back() {
-                                    //从迭代器获取到上一个键值对
-                                    yield (key.value(), value.value());
-                                }
-                            } else {
-                                //顺序
-                                while let Some(Ok((key, value))) = iterator.next() {
-                                    //从迭代器获取到下一个键值对
-                                    yield (key.value(), value.value());
-                                }
-                            }
+            let table = if let Ok(table) = trans.open_table(DEFAULT_TABLE_NAME)
+            {
+                table
+            } else {
+                return;
+            };
+            let mut inner_transaction = InnerTransaction::OnlyRead(trans, transaction.0.table.name());
+            if let Some(mut iterator) = inner_transaction
+                .values_by_read(&table, key, descending)
+            {
+                if descending {
+                    //倒序
+                    while let Some(Ok((key, value))) = iterator.next_back() {
+                        //从迭代器获取到上一个键值对
+                        let key = key.value();
+                        if ignores.contains_key(&key) {
+                            //已迭代过了，则继续迭代上一个键值对
+                            continue;
                         }
-                    },
-                    InnerTransaction::Writable(trans, name) => {
-                        let table = if let Ok(table) = trans.open_table(DEFAULT_TABLE_NAME) {
-                            table
-                        } else {
-                            return;
-                        };
 
-                        if let Some(mut iterator) = inner_transaction
-                            .values_by_write(&table, key, descending)
-                        {
-                            if descending {
-                                //倒序
-                                while let Some(Ok((key, value))) = iterator.next_back() {
-                                    //从迭代器获取到上一个键值对
-                                    yield (key.value(), value.value());
-                                }
-                            } else {
-                                //顺序
-                                while let Some(Ok((key, value))) = iterator.next() {
-                                    //从迭代器获取到下一个键值对
-                                    yield (key.value(), value.value());
-                                }
-                            }
+                        yield (key, value.value());
+                    }
+                } else {
+                    //顺序
+                    while let Some(Ok((key, value))) = iterator.next() {
+                        //从迭代器获取到下一个键值对
+                        let key = key.value();
+                        if ignores.contains_key(&key) {
+                            //已迭代过了，则继续迭代下一个键值对
+                            continue;
                         }
-                    },
-                    InnerTransaction::Repair(_trans, _name) => {
-                        //修复时不允许迭代
-                        return;
-                    },
+
+                        yield (key, value.value());
+                    }
                 }
             }
         };
@@ -1359,52 +1131,8 @@ impl<
            prepare_timeout: u64,
            commit_timeout: u64,
            table: BtreeOrderedTable<C, Log>) -> Self {
-        let table_name = table.name();
-        let mut write_lock = None;
-        let inner_transaction = if is_writable {
-            //可写事务
-            if let Some(lock) = table.try_lock_write() {
-                //当前没有正在执行的写事务，则构建一个可写的内部事务
-                match table.0.inner.read().begin_write() {
-                    Err(e) => {
-                        let _ = table.try_unlock_write(lock);
-                        panic!("Create b-tree ordered table inner writable transaction failed, table: {:?}, reason: {:?}",
-                               table_name.as_str(),
-                               e);
-                    },
-                    Ok(mut transaction) => {
-                        write_lock = Some(lock);
-                        transaction.set_durability(Durability::None);
-                        InnerTransaction::Writable(transaction, table_name)
-                    },
-                }
-            } else {
-                //当前有正在执行的写事务，则构建一个只读的写冲突内部事务，后续有任何写操作将直接返回冲突
-                match table.0.inner.read().begin_read() {
-                    Err(e) => {
-                        panic!("Create b-tree ordered table inner write conflict transaction failed, table: {:?}, reason: {:?}",
-                               table_name.as_str(),
-                               e);
-                    },
-                    Ok(transaction) => {
-                        InnerTransaction::WriteConflict(transaction, table_name)
-                    },
-                }
-            }
-        } else {
-            //只读事务
-            match table.0.inner.read().begin_read() {
-                Err(e) => {
-                    panic!("Create b-tree ordered table inner only read transaction failed, table: {:?}, reason: {:?}",
-                           table_name.as_str(),
-                           e);
-                },
-                Ok(transaction) => {
-                    InnerTransaction::OnlyRead(transaction, table_name)
-                },
-            }
-        };
-
+        let cache_ref = table.0.cache.lock().clone();
+        let cache_mut = SpinLock::new(cache_ref.clone());
         let inner = InnerBtreeOrdTabTr {
             source,
             tid: SpinLock::new(None),
@@ -1414,49 +1142,10 @@ impl<
             persistence: AtomicBool::new(is_persistent),
             prepare_timeout,
             commit_timeout,
+            cache_mut,
+            cache_ref,
             table,
             actions: SpinLock::new(XHashMap::default()),
-            write_lock,
-            inner_transaction: SpinLock::new(Some(inner_transaction)),
-        };
-
-        BtreeOrdTabTr(Arc::new(inner))
-    }
-
-    //构建一个用于修复表的有序B树表事务
-    fn with_repair(source: Atom,
-                   is_writable: bool,
-                   is_persistent: bool,
-                   prepare_timeout: u64,
-                   commit_timeout: u64,
-                   table: BtreeOrderedTable<C, Log>) -> Self {
-        let table_name = table.name();
-        let mut write_lock = None;
-        //当前有正在执行的写事务，则构建一个只读的写冲突内部事务，后续有任何写操作将直接返回冲突
-        let inner_transaction = match table.0.inner.read().begin_read() {
-            Err(e) => {
-                panic!("Create b-tree ordered table inner repair transaction failed, table: {:?}, reason: {:?}",
-                       table_name.as_str(),
-                       e);
-            },
-            Ok(transaction) => {
-                InnerTransaction::Repair(transaction, table_name)
-            },
-        };
-
-        let inner = InnerBtreeOrdTabTr {
-            source,
-            tid: SpinLock::new(None),
-            cid: SpinLock::new(None),
-            status: SpinLock::new(Transaction2PcStatus::default()),
-            writable: is_writable,
-            persistence: AtomicBool::new(is_persistent),
-            prepare_timeout,
-            commit_timeout,
-            table,
-            actions: SpinLock::new(XHashMap::default()),
-            write_lock,
-            inner_transaction: SpinLock::new(Some(inner_transaction)),
         };
 
         BtreeOrdTabTr(Arc::new(inner))
@@ -1479,7 +1168,14 @@ impl<
                         },
                         KVActionLog::Write(_) => {
                             //本地预提交事务对相同的关键字执行了写操作，则存在读写冲突
-                            return Err(<Self as Transaction2Pc>::PrepareError::new_transaction_error(ErrorLevel::Normal, format!("Prepare b-tree ordered table conflicted, table: {:?}, key: {:?}, source: {:?}, transaction_uid: {:?}, prepare_uid: {:?}, confilicted_transaction_uid: {:?}, reason: require write key but reading now", self.0.table.name().as_str(), key, self.0.source, self.get_transaction_uid(), self.get_prepare_uid(), guid)));
+                            return Err(<Self as Transaction2Pc>::PrepareError::new_transaction_error(ErrorLevel::Normal,
+                                                                                                     format!("Prepare b-tree ordered table conflicted, table: {:?}, key: {:?}, source: {:?}, transaction_uid: {:?}, prepare_uid: {:?}, confilicted_transaction_uid: {:?}, reason: require write key but reading now",
+                                                                                                             self.0.table.name().as_str(),
+                                                                                                             key,
+                                                                                                             self.0.source,
+                                                                                                             self.get_transaction_uid(),
+                                                                                                             self.get_prepare_uid(),
+                                                                                                             guid)));
                         },
                     }
                 },
@@ -1495,13 +1191,111 @@ impl<
                         },
                         _ => {
                             //有序B树表的预提交表中的一个预提交事务与本地预提交事务操作了相同的关键字，且是写操作，则存在读写冲突
-                            return Err(<Self as Transaction2Pc>::PrepareError::new_transaction_error(ErrorLevel::Normal, format!("Prepare b-tree ordered table conflicted, table: {:?}, key: {:?}, source: {:?}, transaction_uid: {:?}, prepare_uid: {:?}, confilicted_transaction_uid: {:?}, reason: writing now", self.0.table.name().as_str(), key, self.0.source, self.get_transaction_uid(), self.get_prepare_uid(), guid)));
+                            return Err(<Self as Transaction2Pc>::PrepareError::new_transaction_error(ErrorLevel::Normal,
+                                                                                                     format!("Prepare b-tree ordered table conflicted, table: {:?}, key: {:?}, source: {:?}, transaction_uid: {:?}, prepare_uid: {:?}, confilicted_transaction_uid: {:?}, reason: writing now",
+                                                                                                             self.0.table.name().as_str(),
+                                                                                                             key,
+                                                                                                             self.0.source,
+                                                                                                             self.get_transaction_uid(),
+                                                                                                             self.get_prepare_uid(),
+                                                                                                             guid)));
                         },
                     }
                 },
                 None => {
                     //有序B树表的预提交表中没有任何预提交事务与本地预提交事务操作了相同的关键字，则不存在读写冲突，并继续检查预提交表中是否存在读写冲突
                     continue;
+                },
+            }
+        }
+
+        Ok(())
+    }
+
+    // 检查有序B树表的临时缓存的根节点冲突
+    fn check_root_conflict(&self, key: &Binary) -> Result<(), KVTableTrError> {
+        let b = self.0.table.0.cache.lock().ptr_eq(&self.0.cache_ref);
+        if !b {
+            //有序B树表的临时缓存的根节点在当前事务执行过程中已改变
+            let key = key.clone();
+            match self.0.table.0.cache.lock().get(&key) {
+                None => {
+                    //事务的当前操作记录中的关键字，在当前表中不存在
+                    match self.0.cache_ref.get(&key) {
+                        None => {
+                            //事务的当前操作记录中的关键字，在事务创建时的表中也不存在
+                            //表示此关键字是在当前事务内新增的，则此关键字的操作记录可以预提交
+                            //并继续其它关键字的操作记录的预提交
+                            ()
+                        },
+                        _ => {
+                            //事务的当前操作记录中的关键字，在事务创建时的表中已存在
+                            //表示此关键字在当前事务执行过程中被删除，则此关键字的操作记录不允许预提交
+                            //并立即返回当前事务预提交冲突
+                            return Err(<Self as Transaction2Pc>::PrepareError::new_transaction_error(ErrorLevel::Normal,
+                                                                                                     format!("Prepare b-tree ordered table conflicted, table: {:?}, key: {:?}, source: {:?}, transaction_uid: {:?}, prepare_uid: {:?}, reason: the key is deleted in table while the transaction is running",
+                                                                                                             self.0.table.name().as_str(),
+                                                                                                             key,
+                                                                                                             self.0.source,
+                                                                                                             self.get_transaction_uid(),
+                                                                                                             self.get_prepare_uid())));
+                        },
+                    }
+                },
+                Some(root_value) => {
+                    //事务的当前操作记录中的关键字，在当前表中已存在
+                    match self.0.cache_ref.get(&key) {
+                        Some(copy_value) => {
+                            if root_value.is_some() && copy_value.is_some() {
+                                //值都不为空，则比较内容
+                                if Binary::binary_equal(root_value.as_ref().unwrap(), copy_value.as_ref().unwrap()) {
+                                    //事务的当前操作记录中的关键字，在事务创建时的表中也存在，且值引用相同
+                                    //表示此关键字在当前事务执行过程中未改变，且值也未改变，则此关键字的操作记录允许预提交
+                                    //并继续其它关键字的操作记录的预提交
+                                    ()
+                                } else {
+                                    //事务的当前操作记录中的关键字，与事务创建时的表中的关键字不匹配
+                                    //表示此关键字在当前事务执行过程中未改变，但值已改变，则此关键字的操作记录不允许预提交
+                                    //并立即返回当前事务预提交冲突
+                                    return Err(<Self as Transaction2Pc>::PrepareError::new_transaction_error(ErrorLevel::Normal,
+                                                                                                             format!("Prepare b-tree ordered table conflicted, table: {:?}, key: {:?}, source: {:?}, transaction_uid: {:?}, prepare_uid: {:?}, reason: the value is updated in table while the transaction is running",
+                                                                                                                     self.0.table.name().as_str(),
+                                                                                                                     key,
+                                                                                                                     self.0.source,
+                                                                                                                     self.get_transaction_uid(),
+                                                                                                                     self.get_prepare_uid())));
+                                }
+                            } else if root_value.is_none() && copy_value.is_none() {
+                                //事务的当前操作记录中的关键字，在事务创建时的表中也存在，且值引用相同
+                                //表示此关键字在当前事务执行过程中未改变，且值也未改变，则此关键字的操作记录允许预提交
+                                //并继续其它关键字的操作记录的预提交
+                                ()
+                            } else {
+                                //事务的当前操作记录中的关键字，与事务创建时的表中的关键字不匹配
+                                //表示此关键字在当前事务执行过程中未改变，但值已改变，则此关键字的操作记录不允许预提交
+                                //并立即返回当前事务预提交冲突
+                                return Err(<Self as Transaction2Pc>::PrepareError::new_transaction_error(ErrorLevel::Normal,
+                                                                                                         format!("Prepare b-tree ordered table conflicted, table: {:?}, key: {:?}, source: {:?}, transaction_uid: {:?}, prepare_uid: {:?}, reason: the value is updated in table while the transaction is running",
+                                                                                                                 self.0.table.name().as_str(),
+                                                                                                                 key,
+                                                                                                                 self.0.source,
+                                                                                                                 self.get_transaction_uid(),
+                                                                                                                 self.get_prepare_uid())));
+                            }
+                        },
+                        _ => {
+                            //事务的当前操作记录中的关键字，与事务创建时的表中的关键字不匹配
+                            //表示此关键字在当前事务执行过程中未改变，但值已改变，则此关键字的操作记录不允许预提交
+                            //并立即返回当前事务预提交冲突
+                            return Err(<Self as Transaction2Pc>::PrepareError::new_transaction_error(ErrorLevel::Normal,
+                                                                                                     format!("Prepare b-tree ordered table conflicted, table: {:?}, key: {:?}, source: {:?}, transaction_uid: {:?}, prepare_uid: {:?}, reason: the value is updated in table while the transaction is running",
+                                                                                                             self.0.table.name().as_str(),
+                                                                                                             key,
+                                                                                                             self.0.source,
+                                                                                                             self.get_transaction_uid(),
+                                                                                                             self.get_prepare_uid())));
+                        },
+                    }
                 },
             }
         }
@@ -1516,33 +1310,35 @@ impl<
         //获取事务的当前操作记录，并重置事务的当前操作记录
         let actions = mem::replace(&mut *self.0.actions.lock(), XHashMap::default());
 
-        if let Some(inner_transaction) = &mut *self.0.inner_transaction.lock() {
-            if inner_transaction.is_writable() {
-                //当前事务是写事务，则在事务对应的表的根节点，执行操作记录中的所有写操作
-                for (key, action) in &actions {
-                    match action {
-                        KVActionLog::Write(Some(value)) | KVActionLog::DirtyWrite(Some(value)) => {
-                            //执行插入或更新指定关键字的值的操作
-                            inner_transaction.upsert(key.clone(), value.clone());
-                        },
-                        KVActionLog::Write(None) | KVActionLog::DirtyWrite(None) => {
-                            //执行删除指定关键字的值的操作
-                            inner_transaction.delete(key);
-                        },
-                        KVActionLog::Read => (), //忽略读操作
-                    }
-                }
+        //在事务对应的有序B树表的临时缓存的根节点，执行操作记录中的所有写操作
+        for (key, action) in &actions {
+            match action {
+                KVActionLog::Write(Some(value)) | KVActionLog::DirtyWrite(Some(value)) => {
+                    //执行插入或更新指定关键字的值的操作
+                    self
+                        .0
+                        .table
+                        .0
+                        .cache
+                        .lock()
+                        .upsert(key.clone(), Some(value.clone()), false);
+                },
+                KVActionLog::Write(None) | KVActionLog::DirtyWrite(None) => {
+                    //执行删除指定关键字的值的操作，则标记删除
+                    self
+                        .0
+                        .table
+                        .0
+                        .cache
+                        .lock()
+                        .upsert(key.clone(), None, false);
+                },
+                KVActionLog::Read => (), //忽略读操作
             }
         }
 
         //将事务的当前操作记录，写入表的预提交表
-        self
-            .0
-            .table
-            .0
-            .prepare
-            .lock()
-            .insert(transaction_uid, actions);
+        self.0.table.0.prepare.lock().insert(transaction_uid, actions);
     }
 }
 
@@ -1567,31 +1363,14 @@ struct InnerBtreeOrdTabTr<
     prepare_timeout:    u64,
     //事务提交超时时长，单位毫秒
     commit_timeout:     u64,
+    //事务的临时缓存的可写引用
+    cache_mut:          SpinLock<OrdMap<Tree<Binary, Option<Binary>>>>,
+    //事务的临时缓存的只读引用
+    cache_ref:          OrdMap<Tree<Binary, Option<Binary>>>,
     //事务对应的有序B树表
     table:              BtreeOrderedTable<C, Log>,
     //事务内操作记录
     actions:            SpinLock<XHashMap<Binary, KVActionLog>>,
-    //写锁唯一ID
-    write_lock:         Option<u64>,
-    //内部事务
-    inner_transaction:  SpinLock<Option<InnerTransaction>>,
-}
-
-impl<
-    C: Clone + Send + 'static,
-    Log: AsyncCommitLog<C = C, Cid = Guid>,
-> Drop for InnerBtreeOrdTabTr<C, Log> {
-    fn drop(&mut self) {
-        if let Some(write_lock_uid) = self.write_lock.take() {
-            //当前是写事务，则解锁
-            let _ = self.table.try_unlock_write(write_lock_uid);
-        }
-
-        if let Some(inner_transaction) = self.inner_transaction.lock().take() {
-            //当前有内部事务，则立即回滚
-            let _ = inner_transaction.rollback();
-        }
-    }
 }
 
 // 内部事务
@@ -2052,133 +1831,6 @@ impl InnerTransaction {
     }
 }
 
-async fn collect_write_conflict<
-    C: Clone + Send + 'static,
-    Log: AsyncCommitLog<C = C, Cid = Guid>,
->(table: &BtreeOrderedTable<C, Log>, timeout: Option<usize>) {
-    if let Some(timeout) = timeout {
-        //需要等待指定时间后，再开始整理
-        table.0.rt.timeout(timeout).await;
-    }
-
-    //已达当前表的写冲突事务缓冲上限，则非持久化提交当前表的写冲突事务缓冲区中的所有写冲突事务
-    let write_confilct_commits: Vec<(XHashMap<Binary, KVActionLog>, Sender<IOResult<XHashMap<Binary, KVActionLog>>>)> = table
-        .0
-        .write_conflict_commits
-        .write()
-        .await
-        .drain(..)
-        .collect();
-    let (mut actions_vec, mut senders_vec): (Vec<XHashMap<Binary, KVActionLog>>, Vec<Sender<IOResult<XHashMap<Binary, KVActionLog>>>>) = write_confilct_commits.into_iter().unzip();
-
-    let write_lock_uid = loop {
-        if let Some(lock) = table.try_lock_write() {
-            //尝试获取锁成功
-            break lock;
-        } else {
-            //尝试获取锁失败，则稍候重试
-            table
-                .0
-                .rt
-                .timeout(10)
-                .await;
-            continue;
-        }
-    };
-
-    //立即开始内部写事务
-    let r = table.0.inner.read().begin_write();
-    if r.is_err() {
-        if let Err(e) = r {
-            //创建写事务失败，则通知所有异步等待非持久化提交成功的写冲突事务
-            let _ = table.try_unlock_write(write_lock_uid);
-
-            for sender in senders_vec {
-                sender
-                    .send(Err(Error::new(ErrorKind::Other,
-                                         format!("Conflict commit b-tree ordered table failed, table: {:?}, reason: {:?}",
-                                                 table.name().as_str(),
-                                                 e))))
-                    .await;
-            }
-
-            return;
-        }
-    }
-    let mut transaction = r.unwrap();
-    transaction.set_durability(Durability::None);
-    let mut new_inner_transaction = InnerTransaction::Writable(transaction, table.name());
-
-    //立即在新的内部写事务上执行写冲突事务的修改或删除操作
-    for actions in &actions_vec {
-        for (key, action) in actions.iter() {
-            match action {
-                KVActionLog::Write(None) | KVActionLog::DirtyWrite(None) => {
-                    //删除指定关键字
-                    if let Err(e) = new_inner_transaction.delete(key) {
-                        //删除失败，则通知所有异步等待非持久化提交成功的写冲突事务
-                        for sender in senders_vec {
-                            sender
-                                .send(Err(Error::new(ErrorKind::Other,
-                                                     format!("Conflict delete b-tree ordered table failed, table: {:?}, reason: {:?}",
-                                                             table.name().as_str(),
-                                                             e))))
-                                .await;
-                        }
-
-                        return;
-                    }
-                },
-                KVActionLog::Write(Some(value)) | KVActionLog::DirtyWrite(Some(value)) => {
-                    //插入或更新指定关键字
-                    if let Err(e) = new_inner_transaction.upsert(key.clone(), value.clone()) {
-                        //修改失败，则通知所有异步等待非持久化提交成功的写冲突事务
-                        for sender in senders_vec {
-                            sender
-                                .send(Err(Error::new(ErrorKind::Other,
-                                                     format!("Conflict upsert b-tree ordered table failed, table: {:?}, reason: {:?}",
-                                                             table.name().as_str(),
-                                                             e))))
-                                .await;
-                        }
-
-                        return;
-                    }
-                },
-                KVActionLog::Read => (), //忽略读操作
-            }
-        }
-    }
-
-    //非持久化提交新的内部写事务
-    if let Err(e) = new_inner_transaction.commit() {
-        //内部事务提交失败，则通知其它异步等待非持久化提交成功的写冲突事务
-        for sender in senders_vec {
-            sender
-                .send(Err(Error::new(ErrorKind::Other,
-                                     format!("Conflict commit b-tree ordered table failed, table: {:?}, reason: {:?}",
-                                             table.name().as_str(),
-                                             e))))
-                .await;
-        }
-
-        return;
-    }
-
-    //安全的强制解除表的写锁
-    let _ = table
-        .try_unlock_write(write_lock_uid);
-
-    //通知所有异步等待非持久化提交成功的写冲突事务
-    for (sender,
-        actions) in senders_vec.into_iter().zip(actions_vec.into_iter())
-    {
-        sender
-            .send(Ok(actions))
-            .await;
-    }
-}
-
 // 异步整理有序B树表中等待写入redb的事务，
 // 返回本次整理消耗的时间，本次写入redb成功的事务数、关键字数和字节数，以及本次写入redb失败的事务数、关键字数和字节数
 async fn collect_waits<
@@ -2216,34 +1868,26 @@ async fn collect_waits<
             .lock()
             .await;
 
-        while let Some((wait_tr, actions, confirm)) = locked.pop_front() {
-            for (key, actions) in actions.iter() {
-                match actions {
-                    KVActionLog::Write(None) | KVActionLog::DirtyWrite(None) => {
-                        //统计删除了有序B树表中指定关键字的值
-                        keys_len += 1;
-                        bytes_len += key.len();
-                    },
-                    KVActionLog::Write(Some(value)) | KVActionLog::DirtyWrite(Some(value)) => {
-                        //统计插入或更新了有序B树表中指定关键字的值
-                        keys_len += 1;
-                        bytes_len += key.len() + value.len();
-                    },
-                    KVActionLog::Read => (), //忽略读操作
-                }
-            }
+        match table.0.inner.read().begin_write() {
+            Err(e) => {
+                //创建redb的写事务失败
+                table
+                    .0
+                    .collecting
+                    .store(false, Ordering::Release); //设置为已整理结束
+                error!("Collect b-tree ordered table failed, table: {:?}, transactions: {}, keys: {}, bytes: {}, reason: {:?}",
+                            table.name().as_str(),
+                            trs_len,
+                            keys_len,
+                            bytes_len,
+                            e);
 
-            trs_len += 1;
-            waits.push_back((wait_tr, confirm));
-        }
-
-        loop {
-            if let Some(lock) = table.try_lock_write() {
-                //当前B树表未写锁
-                match table.0.inner.read().begin_write() {
+                return Err((now.elapsed(), (trs_len, keys_len, bytes_len)));
+            },
+            Ok(mut transaction) => {
+                //创建redb的写事务成功
+                let mut inner_table = match transaction.open_table(DEFAULT_TABLE_NAME) {
                     Err(e) => {
-                        //写入redb失败，则稍候重试
-                        let _ = table.try_unlock_write(lock); //立即释放当前B树表的写锁
                         table
                             .0
                             .collecting
@@ -2254,35 +1898,71 @@ async fn collect_waits<
                             keys_len,
                             bytes_len,
                             e);
+
+                        return Err((now.elapsed(), (trs_len, keys_len, bytes_len)));
                     },
-                    Ok(mut transaction) => {
-                        transaction.set_durability(Durability::Immediate);
-                        if let Err(e) = transaction.commit() {
-                            //写入redb失败，则立即中止本次整理
-                            let _ = table.try_unlock_write(lock); //立即释放当前B树表的写锁
-                            table
-                                .0
-                                .collecting
-                                .store(false, Ordering::Release); //设置为已整理结束
-                            error!("Collect b-tree ordered table failed, table: {:?}, transactions: {}, keys: {}, bytes: {}, reason: {:?}",
+                    Ok(inner_table) => {
+                       inner_table
+                    },
+                };
+
+                while let Some((wait_tr, actions, confirm)) = locked.pop_front()
+                {
+                    for (key, actions) in actions.iter() {
+                        match actions {
+                            KVActionLog::Write(None) | KVActionLog::DirtyWrite(None) => {
+                                //统计删除了有序B树表中指定关键字的值
+                                if let Err(e) = inner_table.remove(key) {
+                                    //删除指定关键字的值失败，则继续处理下一个操作记录
+                                    error!("Delete key-value pair of redb table failed, table: {:?}, key: {:?}, reason: {:?}",
+                                                table.name().as_str(),
+                                                key,
+                                                e);
+                                    continue;
+                                }
+
+                                keys_len += 1;
+                                bytes_len += key.len();
+                            },
+                            KVActionLog::Write(Some(value)) | KVActionLog::DirtyWrite(Some(value)) => {
+                                //统计插入或更新了有序B树表中指定关键字的值
+                                if let Err(e) = inner_table.insert(key, value) {
+                                    //插入或更新指定关键字的值失败，则继续处理下一个操作记录
+                                    error!("Upsert key-value pair of redb table failed, table: {:?}, key: {:?}, reason: {:?}",
+                                                table.name().as_str(),
+                                                key,
+                                                e);
+                                    continue;
+                                }
+
+                                keys_len += 1;
+                                bytes_len += key.len() + value.len();
+                            },
+                            KVActionLog::Read => (), //忽略读操作
+                        }
+                    }
+
+                    trs_len += 1;
+                    waits.push_back((wait_tr, confirm));
+                }
+                drop(inner_table); //在持久化提交前必须关闭redb表
+
+                if let Err(e) = transaction.commit() {
+                    //持久化提交redb失败，则立即中止本次整理
+                    table
+                        .0
+                        .collecting
+                        .store(false, Ordering::Release); //设置为已整理结束
+                    error!("Collect b-tree ordered table failed, table: {:?}, transactions: {}, keys: {}, bytes: {}, reason: {:?}",
                                 table.name().as_str(),
                                 trs_len,
                                 keys_len,
                                 bytes_len,
                                 e);
 
-                            return Err((now.elapsed(), (trs_len, keys_len, bytes_len)));
-                        }
-
-                        //持久化提交成功，则立即释放当前B树表的写锁
-                        let _ = table.try_unlock_write(lock);
-                        break;
-                    },
+                    return Err((now.elapsed(), (trs_len, keys_len, bytes_len)));
                 }
-            }
-
-            //当前B树表已写锁或获取写事务失败，则稍候重试
-            table.0.rt.timeout(1000).await;
+            },
         }
     }
 
