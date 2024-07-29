@@ -905,7 +905,7 @@ impl<
             //记录对指定关键字的最新删除操作，并增加写操作计数
             let _ = tr.0.actions.lock().insert(key.clone(), KVActionLog::Write(None));
 
-            if let Some(Some(Some(value))) = tr.0.cache_mut.lock().delete(&key, false) {
+            if let Some(Some(Some(value))) = tr.0.cache_mut.lock().delete(&key, true) {
                 //指定关键字存在，则标记删除
                 let _ = tr
                     .0
@@ -2019,5 +2019,4 @@ async fn collect_waits<
 
     Ok((now.elapsed(), (trs_len, keys_len, bytes_len)))
 }
-
 
