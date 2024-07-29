@@ -674,7 +674,10 @@ impl<
                                 match action {
                                     KVActionLog::Write(None) | KVActionLog::DirtyWrite(None) => {
                                         //删除指定关键字
-                                        let _ = locked.delete(key, false);
+                                        if let Some(Some(Some(_))) = locked.delete(key, true) {
+                                            //指定关键字存在，则标记删除
+                                            let _ = locked.upsert(key.clone(), None, false);
+                                        }
                                     },
                                     KVActionLog::Write(Some(value)) | KVActionLog::DirtyWrite(Some(value)) => {
                                         //插入或更新指定关键字
