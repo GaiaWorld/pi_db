@@ -195,6 +195,7 @@ impl<
             let mut transaction = match locked.begin_write() {
                 Err(e) => {
                     //创建写事务失败，则立即返回错误原因
+                    table.0.collecting.store(false, Ordering::Release); //设置为已整理结束
                     return Err(KVTableTrError::new_transaction_error(ErrorLevel::Fatal,
                                                                      format!("Compact b-tree ordered table failed, table: {:?}, , reason: {:?}",
                                                                              table.name().as_str(),
@@ -205,6 +206,7 @@ impl<
             transaction.set_durability(Durability::Immediate);
             if let Err(e) = transaction.commit() {
                 //写事务持久化提交失败，则立即返回错误原因
+                table.0.collecting.store(false, Ordering::Release); //设置为已整理结束
                 return Err(KVTableTrError::new_transaction_error(ErrorLevel::Fatal,
                                                                  format!("Compact b-tree ordered table failed, table: {:?}, , reason: {:?}",
                                                                          table.name().as_str(),
@@ -219,6 +221,7 @@ impl<
                     //压缩数据表失败
                     if retry_count == 0 {
                         //重试已达限制，则立即返回错误原因
+                        table.0.collecting.store(false, Ordering::Release); //设置为已整理结束
                         return Err(KVTableTrError::new_transaction_error(ErrorLevel::Normal,
                                                                          format!("Compact b-tree ordered table failed, table: {:?}, time: {:?}, reason: {:?}",
                                                                                  table.name().as_str(),
@@ -236,6 +239,7 @@ impl<
                 now.elapsed());
             }
 
+            table.0.collecting.store(false, Ordering::Release); //设置为已整理结束
             Ok(())
         }.boxed()
     }

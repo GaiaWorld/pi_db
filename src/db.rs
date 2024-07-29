@@ -2272,27 +2272,6 @@ impl<
                 table_tr
             },
             KVDBTable::BtreeOrdTab(tab) => {
-                //在Linux环境中启动全局有序B树表清理的定时任务
-                #[cfg(target_os = "linux")]
-                {
-                    if let Ok(_) = GLOBAL_B_TREE_ORDERED_TABLE_CLEANUP_FLAG
-                        .compare_exchange(false,
-                                          true,
-                                          Ordering::AcqRel,
-                                          Ordering::Relaxed) {
-                        //全局只启动一次
-                        let db_mgr = self.0.db_mgr.clone();
-                        let _ = self.0.db_mgr.0.rt.spawn(async move {
-                            loop {
-                                db_mgr.0.rt.timeout(DEFAULT_GLOBAL_B_TREE_ORDERED_TABLE_CLEANUP_INTERVAL).await;
-                                let now = Instant::now();
-                                db_mgr.cleanup_buffer_after_collect_table();
-                                info!("Cleanup memory for global b-tree table finish, time: {:?}", now.elapsed());
-                            }
-                        });
-                    }
-                }
-
                 let tr = tab.transaction(self.get_source(),
                                          self.is_writable(),
                                          is_persistent,
