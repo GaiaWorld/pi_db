@@ -1,6 +1,6 @@
 use std::{mem, thread};
 use std::path::{Path, PathBuf};
-use std::collections::{VecDeque, HashMap};
+use std::collections::{VecDeque, HashMap, BTreeMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use std::sync::{Arc,
@@ -1261,13 +1261,7 @@ impl<
                                     //事务的当前操作记录中的关键字，与事务创建时的表中的关键字不匹配
                                     //表示此关键字在当前事务执行过程中未改变，但值已改变，则此关键字的操作记录不允许预提交
                                     //并立即返回当前事务预提交冲突
-                                    return Err(<Self as Transaction2Pc>::PrepareError::new_transaction_error(ErrorLevel::Normal,
-                                                                                                             format!("Prepare b-tree ordered table conflicted, table: {:?}, key: {:?}, source: {:?}, transaction_uid: {:?}, prepare_uid: {:?}, reason: the value is updated in table while the transaction is running",
-                                                                                                                     self.0.table.name().as_str(),
-                                                                                                                     key,
-                                                                                                                     self.0.source,
-                                                                                                                     self.get_transaction_uid(),
-                                                                                                                     self.get_prepare_uid())));
+                                    return Err(<Self as Transaction2Pc>::PrepareError::new_transaction_error(ErrorLevel::Normal, format!("Prepare b-tree ordered table conflicted, table: {:?}, key: {:?}, source: {:?}, transaction_uid: {:?}, prepare_uid: {:?}, reason: the value is updated in table while the transaction is running", self.0.table.name().as_str(), key, self.0.source, self.get_transaction_uid(), self.get_prepare_uid())));
                                 }
                             } else if root_value.is_none() && copy_value.is_none() {
                                 //事务的当前操作记录中的关键字，在事务创建时的表中也存在，且值引用相同
@@ -1343,6 +1337,29 @@ impl<
 
         //将事务的当前操作记录，写入表的预提交表
         self.0.table.0.prepare.lock().insert(transaction_uid, actions);
+    }
+
+    // 立即删除缓存中指定关键字的值，只允许在指定关键字的值被持久化后调用
+    pub(crate) fn delete_cache(&self, keys: Vec<<Self as KVAction>::Key>) {
+        for key in &keys {
+            let _ = self.0.cache_mut.lock().delete(key, false);
+        }
+
+        //更新有序B树表的临时缓存的根节点
+        {
+            let mut locked = self.0.table.0.cache.lock();
+            if !locked.ptr_eq(&self.0.cache_ref) {
+                //有序B树表的临时缓存的根节点在当前事务执行过程中已改变，
+                //一般是因为其它事务更新了与当前事务无关的关键字，
+                //则将当前事务的修改直接作用在当前有序B树表的临时缓存中
+                for key in &keys {
+                    let _ = locked.delete(key, false);
+                }
+            } else {
+                //有序B树表的临时缓存的根节点在当前事务执行过程中未改变，则用本次事务修改并提交成功的根节点替换有序B树表的临时缓存的根节点
+                *locked = self.0.cache_mut.lock().clone();
+            }
+        }
     }
 }
 
@@ -1859,6 +1876,7 @@ async fn collect_waits<
 
     //将有序B树表中等待写入redb的事务，写入redb
     let mut waits = VecDeque::new();
+    let mut cache_keys = BTreeMap::new();
     let mut trs_len = 0;
     let mut keys_len = 0;
     let mut bytes_len = 0;
@@ -1944,6 +1962,8 @@ async fn collect_waits<
                             },
                             KVActionLog::Read => (), //忽略读操作
                         }
+
+                        cache_keys.insert(key.clone(), ()); //记录需要在持久化提交成功后，从缓存中清理的关键字
                     }
 
                     trs_len += 1;
@@ -1984,6 +2004,18 @@ async fn collect_waits<
         }
     }
     table.0.collecting.store(false, Ordering::Release); //设置为已整理结束
+
+    //清理已经持久化提交后的关键字在缓存中的值
+    let clean_cache_transaction = table.transaction(Atom::from("Collect_waits_cache"),
+                      false,
+                      false,
+                      5000,
+                      5000);
+    clean_cache_transaction
+        .delete_cache(cache_keys
+            .keys()
+            .map(|key| key.clone())
+            .collect());
 
     Ok((now.elapsed(), (trs_len, keys_len, bytes_len)))
 }

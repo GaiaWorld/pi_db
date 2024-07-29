@@ -1396,7 +1396,7 @@ fn bench_table_conflict(b: &mut Bencher) {
     });
 }
 
-// 测试前清空数据库
+// 测试写性能，还会测试写数据，持久化提交数据，读已缓存数据和读未缓存数据的功能
 #[bench]
 fn bench_b_tree_table(b: &mut Bencher) {
     use std::thread;
@@ -1456,7 +1456,7 @@ fn bench_b_tree_table(b: &mut Bencher) {
         let table_name = Atom::from("test_log/a/b/c");
 
         let now = Instant::now();
-        for index in 0..100usize {
+        for index in 0..1000usize {
             let s_copy = s.clone();
             let db_copy = db.clone();
             let table_name_copy = table_name.clone();
@@ -1523,7 +1523,7 @@ fn bench_b_tree_table(b: &mut Bencher) {
                 },
                 Ok(_) => {
                     count += 1;
-                    if count >= 100 {
+                    if count >= 1000 {
                         break;
                     }
                 },
@@ -1538,7 +1538,7 @@ fn bench_b_tree_table(b: &mut Bencher) {
             .transaction(Atom::from("test_log/a/b/c"), false, 5000, 5000)
             .unwrap();
         let mut stream = transaction.values(Atom::from("test_log/a/b/c"), None, false).await.unwrap();
-        for index in 0..100 {
+        for index in 0..1000 {
             if let Some((key, value)) = stream.next().await {
                 assert_eq!(binary_to_usize(&key).unwrap(), index);
                 assert_eq!(String::from_utf8_lossy(value.as_ref()).as_ref(), "Hello World!");
@@ -1546,10 +1546,27 @@ fn bench_b_tree_table(b: &mut Bencher) {
                 panic!("assert failed, index: {:?}", index);
             }
         }
-        println!("======> assert ok");
+        println!("======> assert cache before clean ok");
     });
 
     thread::sleep(Duration::from_millis(70000));
+
+    let db_clone = db_copy.clone();
+    rt.spawn(async move {
+        let mut transaction = db_clone
+            .transaction(Atom::from("test_log/a/b/c"), false, 5000, 5000)
+            .unwrap();
+        let mut stream = transaction.values(Atom::from("test_log/a/b/c"), None, false).await.unwrap();
+        for index in 0..1000 {
+            if let Some((key, value)) = stream.next().await {
+                assert_eq!(binary_to_usize(&key).unwrap(), index);
+                assert_eq!(String::from_utf8_lossy(value.as_ref()).as_ref(), "Hello World!");
+            } else {
+                panic!("assert failed, index: {:?}", index);
+            }
+        }
+        println!("======> assert cache after clean ok");
+    });
 }
 
 #[bench]
