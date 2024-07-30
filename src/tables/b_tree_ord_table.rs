@@ -140,20 +140,20 @@ impl<
     }
 
     fn len(&self) -> usize {
+        let cache_len = self.0.cache.lock().size();
         if let Ok(tr) = self.0.inner.read().begin_read() {
             if let Ok(table) = tr.open_table(DEFAULT_TABLE_NAME) {
                 let table_len = table.len().unwrap_or(0) as usize;
-                let cache_len = self.0.cache.lock().size();
                 if table_len < cache_len {
                     cache_len
                 } else {
                     table_len
                 }
             } else {
-                0
+                cache_len
             }
         } else {
-            0
+            cache_len
         }
     }
 
