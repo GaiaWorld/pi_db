@@ -21,11 +21,16 @@ use pi_async_rt::rt::{AsyncRuntime,
 use pi_async_transaction::{TransactionError,
                            ErrorLevel,
                            manager_2pc::Transaction2PcManager};
-use pi_store::commit_logger::CommitLoggerBuilder;
+use pi_guid::Guid;
+use pi_store::commit_logger::{CommitLogger, CommitLoggerBuilder};
 use async_stream::stream;
 use pi_async_rt::prelude::startup_global_time_loop;
 use pi_bon::{WriteBuffer, ReadBuffer, Encode, Decode, ReadBonErr};
-use pi_db::{Binary, KVDBTableType, KVTableMeta, db::KVDBManagerBuilder, tables::TableKV, KVTableTrError};
+use pi_db::{Binary, KVDBTableType, KVTableMeta,
+            db::{KVDBManagerBuilder, KVDBManager},
+            tables::TableKV,
+            utils::KVDBEvent,
+            KVTableTrError};
 
 #[bench]
 fn bench_insert_ordmap_by_small(b: &mut Bencher) {
@@ -1396,6 +1401,192 @@ fn bench_table_conflict(b: &mut Bencher) {
     });
 }
 
+#[bench]
+fn bench_log_table_commit_log_error(b: &mut Bencher) {
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    env_logger::init();
+
+    let _handle = startup_global_time_loop(100);
+    let builder = MultiTaskRuntimeBuilder::default();
+    let rt = builder.build();
+    let rt_copy = rt.clone();
+
+    //异步构建数据库管理器
+    let (sender, receiver) = bounded(1);
+    let _ = rt.spawn(async move {
+        let guid_gen = GuidGen::new(run_nanos(), 0);
+        let commit_logger_builder = CommitLoggerBuilder::new(rt_copy.clone(), "./.commit_log");
+        let commit_logger = commit_logger_builder
+            .build()
+            .await
+            .unwrap();
+
+        let tr_mgr = Transaction2PcManager::new(rt_copy.clone(),
+                                                guid_gen,
+                                                commit_logger);
+
+        let builder = KVDBManagerBuilder::new(rt_copy.clone(), tr_mgr, "./db");
+        match builder.startup().await {
+            Err(e) => {
+                println!("!!!!!!startup db failed, reason: {:?}", e);
+            },
+            Ok(db) => {
+                let tr = db.transaction(Atom::from("test_log"), true, 500, 500).unwrap();
+                if let Err(e) = tr.create_table(Atom::from("test_log"),
+                                                KVTableMeta::new(KVDBTableType::LogOrdTab,
+                                                                 true,
+                                                                 EnumType::Usize,
+                                                                 EnumType::Str)).await {
+                    //创建有序日志表失败
+                    println!("!!!!!!create log ordered table failed, reason: {:?}", e);
+                }
+                let output = tr.prepare_modified().await.unwrap();
+                let _ = tr.commit_modified(output).await;
+                println!("!!!!!!db table size: {:?}", db.table_size().await);
+
+                sender.send(db);
+            },
+        }
+    });
+    thread::sleep(Duration::from_millis(3000));
+
+    let rt_copy = rt.clone();
+    let db = receiver.recv().unwrap();
+    b.iter(move || {
+        let (s, r) = unbounded();
+        let table_name = Atom::from("test_log");
+
+        let now = Instant::now();
+        for index in 0..10000usize {
+            let s_copy = s.clone();
+            let db_copy = db.clone();
+            let table_name_copy = table_name.clone();
+
+            if index % 10 == 0 {
+                let _ = rt_copy.spawn(async move {
+                    let tr = db_copy
+                        .transaction(Atom::from("test log table0"),
+                                     false,
+                                     500,
+                                     500)
+                        .unwrap();
+
+                    let _ = tr.upsert(vec![TableKV {
+                        table: table_name_copy,
+                        key: usize_to_binary(index),
+                        value: Some(Binary::new("Hello World!".as_bytes().to_vec()))
+                    }]).await;
+
+                    loop {
+                        match tr.prepare_modified().await {
+                            Err(e) => {
+                                println!("prepare failed, reason: {:?}", e);
+                                if let Err(e) = tr.rollback_modified().await {
+                                    println!("rollback failed, reason: {:?}", e);
+                                    break;
+                                } else {
+                                    println!("rollback ok for prepare");
+                                    continue;
+                                }
+                            },
+                            Ok(output) => {
+                                match tr.commit_modified(output).await {
+                                    Err(e) => {
+                                        println!("commit failed, reason: {:?}", e);
+                                        if let ErrorLevel::Fatal = &e.level() {
+                                            println!("rollback failed, reason: commit fatal error");
+                                        } else {
+                                            println!("rollbakc ok for commit");
+                                        }
+                                        break;
+                                    },
+                                    Ok(()) => {
+                                        s_copy.send(());
+                                        break;
+                                    },
+                                }
+                            },
+                        }
+                    }
+                });
+            } else {
+                let _ = rt_copy.spawn(async move {
+                    let tr = db_copy
+                        .transaction(Atom::from("test log table1"),
+                                     true,
+                                     500,
+                                     500)
+                        .unwrap();
+
+                    let _ = tr.upsert(vec![TableKV {
+                        table: table_name_copy,
+                        key: usize_to_binary(index),
+                        value: Some(Binary::new("Hello World!".as_bytes().to_vec()))
+                    }]).await;
+
+                    loop {
+                        match tr.prepare_modified().await {
+                            Err(e) => {
+                                println!("prepare failed, reason: {:?}", e);
+                                if let Err(e) = tr.rollback_modified().await {
+                                    println!("rollback failed, reason: {:?}", e);
+                                    break;
+                                } else {
+                                    println!("rollback ok for prepare");
+                                    continue;
+                                }
+                            },
+                            Ok(output) => {
+                                match tr.commit_modified(output).await {
+                                    Err(e) => {
+                                        println!("commit failed, reason: {:?}", e);
+                                        if let ErrorLevel::Fatal = &e.level() {
+                                            println!("rollback failed, reason: commit fatal error");
+                                        } else {
+                                            println!("rollbakc ok for commit");
+                                        }
+                                        break;
+                                    },
+                                    Ok(()) => {
+                                        s_copy.send(());
+                                        break;
+                                    },
+                                }
+                            },
+                        }
+                    }
+                });
+            }
+        }
+
+        let mut count = 0;
+        loop {
+            match r.recv_timeout(Duration::from_millis(10000)) {
+                Err(e) => {
+                    println!(
+                        "!!!!!!recv timeout, len: {}, timer_len: {}, e: {:?}",
+                        rt_copy.wait_len(),
+                        rt_copy.len(),
+                        e
+                    );
+                    continue;
+                },
+                Ok(_) => {
+                    count += 1;
+                    if count >= 10000 {
+                        break;
+                    }
+                },
+            }
+        }
+        println!("time: {:?}", Instant::now() - now);
+    });
+
+    thread::sleep(Duration::from_millis(180000));
+}
+
 // 测试写性能，还会测试写数据，持久化提交数据，读已缓存数据和读未缓存数据的功能
 #[bench]
 fn bench_b_tree_table(b: &mut Bencher) {
@@ -1424,7 +1615,17 @@ fn bench_b_tree_table(b: &mut Bencher) {
                                                 commit_logger);
 
         let builder = KVDBManagerBuilder::new(rt_copy.clone(), tr_mgr, "./db");
-        match builder.startup().await {
+        let mut count = 0usize;
+        let listener = move |
+            db_mgr: &KVDBManager<usize, CommitLogger>,
+            tr_mgr: &Transaction2PcManager<usize, CommitLogger>,
+            events: &mut Vec<KVDBEvent<Guid>>,
+        | {
+            count += events.len();
+            events.clear();
+            println!("!!!!!!> count: {:?}, start total: {:?}, end total: {:?}, active: {:?}", count, tr_mgr.produced_transaction_total(), tr_mgr.consumed_transaction_total(), tr_mgr.transaction_len());
+        };
+        match builder.startup_with_listener(Some(listener)).await {
             Err(e) => {
                 println!("!!!!!!startup db failed, reason: {:?}", e);
             },

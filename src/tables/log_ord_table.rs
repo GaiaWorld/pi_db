@@ -10,6 +10,7 @@ use parking_lot::Mutex;
 use futures::{future::{FutureExt, BoxFuture},
               stream::{StreamExt, BoxStream}};
 use async_lock::Mutex as AsyncMutex;
+use async_channel::{Sender, Receiver, unbounded};
 use async_stream::stream;
 use log::{debug, info, error};
 
@@ -32,16 +33,7 @@ use pi_store::log_store::log_file::{PairLoader,
                                     LogMethod,
                                     LogFile};
 
-use crate::{Binary,
-            KVAction,
-            TableTrQos,
-            KVActionLog,
-            KVDBCommitConfirm,
-            KVTableTrError,
-            TransactionDebugEvent,
-            transaction_debug_logger,
-            db::{KVDBTransaction, KVDBChildTrList},
-            tables::KVTable};
+use crate::{Binary, KVAction, TableTrQos, KVActionLog, KVDBCommitConfirm, KVTableTrError, TransactionDebugEvent, transaction_debug_logger, db::{KVDBTransaction, KVDBChildTrList}, tables::KVTable, utils::KVDBEvent, KVDBTableType};
 
 ///
 /// 默认的日志文件延迟提交的超时时长，单位ms
@@ -173,7 +165,8 @@ impl<
                                      load_buf_len: u64,
                                      is_checksum: bool,
                                      waits_limit: usize,
-                                     wait_timeout: usize) -> Self {
+                                     wait_timeout: usize,
+                                     notifier: Option<Sender<KVDBEvent<Guid>>>) -> Self {
         let root = Mutex::new(OrdMap::new(None));
         let prepare = Mutex::new(XHashMap::default());
 
@@ -206,6 +199,7 @@ impl<
                     wait_timeout,
                     collecting,
                     log_file,
+                    notifier,
                 };
 
                 let table = LogOrderedTable(Arc::new(inner));
@@ -265,16 +259,28 @@ struct InnerLogOrderedTable<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>,
 > {
-    name:           Atom,                                                                                                   //表名
-    root:           Mutex<OrdMap<Tree<Binary, Binary>>>,                                                                    //有序日志表的根节点
-    prepare:        Mutex<XHashMap<Guid, XHashMap<Binary, KVActionLog>>>,                                                   //有序日志表的预提交表
-    rt:             MultiTaskRuntime<()>,                                                                                   //异步运行时
-    waits:          AsyncMutex<VecDeque<(LogOrdTabTr<C, Log>, XHashMap<Binary, KVActionLog>, <LogOrdTabTr<C, Log> as Transaction2Pc>::CommitConfirm)>>,                                                                                     //等待异步写日志文件的已提交的有序日志事务列表
-    waits_size:     AtomicUsize,                                                                                            //等待异步写日志文件的已提交的有序日志事务的键值对大小
-    waits_limit:    usize,                                                                                                  //等待异步写日志文件的已提交的有序日志事务大小限制
-    wait_timeout:   usize,                                                                                                  //等待异步写日志文件的超时时长，单位毫秒
-    collecting:     AtomicBool,                                                                                             //是否正在整理等待异步写日志文件的已提交的有序日志事务列表
-    log_file:       LogFile,                                                                                                //日志文件
+    //表名
+    name:           Atom,
+    //有序日志表的根节点
+    root:           Mutex<OrdMap<Tree<Binary, Binary>>>,
+    //有序日志表的预提交表
+    prepare:        Mutex<XHashMap<Guid, XHashMap<Binary, KVActionLog>>>,
+    //异步运行时
+    rt:             MultiTaskRuntime<()>,
+    //等待异步写日志文件的已提交的有序日志事务列表
+    waits:          AsyncMutex<VecDeque<(LogOrdTabTr<C, Log>, XHashMap<Binary, KVActionLog>, <LogOrdTabTr<C, Log> as Transaction2Pc>::CommitConfirm)>>,
+    //等待异步写日志文件的已提交的有序日志事务的键值对大小
+    waits_size:     AtomicUsize,
+    //等待异步写日志文件的已提交的有序日志事务大小限制
+    waits_limit:    usize,
+    //等待异步写日志文件的超时时长，单位毫秒
+    wait_timeout:   usize,
+    //是否正在整理等待异步写日志文件的已提交的有序日志事务列表
+    collecting:     AtomicBool,
+    //日志文件
+    log_file:       LogFile,
+    //表事件通知器
+    notifier:       Option<Sender<KVDBEvent<Guid>>>,
 }
 
 unsafe impl<
@@ -1235,27 +1241,68 @@ async fn collect_waits<
     }
 
     //写入日志文件成功，则调用指定事务的确认提交回调，并继续写入下一个事务
-    for (wait_tr, confirm) in waits {
-        //跟踪提交
-        #[cfg(feature = "log_table_debug")]
-        {
-            let event = TransactionDebugEvent::CommitConfirm(wait_tr.get_transaction_uid().unwrap(),
-                                                             wait_tr.get_commit_uid().unwrap(),
-                                                             wait_tr.0.table.name(),
-                                                             wait_tr.is_writable(),
-                                                             wait_tr.is_require_persistence());
-            let logger = transaction_debug_logger();
-            logger.log(event);
-        }
-        if let Err(e) = confirm(wait_tr.get_transaction_uid().unwrap(),
-                                wait_tr.get_commit_uid().unwrap(),
-                                Ok(())) {
-            error!("Collect log ordered table failed, table: {:?}, transactions: {}, keys: {}, bytes: {}, reason: {:?}",
+    if let Some(notifier) = table.0.notifier.as_ref() {
+        //指定了监听器
+        for (wait_tr, confirm) in waits {
+            //跟踪提交
+            #[cfg(feature = "log_table_debug")]
+            {
+                let event = TransactionDebugEvent::CommitConfirm(wait_tr.get_transaction_uid().unwrap(),
+                                                                 wait_tr.get_commit_uid().unwrap(),
+                                                                 wait_tr.0.table.name(),
+                                                                 wait_tr.is_writable(),
+                                                                 wait_tr.is_require_persistence());
+                let logger = transaction_debug_logger();
+                logger.log(event);
+            }
+            if let Err(e) = confirm(wait_tr.get_transaction_uid().unwrap(),
+                                    wait_tr.get_commit_uid().unwrap(),
+                                    Ok(())) {
+                notifier.send(KVDBEvent::CommitFailed(wait_tr.get_source(),
+                                                      wait_tr.0.table.name(),
+                                                      KVDBTableType::BtreeOrdTab,
+                                                      wait_tr.get_transaction_uid().unwrap(),
+                                                      wait_tr.get_commit_uid().unwrap()))
+                    .await;
+                error!("Collect log ordered table failed, table: {:?}, transactions: {}, keys: {}, bytes: {}, reason: {:?}",
                     table.name().as_str(),
                     trs_len,
                     keys_len,
                     bytes_len,
                     e);
+            } else {
+                notifier.send(KVDBEvent::ConfirmCommited(wait_tr.get_source(),
+                                                         wait_tr.0.table.name(),
+                                                         KVDBTableType::BtreeOrdTab,
+                                                         wait_tr.get_transaction_uid().unwrap(),
+                                                         wait_tr.get_commit_uid().unwrap()))
+                    .await;
+            }
+        }
+    } else {
+        //未指定监听器
+        for (wait_tr, confirm) in waits {
+            //跟踪提交
+            #[cfg(feature = "log_table_debug")]
+            {
+                let event = TransactionDebugEvent::CommitConfirm(wait_tr.get_transaction_uid().unwrap(),
+                                                                 wait_tr.get_commit_uid().unwrap(),
+                                                                 wait_tr.0.table.name(),
+                                                                 wait_tr.is_writable(),
+                                                                 wait_tr.is_require_persistence());
+                let logger = transaction_debug_logger();
+                logger.log(event);
+            }
+            if let Err(e) = confirm(wait_tr.get_transaction_uid().unwrap(),
+                                    wait_tr.get_commit_uid().unwrap(),
+                                    Ok(())) {
+                error!("Collect log ordered table failed, table: {:?}, transactions: {}, keys: {}, bytes: {}, reason: {:?}",
+                    table.name().as_str(),
+                    trs_len,
+                    keys_len,
+                    bytes_len,
+                    e);
+            }
         }
     }
     table.0.collecting.store(false, Ordering::Release); //设置为已整理结束

@@ -5,6 +5,6 @@
 testlogfile
 **/.idea
 **/*.bat
-**/commit_log
+**/.commit_log
 **/db
 **/specific_db

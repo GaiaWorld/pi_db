@@ -10,6 +10,7 @@ use std::sync::{Arc,
 use futures::{future::{FutureExt, BoxFuture}, stream::BoxStream, StreamExt};
 use crossbeam_channel::bounded;
 use async_lock::{Mutex, RwLock};
+use async_channel::{Sender, Receiver, unbounded};
 use dashmap::DashMap;
 use lazy_static::lazy_static;
 use bytes::BufMut;
@@ -58,7 +59,7 @@ use crate::{Binary,
                                        LogWTabTr},
                      b_tree_ord_table::{BtreeOrderedTable,
                                         BtreeOrdTabTr}},
-            utils::CreateTableOptions};
+            utils::{CreateTableOptions, KVDBEvent}};
 
 ///
 /// 默认的数据库表元信息目录名
@@ -158,6 +159,16 @@ impl<
 > KVDBManagerBuilder<C, Log> {
     /// 异步启动键值对数据库，并返回键值对数据库的管理器
     pub async fn startup(self) -> IOResult<KVDBManager<C, Log>> {
+        self
+            .startup_with_listener::<fn(&KVDBManager<C, Log>, &Transaction2PcManager<C, Log>, &mut Vec<KVDBEvent<Guid>>)>(None)
+            .await
+    }
+
+    /// 异步启动指定监听器的键值对数据库，并返回键值对数据库的管理器
+    pub async fn startup_with_listener<F>(self, db_event_listener: Option<F>)
+                                          -> IOResult<KVDBManager<C, Log>>
+    where F: FnMut(&KVDBManager<C, Log>, &Transaction2PcManager<C, Log>, &mut Vec<KVDBEvent<Guid>>) + Send + Sync + 'static
+    {
         if !self.tables_meta_path.exists() {
             //指定路径的元信息表目录不存在，则创建
             let _ = create_dir(self.rt.clone(), self.tables_meta_path.clone()).await?;
@@ -176,6 +187,12 @@ impl<
         let tables_path = self.tables_path;
         let tables = Arc::new(RwLock::new(XHashMap::default()));
         let status = AtomicU64::new(DB_INITING_STATUS);
+        let (notifier, listener) = if db_event_listener.is_some() {
+            let (notifier, listener) = unbounded();
+            (Some(notifier), Some(listener))
+        } else {
+            (None, None)
+        };
         let inner = InnerKVDBManager {
             rt,
             tr_mgr,
@@ -184,6 +201,8 @@ impl<
             tables_path,
             tables,
             status,
+            listener,
+            notifier,
         };
         let db_mgr = KVDBManager(Arc::new(inner));
 
@@ -300,6 +319,65 @@ impl<
                         now.elapsed());
                 }
             }
+        }
+
+        if let Some(mut handle) = db_event_listener {
+            //指定了数据库事件监听器
+            let db_mgr_copy = db_mgr.clone();
+            let listener = db_mgr
+                .0
+                .listener
+                .as_ref()
+                .unwrap()
+                .clone();
+
+
+            db_mgr.0.rt.spawn(async move {
+                let mut events = Vec::with_capacity(3072);
+                loop {
+                    let mut try_count = 5usize;
+                    while events.len() < 3072 {
+                        //未达单次事件处理上限
+                        if let Ok(event) = listener.try_recv() {
+                            //有事件
+                            try_count = 5; //重置重试次数
+                            events.push(event);
+                        } else {
+                            //无事件
+                            if try_count > 0 {
+                                //未达重试限制，则稍候重试
+                                try_count = try_count.checked_sub(1).unwrap_or(0);
+                                db_mgr_copy
+                                    .0
+                                    .rt
+                                    .timeout(10)
+                                    .await;
+                                continue;
+                            }
+
+                            //已达重试限制
+                            if events.len() > 0 {
+                                //有待处理的事件，则立即处理
+                                try_count = 5; //重置重试次数
+                                handle(&db_mgr_copy, &db_mgr_copy.0.tr_mgr, &mut events);
+                                break;
+                            } else {
+                                //没有待处理的事件，则等待
+                                if let Ok(event) = listener.recv().await {
+                                    //有事件
+                                    try_count = 5; //重置重试次数
+                                    events.push(event);
+                                }
+                            }
+                        }
+                    }
+
+                    if events.len() > 0 {
+                        //有待处理的事件，则立即处理
+                        handle(&db_mgr_copy, &db_mgr_copy.0.tr_mgr, &mut events);
+                    }
+                }
+            });
         }
 
         db_mgr.0.status.store(DB_INITED_STATUS, Ordering::SeqCst); //设置数据库状态为已初始化
@@ -819,6 +897,8 @@ struct InnerKVDBManager<
     tables_path:        PathBuf,                                        //数据库表文件所在目录的路径
     tables:             Arc<RwLock<XHashMap<Atom, KVDBTable<C, Log>>>>, //数据表
     status:             AtomicU64,                                      //数据库状态
+    listener:           Option<Receiver<KVDBEvent<Guid>>>,              //数据库事件监听器
+    notifier:           Option<Sender<KVDBEvent<Guid>>>,                //数据库事件通知器
 }
 
 ///
@@ -2410,7 +2490,8 @@ impl<
                                              load_buf_len as u64,
                                              true,
                                              16 * 1024 * 1024,
-                                             60 * 1000).await;
+                                             60 * 1000,
+                                             self.0.db_mgr.0.notifier.clone()).await;
 
                     //注册创建的有序日志表
                     tables.insert(name.clone(), KVDBTable::LogOrdTab(table));
@@ -2453,7 +2534,8 @@ impl<
                                                cache_size,
                                                enable_compact,
                                                1024 * 1024,
-                                               60 * 1000).await;
+                                               60 * 1000,
+                                               self.0.db_mgr.0.notifier.clone()).await;
 
                     //注册创建的有序日志表
                     tables.insert(name.clone(), KVDBTable::BtreeOrdTab(table));
@@ -2638,6 +2720,7 @@ impl<
             let result_copy = result.clone();
             let count_copy = count.clone();
 
+            let notifier = self.0.db_mgr.0.notifier.clone();
             let _ = self.0.db_mgr.0.rt.spawn(async move {
                 //待创建的指定名称的表不存在，则创建指定名称的表，并将表的元信息注册到元信息表
                 match meta.table_type {
@@ -2668,7 +2751,8 @@ impl<
                                                      load_buf_len as u64,
                                                      is_checksum,
                                                      16 * 1024 * 1024,
-                                                     60 * 1000).await;
+                                                     60 * 1000,
+                                                     notifier).await;
 
                             //注册创建的有序日志表
                             tables
@@ -2720,7 +2804,8 @@ impl<
                                                        cache_size,
                                                        enable_compact,
                                                        1024 * 1024,
-                                                       60 * 1000).await;
+                                                       60 * 1000,
+                                                       notifier).await;
 
                             //注册创建的有序日志表
                             tables
@@ -2826,7 +2911,8 @@ impl<
                                          2 * 1024 * 1024,
                                          true,
                                          16 * 1024 * 1024,
-                                         60 * 1000).await;
+                                         60 * 1000,
+                                         self.0.db_mgr.0.notifier.clone()).await;
 
                 //注册创建的有序日志表
                 tables.insert(name.clone(), KVDBTable::LogOrdTab(table));
@@ -2859,7 +2945,8 @@ impl<
                                                16 * 1024 * 1024,
                                                true,
                                                1024 * 1024,
-                                               60 * 1000).await {
+                                               60 * 1000,
+                                               self.0.db_mgr.0.notifier.clone()).await {
                     //尝试创建成功，则注册创建的有序日志表
                     tables.insert(name.clone(), KVDBTable::BtreeOrdTab(table));
                 }

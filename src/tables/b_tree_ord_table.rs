@@ -11,7 +11,7 @@ use pi_async_rt::{rt::{AsyncRuntime,
                        multi_thread::MultiTaskRuntime},
                   lock::spin_lock::SpinLock};
 use async_lock::{Mutex as AsyncMutex, RwLock as AsyncRwLock};
-use async_channel::{Sender, Receiver, bounded};
+use async_channel::{Sender, Receiver, bounded, unbounded};
 use pi_async_transaction::{AsyncCommitLog,
                            TransactionError,
                            Transaction2Pc,
@@ -37,10 +37,8 @@ use pi_ordmap::asbtree::Tree;
 use pi_ordmap::ordmap::{Entry, OrdMap};
 use pi_store::log_store::log_file::LogMethod;
 
-use crate::{Binary, KVAction, KVActionLog, KVDBCommitConfirm, KVTableTrError, TableTrQos, TransactionDebugEvent, transaction_debug_logger,
-            db::{KVDBChildTrList, KVDBTransaction},
-            tables::{KVTable,
-                     log_ord_table::{LogOrderedTable, LogOrdTabTr}}};
+use crate::{Binary, KVAction, KVActionLog, KVDBCommitConfirm, KVTableTrError, TableTrQos, TransactionDebugEvent, transaction_debug_logger, db::{KVDBChildTrList, KVDBTransaction}, tables::{KVTable,
+                                                                                                                                                                                            log_ord_table::{LogOrderedTable, LogOrdTabTr}}, utils::KVDBEvent, KVDBTableType};
 
 // 默认的表名
 const DEFAULT_TABLE_FILE_NAME: &str = "table.dat";
@@ -262,7 +260,8 @@ impl<
                                      cache_size: usize,
                                      enable_compact: bool,
                                      waits_limit: usize,
-                                     wait_timeout: usize) -> Self
+                                     wait_timeout: usize,
+                                     notifier: Option<Sender<KVDBEvent<Guid>>>) -> Self
     {
         Self::try_new(rt,
                       path,
@@ -270,7 +269,8 @@ impl<
                       cache_size,
                       enable_compact,
                       waits_limit,
-                      wait_timeout)
+                      wait_timeout,
+                      notifier)
             .await
             .unwrap()
     }
@@ -282,7 +282,8 @@ impl<
                                                 mut cache_size: usize,
                                                 enable_compact: bool,
                                                 waits_limit: usize,
-                                                wait_timeout: usize) -> Option<Self>
+                                                wait_timeout: usize,
+                                                notifier: Option<Sender<KVDBEvent<Guid>>>) -> Option<Self>
     {
         let now = Instant::now();
         let cache_size = if cache_size < MIN_CACHE_SIZE {
@@ -367,6 +368,7 @@ impl<
                     waits_limit,
                     wait_timeout,
                     collecting,
+                    notifier,
                 };
                 let table = BtreeOrderedTable(Arc::new(inner));
                 info!("Load b-tree ordered table succeeded, table: {:?}, keys: {:?}, cache_size: {:?}, enable_compact: {:?}, time: {:?}",
@@ -413,21 +415,21 @@ struct InnerBtreeOrderedTable<
     Log: AsyncCommitLog<C = C, Cid = Guid>,
 > {
     //表名
-    name:                   Atom,
+    name:           Atom,
     //有序B树表的实例的磁盘路径
-    path:                   PathBuf,
+    path:           PathBuf,
     //有序B树表的实例
-    inner:                  RwLock<Database>,
+    inner:          RwLock<Database>,
     //有序B树表的临时缓存，缓存有序B树表两次持久化之间写入的数据，并在有序B树表持久化后清除缓存的数据
-    cache:                  Mutex<OrdMap<Tree<Binary, Option<Binary>>>>,
+    cache:          Mutex<OrdMap<Tree<Binary, Option<Binary>>>>,
     //有序B树表的预提交表
-    prepare:                Mutex<XHashMap<Guid, XHashMap<Binary, KVActionLog>>>,
+    prepare:        Mutex<XHashMap<Guid, XHashMap<Binary, KVActionLog>>>,
     //异步运行时
-    rt:                     MultiTaskRuntime<()>,
+    rt:             MultiTaskRuntime<()>,
     //是否允许对有序B树表进行整理压缩
-    enable_compact:         AtomicBool,
+    enable_compact: AtomicBool,
     //等待异步写日志文件的已提交的有序日志事务列表
-    waits:                  AsyncMutex<VecDeque<(BtreeOrdTabTr<C, Log>, XHashMap<Binary, KVActionLog>, <BtreeOrdTabTr<C, Log> as Transaction2Pc>::CommitConfirm)>>,
+    waits:          AsyncMutex<VecDeque<(BtreeOrdTabTr<C, Log>, XHashMap<Binary, KVActionLog>, <BtreeOrdTabTr<C, Log> as Transaction2Pc>::CommitConfirm)>>,
     //等待异步写日志文件的已提交的有序日志事务的键值对大小
     waits_size:     AtomicUsize,
     //等待异步写日志文件的已提交的有序日志事务大小限制
@@ -436,6 +438,8 @@ struct InnerBtreeOrderedTable<
     wait_timeout:   usize,
     //是否正在整理等待异步写日志文件的已提交的有序日志事务列表
     collecting:     AtomicBool,
+    //表事件通知器
+    notifier:       Option<Sender<KVDBEvent<Guid>>>,
 }
 
 ///
@@ -2000,16 +2004,46 @@ async fn collect_waits<
     }
 
     //写入redb成功，则调用指定事务的确认提交回调，并继续写入下一个事务
-    for (wait_tr, confirm) in waits {
-        if let Err(e) = confirm(wait_tr.get_transaction_uid().unwrap(),
-                                wait_tr.get_commit_uid().unwrap(),
-                                Ok(())) {
-            error!("Commit b-tree ordered table failed, table: {:?}, source: {:?}, transaction_uid: {:?}, prepare_uid: {:?}, reason: {:?}",
+    if let Some(notifier) = table.0.notifier.as_ref() {
+        //指定了监听器
+        for (wait_tr, confirm) in waits {
+            if let Err(e) = confirm(wait_tr.get_transaction_uid().unwrap(),
+                                    wait_tr.get_commit_uid().unwrap(),
+                                    Ok(())) {
+                notifier.send(KVDBEvent::CommitFailed(wait_tr.get_source(),
+                                                      wait_tr.0.table.name(),
+                                                      KVDBTableType::BtreeOrdTab,
+                                                      wait_tr.get_transaction_uid().unwrap(),
+                                                      wait_tr.get_commit_uid().unwrap()))
+                    .await;
+                error!("Commit b-tree ordered table failed, table: {:?}, source: {:?}, transaction_uid: {:?}, prepare_uid: {:?}, reason: {:?}",
                 wait_tr.0.table.name().as_str(),
                 wait_tr.0.source,
                 wait_tr.get_transaction_uid(),
                 wait_tr.get_prepare_uid(),
                 e);
+            } else {
+                notifier.send(KVDBEvent::ConfirmCommited(wait_tr.get_source(),
+                                                         wait_tr.0.table.name(),
+                                                         KVDBTableType::BtreeOrdTab,
+                                                         wait_tr.get_transaction_uid().unwrap(),
+                                                         wait_tr.get_commit_uid().unwrap()))
+                    .await;
+            }
+        }
+    } else {
+        //未指定监听器
+        for (wait_tr, confirm) in waits {
+            if let Err(e) = confirm(wait_tr.get_transaction_uid().unwrap(),
+                                    wait_tr.get_commit_uid().unwrap(),
+                                    Ok(())) {
+                error!("Commit b-tree ordered table failed, table: {:?}, source: {:?}, transaction_uid: {:?}, prepare_uid: {:?}, reason: {:?}",
+                wait_tr.0.table.name().as_str(),
+                wait_tr.0.source,
+                wait_tr.get_transaction_uid(),
+                wait_tr.get_prepare_uid(),
+                e);
+            }
         }
     }
     table.0.collecting.store(false, Ordering::Release); //设置为已整理结束
