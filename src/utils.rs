@@ -20,6 +20,7 @@ pub enum CreateTableOptions {
 ///
 #[derive(Debug, Clone)]
 pub enum KVDBEvent<Cid: Debug + Clone + Send + PartialEq + Eq + 'static> {
+    Statistics(bool),                                       //统计
     CommitFailed(Atom, Atom, KVDBTableType, Cid, Cid),      //提交已失败
     ConfirmCommited(Atom, Atom, KVDBTableType, Cid, Cid),   //确认已提交
 }
