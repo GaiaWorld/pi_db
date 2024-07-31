@@ -1621,6 +1621,11 @@ fn bench_b_tree_table(b: &mut Bencher) {
             tr_mgr: &Transaction2PcManager<usize, CommitLogger>,
             events: &mut Vec<KVDBEvent<Guid>>,
         | {
+            if events.len() == 1 {
+                if events[0].is_report_transaction_info() {
+                    println!("!!!!!!> start total: {:?}, end total: {:?}, active: {:?}", tr_mgr.produced_transaction_total(), tr_mgr.consumed_transaction_total(), tr_mgr.transaction_len());
+                }
+            }
             count += events.len();
             events.clear();
             println!("!!!!!!> count: {:?}, start total: {:?}, end total: {:?}, active: {:?}", count, tr_mgr.produced_transaction_total(), tr_mgr.consumed_transaction_total(), tr_mgr.transaction_len());
@@ -1768,6 +1773,12 @@ fn bench_b_tree_table(b: &mut Bencher) {
         }
         println!("======> assert cache after clean ok");
     });
+
+    rt.spawn(async move {
+        db_copy.report_transaction_info().await;
+    });
+
+    thread::sleep(Duration::from_millis(1000));
 }
 
 #[bench]

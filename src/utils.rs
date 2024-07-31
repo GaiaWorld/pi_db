@@ -20,9 +20,38 @@ pub enum CreateTableOptions {
 ///
 #[derive(Debug, Clone)]
 pub enum KVDBEvent<Cid: Debug + Clone + Send + PartialEq + Eq + 'static> {
-    Statistics(bool),                                       //统计
+    ReportTrInfo,                                           //报告事务信息
     CommitFailed(Atom, Atom, KVDBTableType, Cid, Cid),      //提交已失败
     ConfirmCommited(Atom, Atom, KVDBTableType, Cid, Cid),   //确认已提交
+}
+
+impl<Cid: Debug + Clone + Send + PartialEq + Eq + 'static> KVDBEvent<Cid> {
+    /// 判断是否是报告事务信息事件
+    pub fn is_report_transaction_info(&self) -> bool {
+        if let Self::ReportTrInfo = self {
+            true
+        } else {
+            false
+        }
+    }
+
+    /// 判断是否是提交已失败事件
+    pub fn is_commit_failed(&self) -> bool {
+        if let Self::CommitFailed(_, _, _, _, _) = self {
+            true
+        } else {
+            false
+        }
+    }
+
+    /// 判断是否是确认已提交事件
+    pub fn is_confirm_commited(&self) -> bool {
+        if let Self::ConfirmCommited(_, _, _, _, _) = self {
+            true
+        } else {
+            false
+        }
+    }
 }
 
 // 自旋
