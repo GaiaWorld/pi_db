@@ -218,7 +218,8 @@ impl<
                            2 * 1024 * 1024,
                            true,
                            16 * 1024 * 1024,
-                           60 * 1000).await;
+                           60 * 1000,
+                           db_mgr.0.notifier.clone()).await;
         db_mgr.0.tables.write().await.insert(meta_table_name.clone(), KVDBTable::MetaTab(meta_table));
 
         //根据元信息表的元信息，加载其它表，加载操作使用的事务，不需要预提交和提交
@@ -277,7 +278,7 @@ impl<
             let mut table_metas = Vec::with_capacity(table_metas_buf.len());
             swap(&mut table_metas_buf, &mut table_metas);
 
-            //异步批量创建表
+            //异步批量加载表
             if let Err(e) = tr.create_multiple_tables(table_metas, true).await {
                 //加载指定的表失败，则立即返回错误原因
                 db_mgr.0.status.store(DB_UNSTARTUP_STATUS, Ordering::SeqCst);
@@ -288,7 +289,7 @@ impl<
             }
         }
         if table_metas_buf.len() > 0 {
-            //异步批量创建剩余的表
+            //异步批量加载剩余的表
             if let Err(e) = tr.create_multiple_tables(table_metas_buf, true).await {
                 //加载指定的表失败，则立即返回错误原因
                 db_mgr.0.status.store(DB_UNSTARTUP_STATUS, Ordering::SeqCst);

@@ -2020,11 +2020,11 @@ async fn collect_waits<
                                                       wait_tr.get_commit_uid().unwrap()))
                     .await;
                 error!("Commit b-tree ordered table failed, table: {:?}, source: {:?}, transaction_uid: {:?}, prepare_uid: {:?}, reason: {:?}",
-                wait_tr.0.table.name().as_str(),
-                wait_tr.0.source,
-                wait_tr.get_transaction_uid(),
-                wait_tr.get_prepare_uid(),
-                e);
+                    wait_tr.0.table.name().as_str(),
+                    wait_tr.0.source,
+                    wait_tr.get_transaction_uid(),
+                    wait_tr.get_prepare_uid(),
+                    e);
             } else {
                 notifier.send(KVDBEvent::ConfirmCommited(wait_tr.get_source(),
                                                          wait_tr.0.table.name(),
@@ -2041,11 +2041,11 @@ async fn collect_waits<
                                     wait_tr.get_commit_uid().unwrap(),
                                     Ok(())) {
                 error!("Commit b-tree ordered table failed, table: {:?}, source: {:?}, transaction_uid: {:?}, prepare_uid: {:?}, reason: {:?}",
-                wait_tr.0.table.name().as_str(),
-                wait_tr.0.source,
-                wait_tr.get_transaction_uid(),
-                wait_tr.get_prepare_uid(),
-                e);
+                    wait_tr.0.table.name().as_str(),
+                    wait_tr.0.source,
+                    wait_tr.get_transaction_uid(),
+                    wait_tr.get_prepare_uid(),
+                    e);
             }
         }
     }

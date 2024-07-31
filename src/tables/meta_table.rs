@@ -1,22 +1,24 @@
 use std::mem;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-use std::sync::{Arc, atomic::{AtomicBool, AtomicUsize, Ordering}};
-use std::collections::hash_map::Entry as HashMapEntry;
+use std::collections::{VecDeque, hash_map::Entry as HashMapEntry};
+use std::sync::{Arc,
+                atomic::{AtomicBool, AtomicUsize, Ordering}};
 
 use parking_lot::Mutex;
-use futures::{future::{FutureExt, BoxFuture}, stream::{StreamExt, BoxStream}};
+use futures::{future::{FutureExt, BoxFuture},
+              stream::{StreamExt, BoxStream}};
 use async_lock::Mutex as AsyncMutex;
+use async_channel::Sender;
 use async_stream::stream;
 use log::{debug, info, error};
-
+use pi_async_rt::{lock::spin_lock::SpinLock,
+                  rt::{AsyncRuntime,
+                       multi_thread::MultiTaskRuntime}};
 use pi_atom::Atom;
 use pi_guid::Guid;
 use pi_hash::XHashMap;
 use pi_ordmap::{ordmap::{Iter, OrdMap, Keys, Entry}, asbtree::Tree};
-use pi_async_rt::{lock::spin_lock::SpinLock,
-                  rt::{AsyncRuntime,
-                       multi_thread::MultiTaskRuntime}};
 use pi_async_transaction::{AsyncTransaction,
                            Transaction2Pc,
                            UnitTransaction,
@@ -30,15 +32,11 @@ use pi_store::log_store::log_file::{PairLoader,
                                     LogMethod,
                                     LogFile};
 
-use crate::{Binary,
-            KVAction,
-            TableTrQos,
-            KVActionLog,
-            KVDBCommitConfirm,
-            KVTableTrError,
+use crate::{Binary, KVAction, TableTrQos, KVActionLog, KVDBCommitConfirm, KVTableTrError,
             db::{KVDBTransaction, KVDBChildTrList},
-            tables::KVTable};
-use std::collections::VecDeque;
+            tables::KVTable,
+            utils::KVDBEvent,
+            KVDBTableType};
 
 ///
 /// 默认的日志文件延迟提交的超时时长，单位ms
@@ -114,11 +112,15 @@ impl<
             match table.0.log_file.split().await {
                 Err(e) => {
                     //强制创建新的元信息表可写日志文件失败，则立即返回元信息表准备整理错误
-                    return Err(KVTableTrError::new_transaction_error(ErrorLevel::Normal, format!("Ready collect meta table failed, path: {:?}, table: {:?}, reason: {:?}", table.0.log_file.path(), table.0.name.as_str(), e)));
+                    return Err(KVTableTrError::new_transaction_error(ErrorLevel::Normal,
+                                                                     format!("Ready collect meta table failed, path: {:?}, table: {:?}, reason: {:?}",
+                                                                             table.0.log_file.path(),
+                                                                             table.0.name.as_str(),
+                                                                             e)));
                 },
                 Ok(writed_log_index) => {
                     //强制创建新的元信息表可写日志文件成功
-                    info!("Ready collect meta table ok, time: {:?}, path: {:?}, table: {:?}, writed_log_index: {}",
+                    info!("Ready collect meta table succeeded, time: {:?}, path: {:?}, table: {:?}, writed_log_index: {}",
                         now.elapsed(),
                         table.0.log_file.path(),
                         table.0.name.as_str(),
@@ -139,11 +141,15 @@ impl<
                                            false).await {
                 Err(e) => {
                     //整理元信息表的只读日志文件失败，则立即返回元信息表整理错误
-                    return Err(KVTableTrError::new_transaction_error(ErrorLevel::Normal, format!("Collect meta table failed, path: {:?}, table: {:?}, reason: {:?}", table.0.log_file.path(), table.0.name.as_str(), e)));
+                    return Err(KVTableTrError::new_transaction_error(ErrorLevel::Normal,
+                                                                     format!("Collect meta table failed, path: {:?}, table: {:?}, reason: {:?}",
+                                                                        table.0.log_file.path(),
+                                                                        table.0.name.as_str(),
+                                                                        e)));
                 },
                 Ok((size, len)) => {
                     //整理元信息表的只读日志文件成功
-                    info!("Collect meta table ok, time: {:?}, path: {:?}, table: {:?}, file_size: {}, file_len: {}",
+                    info!("Collect meta table succeeded, time: {:?}, path: {:?}, table: {:?}, file_size: {}, file_len: {}",
                         now.elapsed(),
                         table.0.log_file.path(),
                         table.0.name.as_str(),
@@ -170,7 +176,8 @@ impl<
                                      load_buf_len: u64,
                                      is_checksum: bool,
                                      waits_limit: usize,
-                                     wait_timeout: usize) -> Self {
+                                     wait_timeout: usize,
+                                     notifier: Option<Sender<KVDBEvent<Guid>>>) -> Self {
         let root = Mutex::new(OrdMap::new(None));
         let prepare = Mutex::new(XHashMap::default());
 
@@ -203,6 +210,7 @@ impl<
                     wait_timeout,
                     collecting,
                     log_file,
+                    notifier,
                 };
 
                 let table = MetaTable(Arc::new(inner));
@@ -220,7 +228,7 @@ impl<
                            path.as_ref(),
                            e);
                 }
-                info!("Load meta table ok, table: {:?}, path: {:?}, files: {}, keys: {}, bytes: {}, time: {:?}",
+                info!("Load meta table succeeded, table: {:?}, path: {:?}, files: {}, keys: {}, bytes: {}, time: {:?}",
                     name.as_str(),
                     path.as_ref(),
                     loader.log_files_len(),
@@ -242,7 +250,7 @@ impl<
                                     statistics);
                             },
                             Ok((collect_time, statistics)) => {
-                                debug!("Collect meta table ok, table: {:?}, time: {:?}, statistics: {:?}, reason: out of time",
+                                debug!("Collect meta table succeeded, table: {:?}, time: {:?}, statistics: {:?}, reason: out of time",
                                     table_copy.name().as_str(),
                                     collect_time,
                                     statistics);
@@ -262,16 +270,28 @@ struct InnerMetaTable<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>,
 > {
-    name:           Atom,                                                                                                   //表名
-    root:           Mutex<OrdMap<Tree<Binary, Binary>>>,                                                                    //元信息表的根节点
-    prepare:        Mutex<XHashMap<Guid, XHashMap<Binary, KVActionLog>>>,                                                   //元信息表的预提交表
-    rt:             MultiTaskRuntime<()>,                                                                                   //异步运行时
-    waits:          AsyncMutex<VecDeque<(MetaTabTr<C, Log>, XHashMap<Binary, KVActionLog>, <MetaTabTr<C, Log> as Transaction2Pc>::CommitConfirm)>>,                                                                                                                        //等待异步写日志文件的已提交的元信息事务列表
-    waits_size:     AtomicUsize,                                                                                            //等待异步写日志文件的已提交的有序日志事务的键值对大小
-    waits_limit:    usize,                                                                                                  //等待异步写日志文件的已提交的元信息事务大小限制
-    wait_timeout:   usize,                                                                                                  //等待异步写日志文件的超时时长，单位毫秒
-    collecting:     AtomicBool,                                                                                             //是否正在整理等待异步写日志文件的已提交的元信息事务列表
-    log_file:       LogFile,                                                                                                //日志文件
+    //表名
+    name:           Atom,
+    //元信息表的根节点
+    root:           Mutex<OrdMap<Tree<Binary, Binary>>>,
+    //元信息表的预提交表
+    prepare:        Mutex<XHashMap<Guid, XHashMap<Binary, KVActionLog>>>,
+    //异步运行时
+    rt:             MultiTaskRuntime<()>,
+    //等待异步写日志文件的已提交的元信息事务列表
+    waits:          AsyncMutex<VecDeque<(MetaTabTr<C, Log>, XHashMap<Binary, KVActionLog>, <MetaTabTr<C, Log> as Transaction2Pc>::CommitConfirm)>>,
+    //等待异步写日志文件的已提交的有序日志事务的键值对大小
+    waits_size:     AtomicUsize,
+    //等待异步写日志文件的已提交的元信息事务大小限制
+    waits_limit:    usize,
+    //等待异步写日志文件的超时时长，单位毫秒
+    wait_timeout:   usize,
+    //是否正在整理等待异步写日志文件的已提交的元信息事务列表
+    collecting:     AtomicBool,
+    //日志文件
+    log_file:       LogFile,
+    //表事件通知器
+    notifier:       Option<Sender<KVDBEvent<Guid>>>,
 }
 
 unsafe impl<
@@ -500,6 +520,7 @@ impl<
             //移除事务在元信息表的预提交表中的操作记录
             let transaction_uid = tr.get_transaction_uid().unwrap();
 
+            //从元信息表的预提交表中移除当前事务的操作记录
             let actions = {
                 let mut table_prepare = tr
                     .0
@@ -564,7 +585,7 @@ impl<
                     let last_waits_size = table_copy.0.waits_size.fetch_add(size, Ordering::SeqCst); //更新待确认的已提交事务的大小计数
                     if last_waits_size + size >= table_copy.0.waits_limit {
                         //如果当前已注册的待确认的已提交事务大小已达限制，则立即整理
-                        table_copy.0.waits_size.store(0, Ordering::SeqCst); //重置待确认的已提交事务的大小计数
+                        table_copy.0.waits_size.store(0, Ordering::Relaxed); //重置待确认的已提交事务的大小计数
 
                         match collect_waits(&table_copy,
                                             None).await {
@@ -575,7 +596,7 @@ impl<
                                     statistics);
                             },
                             Ok((collect_time, statistics)) => {
-                                debug!("Collect meta table ok, table: {:?}, time: {:?}, statistics: {:?}, reason: out of size",
+                                info!("Collect meta table succeeded, table: {:?}, time: {:?}, statistics: {:?}, reason: out of size",
                                     table_copy.name().as_str(),
                                     collect_time,
                                     statistics);
@@ -874,7 +895,14 @@ impl<
                         },
                         KVActionLog::Write(_) => {
                             //本地预提交事务对相同的关键字执行了写操作，则存在读写冲突
-                            return Err(<Self as Transaction2Pc>::PrepareError::new_transaction_error(ErrorLevel::Normal, format!("Prepare meta table conflicted, table: {:?}, key: {:?}, source: {:?}, transaction_uid: {:?}, prepare_uid: {:?}, confilicted_transaction_uid: {:?}, reason: require write key but reading now", self.0.table.name().as_str(), key, self.0.source, self.get_transaction_uid(), self.get_prepare_uid(), guid)));
+                            return Err(<Self as Transaction2Pc>::PrepareError::new_transaction_error(ErrorLevel::Normal,
+                                                                                                     format!("Prepare meta table conflicted, table: {:?}, key: {:?}, source: {:?}, transaction_uid: {:?}, prepare_uid: {:?}, confilicted_transaction_uid: {:?}, reason: require write key but reading now",
+                                                                                                             self.0.table.name().as_str(),
+                                                                                                             key,
+                                                                                                             self.0.source,
+                                                                                                             self.get_transaction_uid(),
+                                                                                                             self.get_prepare_uid(),
+                                                                                                             guid)));
                         },
                     }
                 },
@@ -890,7 +918,14 @@ impl<
                         },
                         _ => {
                             //元信息表的预提交表中的一个预提交事务与本地预提交事务操作了相同的关键字，且是写操作，则存在读写冲突
-                            return Err(<Self as Transaction2Pc>::PrepareError::new_transaction_error(ErrorLevel::Normal, format!("Prepare meta table conflicted, table: {:?}, key: {:?}, source: {:?}, transaction_uid: {:?}, prepare_uid: {:?}, confilicted_transaction_uid: {:?}, reason: writing now", self.0.table.name().as_str(), key, self.0.source, self.get_transaction_uid(), self.get_prepare_uid(), guid)));
+                            return Err(<Self as Transaction2Pc>::PrepareError::new_transaction_error(ErrorLevel::Normal,
+                                                                                                     format!("Prepare meta table conflicted, table: {:?}, key: {:?}, source: {:?}, transaction_uid: {:?}, prepare_uid: {:?}, confilicted_transaction_uid: {:?}, reason: writing now",
+                                                                                                             self.0.table.name().as_str(),
+                                                                                                             key,
+                                                                                                             self.0.source,
+                                                                                                             self.get_transaction_uid(),
+                                                                                                             self.get_prepare_uid(),
+                                                                                                             guid)));
                         },
                     }
                 },
@@ -924,7 +959,13 @@ impl<
                             //事务的当前操作记录中的关键字，在事务创建时的表中已存在
                             //表示此关键字在当前事务执行过程中被删除，则此关键字的操作记录不允许预提交
                             //并立即返回当前事务预提交冲突
-                            return Err(<Self as Transaction2Pc>::PrepareError::new_transaction_error(ErrorLevel::Normal, format!("Prepare meta table conflicted, table: {:?}, key: {:?}, source: {:?}, transaction_uid: {:?}, prepare_uid: {:?}, reason: the key is deleted in table while the transaction is running", self.0.table.name().as_str(), key, self.0.source, self.get_transaction_uid(), self.get_prepare_uid())));
+                            return Err(<Self as Transaction2Pc>::PrepareError::new_transaction_error(ErrorLevel::Normal,
+                                                                                                     format!("Prepare meta table conflicted, table: {:?}, key: {:?}, source: {:?}, transaction_uid: {:?}, prepare_uid: {:?}, reason: the key is deleted in table while the transaction is running",
+                                                                                                             self.0.table.name().as_str(),
+                                                                                                             key,
+                                                                                                             self.0.source,
+                                                                                                             self.get_transaction_uid(),
+                                                                                                             self.get_prepare_uid())));
                         },
                     }
                 },
@@ -941,7 +982,13 @@ impl<
                             //事务的当前操作记录中的关键字，与事务创建时的表中的关键字不匹配
                             //表示此关键字在当前事务执行过程中未改变，但值已改变，则此关键字的操作记录不允许预提交
                             //并立即返回当前事务预提交冲突
-                            return Err(<Self as Transaction2Pc>::PrepareError::new_transaction_error(ErrorLevel::Normal, format!("Prepare meta table conflicted, table: {:?}, key: {:?}, source: {:?}, transaction_uid: {:?}, prepare_uid: {:?}, reason: the value is updated in table while the transaction is running", self.0.table.name().as_str(), key, self.0.source, self.get_transaction_uid(), self.get_prepare_uid())));
+                            return Err(<Self as Transaction2Pc>::PrepareError::new_transaction_error(ErrorLevel::Normal,
+                                                                                                     format!("Prepare meta table conflicted, table: {:?}, key: {:?}, source: {:?}, transaction_uid: {:?}, prepare_uid: {:?}, reason: the value is updated in table while the transaction is running",
+                                                                                                             self.0.table.name().as_str(),
+                                                                                                             key,
+                                                                                                             self.0.source,
+                                                                                                             self.get_transaction_uid(),
+                                                                                                             self.get_prepare_uid())));
                         },
                     }
                 },
@@ -1010,7 +1057,7 @@ struct MetaTableLoader<
 > {
     statistics:         XHashMap<PathBuf, (u64, u64)>,  //加载统计信息，包括关键字数量和键值对的字节数
     removed:            XHashMap<Vec<u8>, ()>,          //已删除关键字表
-    table:              MetaTable<C, Log>,        //元信息表
+    table:              MetaTable<C, Log>,              //元信息表
 }
 
 impl<
@@ -1198,16 +1245,47 @@ async fn collect_waits<
     }
 
     //写入日志文件成功，则调用指定事务的确认提交回调，并继续写入下一个事务
-    for (wait_tr, confirm) in waits {
-        if let Err(e) = confirm(wait_tr.get_transaction_uid().unwrap(),
-                                wait_tr.get_commit_uid().unwrap(),
-                                Ok(())) {
-            error!("Collect meta table failed, table: {:?}, transactions: {}, keys: {}, bytes: {}, reason: {:?}",
+    if let Some(notifier) = table.0.notifier.as_ref() {
+        //指定了监听器
+        for (wait_tr, confirm) in waits {
+            println!("!!!!!!meta table notifier");
+            if let Err(e) = confirm(wait_tr.get_transaction_uid().unwrap(),
+                                    wait_tr.get_commit_uid().unwrap(),
+                                    Ok(())) {
+                notifier.send(KVDBEvent::CommitFailed(wait_tr.get_source(),
+                                                      wait_tr.0.table.name(),
+                                                      KVDBTableType::BtreeOrdTab,
+                                                      wait_tr.get_transaction_uid().unwrap(),
+                                                      wait_tr.get_commit_uid().unwrap()))
+                    .await;
+                error!("Collect meta table failed, table: {:?}, transactions: {}, keys: {}, bytes: {}, reason: {:?}",
                     table.name().as_str(),
                     trs_len,
                     keys_len,
                     bytes_len,
                     e);
+            } else {
+                notifier.send(KVDBEvent::ConfirmCommited(wait_tr.get_source(),
+                                                         wait_tr.0.table.name(),
+                                                         KVDBTableType::BtreeOrdTab,
+                                                         wait_tr.get_transaction_uid().unwrap(),
+                                                         wait_tr.get_commit_uid().unwrap()))
+                    .await;
+            }
+        }
+    } else {
+        //未指定监听器
+        for (wait_tr, confirm) in waits {
+            if let Err(e) = confirm(wait_tr.get_transaction_uid().unwrap(),
+                                    wait_tr.get_commit_uid().unwrap(),
+                                    Ok(())) {
+                error!("Collect meta table failed, table: {:?}, transactions: {}, keys: {}, bytes: {}, reason: {:?}",
+                    table.name().as_str(),
+                    trs_len,
+                    keys_len,
+                    bytes_len,
+                    e);
+            }
         }
     }
     table.0.collecting.store(false, Ordering::Release); //设置为已整理结束

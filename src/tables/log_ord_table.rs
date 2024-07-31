@@ -10,16 +10,16 @@ use parking_lot::Mutex;
 use futures::{future::{FutureExt, BoxFuture},
               stream::{StreamExt, BoxStream}};
 use async_lock::Mutex as AsyncMutex;
-use async_channel::{Sender, Receiver, unbounded};
+use async_channel::Sender;
 use async_stream::stream;
 use log::{debug, info, error};
-
+use pi_async_rt::{lock::spin_lock::SpinLock,
+                  rt::{AsyncRuntime,
+                       multi_thread::MultiTaskRuntime}};
 use pi_atom::Atom;
 use pi_guid::Guid;
 use pi_hash::XHashMap;
 use pi_ordmap::{ordmap::{Iter, OrdMap, Keys, Entry}, asbtree::Tree};
-use pi_async_rt::{lock::spin_lock::SpinLock,
-                  rt::{AsyncRuntime, multi_thread::MultiTaskRuntime}};
 use pi_async_transaction::{AsyncTransaction,
                            Transaction2Pc,
                            UnitTransaction,
@@ -33,7 +33,11 @@ use pi_store::log_store::log_file::{PairLoader,
                                     LogMethod,
                                     LogFile};
 
-use crate::{Binary, KVAction, TableTrQos, KVActionLog, KVDBCommitConfirm, KVTableTrError, TransactionDebugEvent, transaction_debug_logger, db::{KVDBTransaction, KVDBChildTrList}, tables::KVTable, utils::KVDBEvent, KVDBTableType};
+use crate::{Binary, KVAction, TableTrQos, KVActionLog, KVDBCommitConfirm, KVTableTrError, TransactionDebugEvent, transaction_debug_logger,
+            db::{KVDBTransaction, KVDBChildTrList},
+            tables::KVTable,
+            utils::KVDBEvent,
+            KVDBTableType};
 
 ///
 /// 默认的日志文件延迟提交的超时时长，单位ms
@@ -109,7 +113,11 @@ impl<
             match table.0.log_file.split().await {
                 Err(e) => {
                     //强制创建新的有序日志表可写日志文件失败，则立即返回有序日志表准备整理错误
-                    return Err(KVTableTrError::new_transaction_error(ErrorLevel::Normal, format!("Ready collect log ordered table failed, path: {:?}, table: {:?}, reason: {:?}", table.0.log_file.path(), table.0.name.as_str(), e)));
+                    return Err(KVTableTrError::new_transaction_error(ErrorLevel::Normal,
+                                                                     format!("Ready collect log ordered table failed, path: {:?}, table: {:?}, reason: {:?}",
+                                                                             table.0.log_file.path(),
+                                                                             table.0.name.as_str(),
+                                                                             e)));
                 },
                 Ok(writed_log_index) => {
                     //强制创建新的有序日志表可写日志文件成功
@@ -134,7 +142,11 @@ impl<
                                            false).await {
                 Err(e) => {
                     //整理有序日志表的只读日志文件失败，则立即返回有序日志表整理错误
-                    return Err(KVTableTrError::new_transaction_error(ErrorLevel::Normal, format!("Compact log ordered table failed, path: {:?}, table: {:?}, reason: {:?}", table.0.log_file.path(), table.0.name.as_str(), e)));
+                    return Err(KVTableTrError::new_transaction_error(ErrorLevel::Normal,
+                                                                     format!("Compact log ordered table failed, path: {:?}, table: {:?}, reason: {:?}",
+                                                                             table.0.log_file.path(),
+                                                                             table.0.name.as_str(),
+                                                                             e)));
                 },
                 Ok((size, len)) => {
                     //整理有序日志表的只读日志文件成功
@@ -917,7 +929,14 @@ impl<
                         },
                         KVActionLog::Write(_) => {
                             //本地预提交事务对相同的关键字执行了写操作，则存在读写冲突
-                            return Err(<Self as Transaction2Pc>::PrepareError::new_transaction_error(ErrorLevel::Normal, format!("Prepare log ordered table conflicted, table: {:?}, key: {:?}, source: {:?}, transaction_uid: {:?}, prepare_uid: {:?}, confilicted_transaction_uid: {:?}, reason: require write key but reading now", self.0.table.name().as_str(), key, self.0.source, self.get_transaction_uid(), self.get_prepare_uid(), guid)));
+                            return Err(<Self as Transaction2Pc>::PrepareError::new_transaction_error(ErrorLevel::Normal,
+                                                                                                     format!("Prepare log ordered table conflicted, table: {:?}, key: {:?}, source: {:?}, transaction_uid: {:?}, prepare_uid: {:?}, confilicted_transaction_uid: {:?}, reason: require write key but reading now",
+                                                                                                             self.0.table.name().as_str(),
+                                                                                                             key,
+                                                                                                             self.0.source,
+                                                                                                             self.get_transaction_uid(),
+                                                                                                             self.get_prepare_uid(),
+                                                                                                             guid)));
                         },
                     }
                 },
@@ -933,7 +952,14 @@ impl<
                         },
                         _ => {
                             //有序日志表的预提交表中的一个预提交事务与本地预提交事务操作了相同的关键字，且是写操作，则存在读写冲突
-                            return Err(<Self as Transaction2Pc>::PrepareError::new_transaction_error(ErrorLevel::Normal, format!("Prepare log ordered table conflicted, table: {:?}, key: {:?}, source: {:?}, transaction_uid: {:?}, prepare_uid: {:?}, confilicted_transaction_uid: {:?}, reason: writing now", self.0.table.name().as_str(), key, self.0.source, self.get_transaction_uid(), self.get_prepare_uid(), guid)));
+                            return Err(<Self as Transaction2Pc>::PrepareError::new_transaction_error(ErrorLevel::Normal,
+                                                                                                     format!("Prepare log ordered table conflicted, table: {:?}, key: {:?}, source: {:?}, transaction_uid: {:?}, prepare_uid: {:?}, confilicted_transaction_uid: {:?}, reason: writing now",
+                                                                                                             self.0.table.name().as_str(),
+                                                                                                             key,
+                                                                                                             self.0.source,
+                                                                                                             self.get_transaction_uid(),
+                                                                                                             self.get_prepare_uid(),
+                                                                                                             guid)));
                         },
                     }
                 },
@@ -967,7 +993,13 @@ impl<
                             //事务的当前操作记录中的关键字，在事务创建时的表中已存在
                             //表示此关键字在当前事务执行过程中被删除，则此关键字的操作记录不允许预提交
                             //并立即返回当前事务预提交冲突
-                            return Err(<Self as Transaction2Pc>::PrepareError::new_transaction_error(ErrorLevel::Normal, format!("Prepare log ordered table conflicted, table: {:?}, key: {:?}, source: {:?}, transaction_uid: {:?}, prepare_uid: {:?}, reason: the key is deleted in table while the transaction is running", self.0.table.name().as_str(), key, self.0.source, self.get_transaction_uid(), self.get_prepare_uid())));
+                            return Err(<Self as Transaction2Pc>::PrepareError::new_transaction_error(ErrorLevel::Normal,
+                                                                                                     format!("Prepare log ordered table conflicted, table: {:?}, key: {:?}, source: {:?}, transaction_uid: {:?}, prepare_uid: {:?}, reason: the key is deleted in table while the transaction is running",
+                                                                                                             self.0.table.name().as_str(),
+                                                                                                             key,
+                                                                                                             self.0.source,
+                                                                                                             self.get_transaction_uid(),
+                                                                                                             self.get_prepare_uid())));
                         },
                     }
                 },
@@ -984,7 +1016,13 @@ impl<
                             //事务的当前操作记录中的关键字，与事务创建时的表中的关键字不匹配
                             //表示此关键字在当前事务执行过程中未改变，但值已改变，则此关键字的操作记录不允许预提交
                             //并立即返回当前事务预提交冲突
-                            return Err(<Self as Transaction2Pc>::PrepareError::new_transaction_error(ErrorLevel::Normal, format!("Prepare log ordered table conflicted, table: {:?}, key: {:?}, source: {:?}, transaction_uid: {:?}, prepare_uid: {:?}, reason: the value is updated in table while the transaction is running", self.0.table.name().as_str(), key, self.0.source, self.get_transaction_uid(), self.get_prepare_uid())));
+                            return Err(<Self as Transaction2Pc>::PrepareError::new_transaction_error(ErrorLevel::Normal,
+                                                                                                     format!("Prepare log ordered table conflicted, table: {:?}, key: {:?}, source: {:?}, transaction_uid: {:?}, prepare_uid: {:?}, reason: the value is updated in table while the transaction is running",
+                                                                                                             self.0.table.name().as_str(),
+                                                                                                             key,
+                                                                                                             self.0.source,
+                                                                                                             self.get_transaction_uid(),
+                                                                                                             self.get_prepare_uid())));
                         },
                     }
                 },

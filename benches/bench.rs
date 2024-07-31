@@ -1473,11 +1473,10 @@ fn bench_log_table_commit_log_error(b: &mut Bencher) {
                                      500)
                         .unwrap();
 
-                    let _ = tr.upsert(vec![TableKV {
-                        table: table_name_copy,
-                        key: usize_to_binary(index),
-                        value: Some(Binary::new("Hello World!".as_bytes().to_vec()))
-                    }]).await;
+                    let table_name = Atom::from(("test_log/".to_string() + index.to_string().as_str()).as_str());
+                    let _ = tr.create_table(table_name.clone(),
+                                            KVTableMeta::new(KVDBTableType::LogOrdTab, true, EnumType::Str, EnumType::Str))
+                        .await;
 
                     loop {
                         match tr.prepare_modified().await {
@@ -1645,7 +1644,9 @@ fn bench_b_tree_table(b: &mut Bencher) {
                     println!("!!!!!!create b-tree ordered table failed, reason: {:?}", e);
                 }
                 let output = tr.prepare_modified().await.unwrap();
-                let _ = tr.commit_modified(output).await;
+                if let Err(e) = tr.commit_modified(output).await {
+                    panic!("init db table failed, reason: {:?}", e);
+                }
                 println!("!!!!!!db table size: {:?}", db.table_size().await);
 
                 sender.send(db);
