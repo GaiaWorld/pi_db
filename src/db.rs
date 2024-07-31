@@ -719,6 +719,23 @@ impl<
         Ok(())
     }
 
+    ///
+    /// 异步请求数据库的事务信息报告
+    ///
+    pub async fn report_transaction_info(&self) -> IOResult<()> {
+        if let Some(notifier) = self.0.notifier.as_ref() {
+            if let Err(e) = notifier.send(KVDBEvent::ReportTrInfo).await {
+                Err(Error::new(ErrorKind::ConnectionAborted,
+                               format!("Report transaction info failed, reason: {:?}", e)))
+            } else {
+                Ok(())
+            }
+        } else {
+            Err(Error::new(ErrorKind::ConnectionAborted,
+                           format!("Report transaction info failed, reason: invalid notifier")))
+        }
+    }
+
     // 尝试幂等的重播未确认的提交日志，并修复数据库表数据
     // 注意如果在只有单个线程的运行时修复或并发修复，则可能会发生阻塞
     pub(crate) async fn try_repair(&self) -> IOResult<(usize, usize)> {
