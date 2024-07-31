@@ -138,20 +138,23 @@ impl<
     }
 
     fn len(&self) -> usize {
-        let cache_len = self.0.cache.lock().size();
         if let Ok(tr) = self.0.inner.read().begin_read() {
             if let Ok(table) = tr.open_table(DEFAULT_TABLE_NAME) {
-                let table_len = table.len().unwrap_or(0) as usize;
-                if table_len < cache_len {
-                    cache_len
-                } else {
-                    table_len
+                let mut table_len = table.len().unwrap_or(0) as usize;
+                let keys = self.0.cache.lock().keys(None, false);
+                for key in keys {
+                    if let Ok(None) = table.get(key) {
+                        //记录只在缓存中的关键字
+                        table_len += 1;
+                    }
                 }
+
+                table_len
             } else {
-                cache_len
+                0
             }
         } else {
-            cache_len
+            0
         }
     }
 

@@ -1752,7 +1752,7 @@ fn bench_b_tree_table(b: &mut Bencher) {
                 panic!("assert failed, index: {:?}", index);
             }
         }
-        println!("======> assert cache before clean ok");
+        println!("======> assert cache before clean ok, len: {:?}", db_clone.table_record_size(&Atom::from("test_log/a/b/c")).await.unwrap());
     });
 
     thread::sleep(Duration::from_millis(70000));
