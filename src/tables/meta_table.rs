@@ -1248,7 +1248,6 @@ async fn collect_waits<
     if let Some(notifier) = table.0.notifier.as_ref() {
         //指定了监听器
         for (wait_tr, confirm) in waits {
-            println!("!!!!!!meta table notifier");
             if let Err(e) = confirm(wait_tr.get_transaction_uid().unwrap(),
                                     wait_tr.get_commit_uid().unwrap(),
                                     Ok(())) {
