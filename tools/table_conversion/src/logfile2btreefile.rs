@@ -67,7 +67,7 @@ pub fn conversion(src: String, out: String, batch_count: usize) -> Result<(), St
 
 async fn handle(src: String, out: String, batch_count: usize) -> Result<(), String> {
     let (s, r) = bounded(1);
-    let mut count = 1;
+    let mut count = 0;
     let listener = move |db_mgr: &KVDBManager<usize, CommitLogger>,
                          tr_mgr: &Transaction2PcManager<usize, CommitLogger>,
                          events: &mut Vec<KVDBEvent<Guid>>| {
