@@ -20,6 +20,7 @@ use pi_async_rt::rt::{AsyncRuntime,
                       multi_thread::MultiTaskRuntimeBuilder};
 use pi_async_transaction::{TransactionError,
                            ErrorLevel,
+                           AsyncCommitLog,
                            manager_2pc::Transaction2PcManager};
 use pi_guid::Guid;
 use pi_store::commit_logger::{CommitLogger, CommitLoggerBuilder};
@@ -1622,12 +1623,13 @@ fn bench_b_tree_table(b: &mut Bencher) {
         | {
             if events.len() == 1 {
                 if events[0].is_report_transaction_info() {
-                    println!("!!!!!!> start total: {:?}, end total: {:?}, active: {:?}", tr_mgr.produced_transaction_total(), tr_mgr.consumed_transaction_total(), tr_mgr.transaction_len());
+
+                    println!("!!!!!!> commit total: {:?}, confirm total: {:?}, start total: {:?}, end total: {:?}, active: {:?}", tr_mgr.commit_logger().append_total_count(), tr_mgr.commit_logger().confirm_total_count(), tr_mgr.produced_transaction_total(), tr_mgr.consumed_transaction_total(), tr_mgr.transaction_len());
                 }
             }
             count += events.len();
             events.clear();
-            println!("!!!!!!> count: {:?}, start total: {:?}, end total: {:?}, active: {:?}", count, tr_mgr.produced_transaction_total(), tr_mgr.consumed_transaction_total(), tr_mgr.transaction_len());
+            println!("!!!!!!> count: {:?}, commit total: {:?}, confirm total: {:?}, start total: {:?}, end total: {:?}, active: {:?}", count, tr_mgr.commit_logger().append_total_count(), tr_mgr.commit_logger().confirm_total_count(), tr_mgr.produced_transaction_total(), tr_mgr.consumed_transaction_total(), tr_mgr.transaction_len());
         };
         match builder.startup_with_listener(Some(listener)).await {
             Err(e) => {
