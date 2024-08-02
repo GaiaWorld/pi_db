@@ -15,7 +15,7 @@ pi_db                = "0.10"
 pi_guid              = "~0.1"
 pi_time              = "~0.3"
 pi_store             = "~0.6"
-pi_async_transaction = "~0.6"
+pi_async_transaction = "~0.8"
 pi_atom              = "~0.5"
 pi_sinfo             = { version = "~0.3" }
 futures              = "0.3"

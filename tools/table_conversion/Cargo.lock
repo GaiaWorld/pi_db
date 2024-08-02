@@ -1796,9 +1796,9 @@ dependencies = [
 
 [[package]]
 name = "pi_async_transaction"
-version = "0.6.1"
+version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f4bad2582f26a9e25076f554bef6fbf20e5d55902b64cd1fcc488d40ed439e56"
+checksum = "acbd136484440dacdd339ba38c787fd6d249c9a8d849cfa8191c94f455ef66c0"
 dependencies = [
  "bytes",
  "dashmap 5.5.3",
@@ -1865,9 +1865,9 @@ dependencies = [
 
 [[package]]
 name = "pi_db"
-version = "0.10.7"
+version = "0.10.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e7a165e004d02e74624458f20e9579d64729665ccf3c3909f935187fd3abe872"
+checksum = "36d904231e61acb897e5bd9e85fee46690ae71f85b70fcb925aa72add9e43bbc"
 dependencies = [
  "async-channel",
  "async-lock",
@@ -2093,9 +2093,9 @@ dependencies = [
 
 [[package]]
 name = "pi_store"
-version = "0.6.10"
+version = "0.6.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6d2f080b90f25ae1830f50d0cf04f79bfd4fca10c842b9086701b4ebb3aa902d"
+checksum = "f8e0a468aa95826ea0f55fcf9392f6dee064c51d0c460ec9d77579b6c571fc00"
 dependencies = [
  "async-channel",
  "async-lock",
@@ -2857,9 +2857,9 @@ dependencies = [
 
 [[package]]
 name = "serde_json"
-version = "1.0.121"
+version = "1.0.122"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4ab380d7d9f22ef3f21ad3e6c1ebe8e4fc7a2000ccba2e4d71fc96f15b2cb609"
+checksum = "784b6203951c57ff748476b126ccb5e8e2959a5c19e5c617ab1956be3dbc68da"
 dependencies = [
  "itoa",
  "memchr",
