@@ -1741,6 +1741,8 @@ fn bench_b_tree_table(b: &mut Bencher) {
         println!("time: {:?}", Instant::now() - now);
     });
 
+    thread::sleep(Duration::from_millis(65000));
+
     let db_clone = db_copy.clone();
     rt.spawn(async move {
         let mut transaction = db_clone
@@ -1758,7 +1760,7 @@ fn bench_b_tree_table(b: &mut Bencher) {
         println!("======> assert cache before clean ok, len: {:?}", db_clone.table_record_size(&Atom::from("test_log/a/b/c")).await.unwrap());
     });
 
-    thread::sleep(Duration::from_millis(70000));
+    thread::sleep(Duration::from_millis(10000));
 
     let db_clone = db_copy.clone();
     rt.spawn(async move {

@@ -936,6 +936,54 @@ impl<
         }.boxed()
     }
 
+    #[cfg(not(real_time_iteration))]
+    fn keys<'a>(&self,
+                key: Option<<Self as KVAction>::Key>,
+                descending: bool)
+                -> BoxStream<'a, <Self as KVAction>::Key>
+    {
+        let transaction = self.clone();
+
+        let stream = stream! {
+            let trans = match transaction.0.table.0.inner.read().begin_read() {
+                Err(e) => {
+                    return;
+                },
+                Ok(trans) => {
+                    trans
+                },
+            };
+
+             let table = if let Ok(table) = trans.open_table(DEFAULT_TABLE_NAME)
+            {
+                table
+            } else {
+                return;
+            };
+            let mut inner_transaction = InnerTransaction::OnlyRead(trans, transaction.0.table.name());
+            if let Some(mut iterator) = inner_transaction
+                .values_by_read(&table, key, descending)
+            {
+                if descending {
+                    //倒序
+                    while let Some(Ok((key, _value))) = iterator.next_back() {
+                        //从迭代器获取到上一个关键字
+                        yield key.value();
+                    }
+                } else {
+                    //顺序
+                    while let Some(Ok((key, _value))) = iterator.next() {
+                        //从迭代器获取到下一个关键字
+                        yield key.value();
+                    }
+                }
+            }
+        };
+
+        stream.boxed()
+    }
+
+    #[cfg(real_time_iteration)]
     fn keys<'a>(&self,
                 key: Option<<Self as KVAction>::Key>,
                 descending: bool)
@@ -1029,6 +1077,54 @@ impl<
         stream.boxed()
     }
 
+    #[cfg(not(real_time_iteration))]
+    fn values<'a>(&self,
+                  key: Option<<Self as KVAction>::Key>,
+                  descending: bool)
+                  -> BoxStream<'a, (<Self as KVAction>::Key, <Self as KVAction>::Value)>
+    {
+        let transaction = self.clone();
+
+        let stream = stream! {
+            let trans = match transaction.0.table.0.inner.read().begin_read() {
+                Err(e) => {
+                    return;
+                },
+                Ok(trans) => {
+                    trans
+                },
+            };
+
+            let table = if let Ok(table) = trans.open_table(DEFAULT_TABLE_NAME)
+            {
+                table
+            } else {
+                return;
+            };
+            let mut inner_transaction = InnerTransaction::OnlyRead(trans, transaction.0.table.name());
+            if let Some(mut iterator) = inner_transaction
+                .values_by_read(&table, key, descending)
+            {
+                if descending {
+                    //倒序
+                    while let Some(Ok((key, value))) = iterator.next_back() {
+                        //从迭代器获取到上一个键值对
+                        yield (key.value(), value.value());
+                    }
+                } else {
+                    //顺序
+                    while let Some(Ok((key, value))) = iterator.next() {
+                        //从迭代器获取到下一个键值对
+                        yield (key.value(), value.value());
+                    }
+                }
+            }
+        };
+
+        stream.boxed()
+    }
+
+    #[cfg(real_time_iteration)]
     fn values<'a>(&self,
                   key: Option<<Self as KVAction>::Key>,
                   descending: bool)
