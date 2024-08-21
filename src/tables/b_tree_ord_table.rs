@@ -921,18 +921,23 @@ impl<
             //记录对指定关键字的最新删除操作，并增加写操作计数
             let _ = tr.0.actions.lock().insert(key.clone(), KVActionLog::Write(None));
 
-            if let Some(Some(Some(value))) = tr.0.cache_mut.lock().delete(&key, true) {
+            let opt = if let Some(Some(Some(value))) = tr.0.cache_mut.lock().delete(&key, true) {
                 //指定关键字存在，则标记删除
+                Some(value)
+            } else {
+                None
+            };
+
+            if let Some(value) = opt {
                 let _ = tr
                     .0
                     .cache_mut
                     .lock()
                     .upsert(key, None, false);
-
-                return Ok(Some(value));
+                Ok(Some(value))
+            } else {
+                Ok(None)
             }
-
-            Ok(None)
         }.boxed()
     }
 
