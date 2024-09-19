@@ -1,6 +1,6 @@
 [package]
 name = "pi_db"
-version = "0.10.13"
+version = "0.10.15"
 authors = ["vmos <vmosone007@gmail.com>"]
 edition = "2018"
 description = "Full cache based database，support transaction"
@@ -12,7 +12,6 @@ keywords = ["pi", "database", "transaction"]
 default = []
 trace = ["opentelemetry", "tracing-opentelemetry", "tracing", "tracing-subscriber"]
 log_table_debug = []
-real_time_iteration = []
 
 [dependencies]
 parking_lot = "~0.12"

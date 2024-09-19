@@ -40,7 +40,7 @@ use pi_store::log_store::log_file::LogMethod;
 use crate::{Binary, KVAction, KVActionLog, KVDBCommitConfirm, KVTableTrError, TableTrQos, TransactionDebugEvent, transaction_debug_logger, db::{KVDBChildTrList, KVDBTransaction}, tables::{KVTable,
                                                                                                                                                                                             log_ord_table::{LogOrderedTable, LogOrdTabTr}}, utils::KVDBEvent, KVDBTableType};
 
-// 默认的表名
+// 默认的表文件名
 const DEFAULT_TABLE_FILE_NAME: &str = "table.dat";
 
 // 默认的表名
@@ -51,6 +51,9 @@ const MIN_CACHE_SIZE: usize = 32 * 1024;
 
 // 默认缓存大小
 const DEFAULT_CACHE_SIZE: usize = 16 * 1024 * 1024;
+
+// 默认的选择缓存记录长度
+const DEFAULT_SELECT_CACHE_RECORD_LENGTH: usize = 0x400;
 
 impl Value for Binary {
     type SelfType<'a>
@@ -941,61 +944,13 @@ impl<
         }.boxed()
     }
 
-    #[cfg(not(real_time_iteration))]
-    fn keys<'a>(&self,
-                key: Option<<Self as KVAction>::Key>,
-                descending: bool)
-                -> BoxStream<'a, <Self as KVAction>::Key>
-    {
-        let transaction = self.clone();
-
-        let stream = stream! {
-            let trans = match transaction.0.table.0.inner.read().begin_read() {
-                Err(e) => {
-                    return;
-                },
-                Ok(trans) => {
-                    trans
-                },
-            };
-
-             let table = if let Ok(table) = trans.open_table(DEFAULT_TABLE_NAME)
-            {
-                table
-            } else {
-                return;
-            };
-            let mut inner_transaction = InnerTransaction::OnlyRead(trans, transaction.0.table.name());
-            if let Some(mut iterator) = inner_transaction
-                .values_by_read(&table, key, descending)
-            {
-                if descending {
-                    //倒序
-                    while let Some(Ok((key, _value))) = iterator.next_back() {
-                        //从迭代器获取到上一个关键字
-                        yield key.value();
-                    }
-                } else {
-                    //顺序
-                    while let Some(Ok((key, _value))) = iterator.next() {
-                        //从迭代器获取到下一个关键字
-                        yield key.value();
-                    }
-                }
-            }
-        };
-
-        stream.boxed()
-    }
-
-    #[cfg(real_time_iteration)]
     fn keys<'a>(&self,
                 key: Option<<Self as KVAction>::Key>,
                 descending: bool)
         -> BoxStream<'a, <Self as KVAction>::Key>
     {
         let transaction = self.clone();
-
+        let ptr = Box::into_raw(Box::new(self.0.table.0.cache.lock().keys(key.as_ref(), descending))) as usize;
         let stream = stream! {
             let trans = match transaction.0.table.0.inner.read().begin_read() {
                 Err(e) => {
@@ -1006,121 +961,116 @@ impl<
                 },
             };
 
-            let mut ignores = HashMap::new();
-            if let Some(key) = &key {
-                //指定了关键字
-                let mut values = transaction
-                    .0
-                    .cache_mut
-                    .lock()
-                    .iter(Some(key), descending);
-                while let Some(Entry(key, value)) = values.next() {
-                    //从迭代器获取关键字
-                    ignores.insert(key, ()); //存在或不存在都要记录
-                    if let Some(value) = value {
-                        yield key.clone();
-                    } else {
-                        continue;
-                    }
-                }
-            } else {
-                //未指定关键字
-                let mut keys = transaction
-                    .0
-                    .cache_mut
-                    .lock()
-                    .iter(None, descending);
-                while let Some(Entry(key, value)) = keys.next() {
-                    //从迭代器获取关键字
-                    ignores.insert(key, ()); //存在或不存在都要记录
-                    if let Some(value) = value {
-                        yield key.clone();
-                    } else {
-                        continue;
-                    }
-                }
-            }
-
-             let table = if let Ok(table) = trans.open_table(DEFAULT_TABLE_NAME)
-            {
-                table
-            } else {
-                return;
-            };
-            let mut inner_transaction = InnerTransaction::OnlyRead(trans, transaction.0.table.name());
-            if let Some(mut iterator) = inner_transaction
-                .values_by_read(&table, key, descending)
-            {
-                if descending {
-                    //倒序
-                    while let Some(Ok((key, _value))) = iterator.next_back() {
-                        //从迭代器获取到上一个关键字
-                        let key = key.value();
-                        if ignores.contains_key(&key) {
-                            //已迭代过了，则继续迭代上一个关键字
-                            continue;
-                        }
-
-                        yield key;
-                    }
-                } else {
-                    //顺序
-                    while let Some(Ok((key, _value))) = iterator.next() {
-                        //从迭代器获取到下一个关键字
-                        let key = key.value();
-                        if ignores.contains_key(&key) {
-                            //已迭代过了，则继续迭代下一个关键字
-                            continue;
-                        }
-
-                        yield key;
-                    }
-                }
-            }
-        };
-
-        stream.boxed()
-    }
-
-    #[cfg(not(real_time_iteration))]
-    fn values<'a>(&self,
-                  key: Option<<Self as KVAction>::Key>,
-                  descending: bool)
-                  -> BoxStream<'a, (<Self as KVAction>::Key, <Self as KVAction>::Value)>
-    {
-        let transaction = self.clone();
-
-        let stream = stream! {
-            let trans = match transaction.0.table.0.inner.read().begin_read() {
-                Err(e) => {
-                    return;
-                },
-                Ok(trans) => {
-                    trans
-                },
+            let mut cache_iterator = unsafe {
+                Box::from_raw(ptr as *mut pi_ordmap::ordmap::Keys<'_, Tree<<Self as KVAction>::Key, <Self as KVAction>::Value>>)
             };
 
             let table = if let Ok(table) = trans.open_table(DEFAULT_TABLE_NAME)
             {
                 table
             } else {
+                //当前表还未创建完成，则只迭代缓存中的关键字
+                while let Some(key) = cache_iterator.next() {
+                    //从迭代器获取到下一个关键字
+                    yield key.clone();
+                }
                 return;
             };
             let mut inner_transaction = InnerTransaction::OnlyRead(trans, transaction.0.table.name());
-            if let Some(mut iterator) = inner_transaction
-                .values_by_read(&table, key, descending)
+            if let Some(mut iterator) = inner_transaction.values_by_read(&table, key, descending)
             {
-                if descending {
-                    //倒序
-                    while let Some(Ok((key, value))) = iterator.next_back() {
-                        //从迭代器获取到上一个键值对
-                        yield (key.value(), value.value());
-                    }
-                } else {
-                    //顺序
-                    while let Some(Ok((key, value))) = iterator.next() {
-                        //从迭代器获取到下一个键值对
-                        yield (key.value(), value.value());
+                let (min_size, _) = cache_iterator.size_hint();
+                let mut ignores = HashMap::with_capacity(min_size);
+                let mut cache_b = 2;
+                let mut b = 2;
+                let mut cache_key = None;
+                let mut key = None;
+                loop {
+                    //从迭代器获取到关键字
+                    cache_key = match cache_b {
+                        0 => None, //不再获取关键字
+                        1 => cache_key, //忽略获取关键字
+                        _ => cache_iterator.next(), //获取关键字
+                    };
+                    key = match b {
+                        0 => None, //不再获取关键字
+                        1 => key,   //忽略获取关键字
+                        _ => {
+                            //获取关键字
+                            if descending {
+                                //倒序
+                                iterator.next_back()
+                            } else {
+                                //顺序
+                                iterator.next()
+                            }
+                        },
+                    };
+
+                    match (cache_key, &key) {
+                        (Some(cache_k), Some(Ok((key_, _value)))) => {
+                            //缓存和文件迭代器都有关键字
+                            let k = key_.value();
+                            if descending {
+                                //倒序
+                                if cache_k > &k {
+                                    cache_b = 2;
+                                    b = 1;
+                                    ignores.insert(cache_k.clone(), ()); //记录在缓存中已迭代过的关键字
+
+                                    yield cache_k.clone()
+                                } else {
+                                    cache_b = 1;
+                                    b = 2;
+
+                                    if !ignores.contains_key(&k) {
+                                        //在缓存中未迭代过的关键字，则返回
+                                        yield k;
+                                    }
+                                }
+                            } else {
+                                //顺序
+                                if cache_k < &k {
+                                    cache_b = 2;
+                                    b = 1;
+                                    ignores.insert(cache_k.clone(), ()); //记录在缓存中已迭代过的关键字
+
+                                    yield cache_k.clone()
+                                } else {
+                                    cache_b = 1;
+                                    b = 2;
+
+                                    if !ignores.contains_key(&k) {
+                                        //在缓存中未迭代过的关键字，则返回
+                                        yield k;
+                                    }
+                                }
+                            }
+
+                        },
+                        (None, Some(Ok((key_, _value)))) => {
+                            //只有文件迭代器有关键字
+                            cache_b = 0; //关闭缓存迭代器
+                            b = 2;
+                            let k = key_.value();
+
+                            if !ignores.contains_key(&k) {
+                                //在缓存中未迭代过的关键字，则返回
+                                yield k;
+                            }
+                        },
+                        (Some(cache_k), None) => {
+                            //只有缓存迭代器有关键字
+                            cache_b = 2;
+                            b = 0; //关闭文件迭代器
+                            ignores.insert(cache_k.clone(), ()); //记录在缓存中已迭代过的关键字
+
+                            yield cache_k.clone()
+                        },
+                        _ => {
+                            //迭代已结束
+                            break;
+                        },
                     }
                 }
             }
@@ -1129,14 +1079,13 @@ impl<
         stream.boxed()
     }
 
-    #[cfg(real_time_iteration)]
     fn values<'a>(&self,
                   key: Option<<Self as KVAction>::Key>,
                   descending: bool)
         -> BoxStream<'a, (<Self as KVAction>::Key, <Self as KVAction>::Value)>
     {
         let transaction = self.clone();
-
+        let ptr = Box::into_raw(Box::new(self.0.table.0.cache.lock().iter(key.as_ref(), descending))) as usize;
         let stream = stream! {
             let trans = match transaction.0.table.0.inner.read().begin_read() {
                 Err(e) => {
@@ -1147,74 +1096,115 @@ impl<
                 },
             };
 
-            let mut ignores = HashMap::new();
-            if let Some(key) = &key {
-                //指定了关键字
-                let mut values = transaction
-                    .0
-                    .cache_mut
-                    .lock()
-                    .iter(Some(key), descending);
-                while let Some(Entry(key, value)) = values.next() {
-                    //从迭代器获取关键字
-                    ignores.insert(key.clone(), ()); //存在或不存在都要记录
-                    if let Some(value) = value {
-                        yield (key.clone(), value.clone());
-                    } else {
-                        continue;
-                    }
-                }
-            } else {
-                //未指定关键字
-                let mut values = transaction
-                    .0
-                    .cache_mut
-                    .lock()
-                    .iter(None, descending);
-                while let Some(Entry(key, value)) = values.next() {
-                    //从迭代器获取关键字
-                    ignores.insert(key.clone(), ()); //存在或不存在都要记录
-                    if let Some(value) = value {
-                        yield (key.clone(), value.clone());
-                    } else {
-                        continue;
-                    }
-                }
-            }
+            let mut cache_iterator = unsafe {
+                Box::from_raw(ptr as *mut <Tree<<Self as KVAction>::Key, <Self as KVAction>::Value> as pi_ordmap::ordmap::Iter<'_>>::IterType)
+            };
 
             let table = if let Ok(table) = trans.open_table(DEFAULT_TABLE_NAME)
             {
                 table
             } else {
+                //当前表还未创建完成，则只迭代缓存中的键值对
+                while let Some(Entry(key, value)) = cache_iterator.next() {
+                    yield (key.clone(), value.clone());
+                }
                 return;
             };
+
             let mut inner_transaction = InnerTransaction::OnlyRead(trans, transaction.0.table.name());
-            if let Some(mut iterator) = inner_transaction
-                .values_by_read(&table, key, descending)
+            if let Some(mut iterator) = inner_transaction.values_by_read(&table, key, descending)
             {
-                if descending {
-                    //倒序
-                    while let Some(Ok((key, value))) = iterator.next_back() {
-                        //从迭代器获取到上一个键值对
-                        let key = key.value();
-                        if ignores.contains_key(&key) {
-                            //已迭代过了，则继续迭代上一个键值对
-                            continue;
-                        }
+                let (min_size, _) = cache_iterator.size_hint();
+                let mut ignores = HashMap::with_capacity(min_size);
+                let mut cache_b = 2;
+                let mut b = 2;
+                let mut cache_key_value = None;
+                let mut key_value = None;
+                loop {
+                    //从迭代器获取到键值对
+                    cache_key_value = match cache_b {
+                        0 => None, //不再获取键值对
+                        1 => cache_key_value, //忽略获取键值对
+                        _ => cache_iterator.next(), //获取键值对
+                    };
+                    key_value = match b {
+                        0 => None, //不再获取键值对
+                        1 => key_value,   //忽略获取键值对
+                        _ => {
+                            //获取键值对
+                            if descending {
+                                //倒序
+                                iterator.next_back()
+                            } else {
+                                //顺序
+                                iterator.next()
+                            }
+                        },
+                    };
 
-                        yield (key, value.value());
-                    }
-                } else {
-                    //顺序
-                    while let Some(Ok((key, value))) = iterator.next() {
-                        //从迭代器获取到下一个键值对
-                        let key = key.value();
-                        if ignores.contains_key(&key) {
-                            //已迭代过了，则继续迭代下一个键值对
-                            continue;
-                        }
+                    match (cache_key_value, &key_value) {
+                        (Some(Entry(cache_k, cache_v)), Some(Ok((key_, value_)))) => {
+                            //缓存和文件迭代器都有键值对
+                            let k = key_.value();
+                            if descending {
+                                //倒序
+                                if cache_k > &k {
+                                    cache_b = 2;
+                                    b = 1;
+                                    ignores.insert(cache_k.clone(), ()); //记录在缓存中已迭代过的键值对
 
-                        yield (key, value.value());
+                                    yield (cache_k.clone(), cache_v.clone())
+                                } else {
+                                    cache_b = 1;
+                                    b = 2;
+
+                                    if !ignores.contains_key(&k) {
+                                        //在缓存中未迭代过的键值对，则返回
+                                        yield (k, value_.value());
+                                    }
+                                }
+                            } else {
+                                //顺序
+                                if cache_k < &k {
+                                    cache_b = 2;
+                                    b = 1;
+                                    ignores.insert(cache_k.clone(), ()); //记录在缓存中已迭代过的键值对
+
+                                    yield (cache_k.clone(), cache_v.clone())
+                                } else {
+                                    cache_b = 1;
+                                    b = 2;
+
+                                    if !ignores.contains_key(&k) {
+                                        //在缓存中未迭代过的键值对，则返回
+                                        yield (k, value_.value());
+                                    }
+                                }
+                            }
+                        },
+                        (None, Some(Ok((key_, value_)))) => {
+                            //只有文件迭代器有键值对
+                            cache_b = 0; //关闭缓存迭代器
+                            b = 2;
+                            let k = key_.value();
+
+                            if !ignores.contains_key(&k) {
+                                //在缓存中未迭代过的键值对，则返回
+                                yield (k, value_.value());
+                            }
+                        },
+                        (Some(Entry(cache_k, cache_v)), None) => {
+                            //只有缓存迭代器有键值对
+                            cache_b = 2;
+                            b = 0; //关闭文件迭代器
+                            ignores.insert(cache_k.clone(), ()); //记录在缓存中已迭代过的键值对
+
+                            yield (cache_k.clone(), cache_v.clone())
+                        },
+                        _ => {
+                            //迭代已结束
+                            break;
+                        },
                     }
                 }
             }
