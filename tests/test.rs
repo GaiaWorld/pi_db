@@ -2432,7 +2432,7 @@ fn test_b_tree_table_read_write_iteraton() {
                 let _ = rt_copy.spawn(async move {
                     let tr = db_copy.transaction(Atom::from("test b-tree table"), true, 500, 500).unwrap();
 
-                    for index in 0..1000 {
+                    for index in 0..2000 {
                         let _r = tr.upsert(vec![
                             TableKV {
                                 table: table_name_copy.clone(),

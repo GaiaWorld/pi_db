@@ -52,9 +52,6 @@ const MIN_CACHE_SIZE: usize = 32 * 1024;
 // 默认缓存大小
 const DEFAULT_CACHE_SIZE: usize = 16 * 1024 * 1024;
 
-// 默认的选择缓存记录长度
-const DEFAULT_SELECT_CACHE_RECORD_LENGTH: usize = 0x400;
-
 impl Value for Binary {
     type SelfType<'a>
     where
@@ -1019,7 +1016,7 @@ impl<
                                     ignores.insert(cache_k.clone(), ()); //记录在缓存中已迭代过的关键字
 
                                     yield cache_k.clone()
-                                } else {
+                                } else if cache_k < &k {
                                     cache_b = 1;
                                     b = 2;
 
@@ -1027,6 +1024,12 @@ impl<
                                         //在缓存中未迭代过的关键字，则返回
                                         yield k;
                                     }
+                                } else {
+                                    cache_b = 2;
+                                    b = 2;
+                                    ignores.insert(cache_k.clone(), ()); //记录在缓存中已迭代过的关键字
+
+                                    yield cache_k.clone()
                                 }
                             } else {
                                 //顺序
@@ -1036,7 +1039,7 @@ impl<
                                     ignores.insert(cache_k.clone(), ()); //记录在缓存中已迭代过的关键字
 
                                     yield cache_k.clone()
-                                } else {
+                                } else if cache_k > &k {
                                     cache_b = 1;
                                     b = 2;
 
@@ -1044,6 +1047,12 @@ impl<
                                         //在缓存中未迭代过的关键字，则返回
                                         yield k;
                                     }
+                                } else {
+                                    cache_b = 2;
+                                    b = 2;
+                                    ignores.insert(cache_k.clone(), ()); //记录在缓存中已迭代过的关键字
+
+                                    yield cache_k.clone()
                                 }
                             }
 
@@ -1154,7 +1163,7 @@ impl<
                                     ignores.insert(cache_k.clone(), ()); //记录在缓存中已迭代过的键值对
 
                                     yield (cache_k.clone(), cache_v.clone())
-                                } else {
+                                } else if cache_k < &k {
                                     cache_b = 1;
                                     b = 2;
 
@@ -1162,6 +1171,12 @@ impl<
                                         //在缓存中未迭代过的键值对，则返回
                                         yield (k, value_.value());
                                     }
+                                } else {
+                                    cache_b = 2;
+                                    b = 2;
+                                    ignores.insert(cache_k.clone(), ()); //记录在缓存中已迭代过的键值对
+
+                                    yield (cache_k.clone(), cache_v.clone())
                                 }
                             } else {
                                 //顺序
@@ -1171,7 +1186,7 @@ impl<
                                     ignores.insert(cache_k.clone(), ()); //记录在缓存中已迭代过的键值对
 
                                     yield (cache_k.clone(), cache_v.clone())
-                                } else {
+                                } else if cache_k > &k {
                                     cache_b = 1;
                                     b = 2;
 
@@ -1179,6 +1194,12 @@ impl<
                                         //在缓存中未迭代过的键值对，则返回
                                         yield (k, value_.value());
                                     }
+                                } else {
+                                    cache_b = 2;
+                                    b = 2;
+                                    ignores.insert(cache_k.clone(), ()); //记录在缓存中已迭代过的键值对
+
+                                    yield (cache_k.clone(), cache_v.clone())
                                 }
                             }
                         },
