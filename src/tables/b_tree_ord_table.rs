@@ -33,7 +33,7 @@ use pi_guid::Guid;
 use pi_hash::XHashMap;
 use pi_bon::ReadBuffer;
 use log::{trace, debug, error, warn, info};
-use pi_ordmap::asbtree::Tree;
+use pi_ordmap::asbtree::{Tree, IterTree};
 use pi_ordmap::ordmap::{Entry, OrdMap};
 use pi_store::log_store::log_file::LogMethod;
 
@@ -947,7 +947,7 @@ impl<
         -> BoxStream<'a, <Self as KVAction>::Key>
     {
         let transaction = self.clone();
-        let ptr = Box::into_raw(Box::new(self.0.table.0.cache.lock().keys(key.as_ref(), descending))) as usize;
+        let ptr = Box::into_raw(Box::new(self.0.table.0.cache.lock().iter(key.as_ref(), descending))) as usize;
         let stream = stream! {
             let trans = match transaction.0.table.0.inner.read().begin_read() {
                 Err(e) => {
@@ -959,7 +959,7 @@ impl<
             };
 
             let mut cache_iterator = unsafe {
-                Box::from_raw(ptr as *mut pi_ordmap::ordmap::Keys<'_, Tree<<Self as KVAction>::Key, <Self as KVAction>::Value>>)
+                Box::from_raw(ptr as *mut <Tree<<Self as KVAction>::Key, Option<<Self as KVAction>::Value>> as pi_ordmap::ordmap::Iter<'_>>::IterType)
             };
 
             let table = if let Ok(table) = trans.open_table(DEFAULT_TABLE_NAME)
@@ -967,9 +967,12 @@ impl<
                 table
             } else {
                 //当前表还未创建完成，则只迭代缓存中的关键字
-                while let Some(key) = cache_iterator.next() {
+                while let Some(Entry(key, opt)) = cache_iterator.next() {
                     //从迭代器获取到下一个关键字
-                    yield key.clone();
+                    if let Some(_value) = opt {
+                        //只返回缓存中有值的关键字
+                        yield key.clone();
+                    }
                 }
                 return;
             };
@@ -980,18 +983,18 @@ impl<
                 let mut ignores = HashMap::with_capacity(min_size);
                 let mut cache_b = 2;
                 let mut b = 2;
-                let mut cache_key = None;
-                let mut key = None;
+                let mut cache_key_value = None;
+                let mut key_value = None;
                 loop {
                     //从迭代器获取到关键字
-                    cache_key = match cache_b {
+                    cache_key_value = match cache_b {
                         0 => None, //不再获取关键字
-                        1 => cache_key, //忽略获取关键字
+                        1 => cache_key_value, //忽略获取关键字
                         _ => cache_iterator.next(), //获取关键字
                     };
-                    key = match b {
+                    key_value = match b {
                         0 => None, //不再获取关键字
-                        1 => key,   //忽略获取关键字
+                        1 => key_value,   //忽略获取关键字
                         _ => {
                             //获取关键字
                             if descending {
@@ -1004,8 +1007,8 @@ impl<
                         },
                     };
 
-                    match (cache_key, &key) {
-                        (Some(cache_k), Some(Ok((key_, _value)))) => {
+                    match (cache_key_value, &key_value) {
+                        (Some(Entry(cache_k, opt)), Some(Ok((key_, _value)))) => {
                             //缓存和文件迭代器都有关键字
                             let k = key_.value();
                             if descending {
@@ -1013,9 +1016,12 @@ impl<
                                 if cache_k > &k {
                                     cache_b = 2;
                                     b = 1;
-                                    ignores.insert(cache_k.clone(), ()); //记录在缓存中已迭代过的关键字
 
-                                    yield cache_k.clone()
+                                    if let Some(_cache_v) = opt {
+                                        //只返回缓存中有值的关键字
+                                        ignores.insert(cache_k.clone(), ()); //记录在缓存中已迭代过的关键字
+                                        yield cache_k.clone()
+                                    }
                                 } else if cache_k < &k {
                                     cache_b = 1;
                                     b = 2;
@@ -1027,18 +1033,24 @@ impl<
                                 } else {
                                     cache_b = 2;
                                     b = 2;
-                                    ignores.insert(cache_k.clone(), ()); //记录在缓存中已迭代过的关键字
 
-                                    yield cache_k.clone()
+                                    if let Some(_cache_v) = opt {
+                                        //只返回缓存中有值的关键字
+                                        ignores.insert(cache_k.clone(), ()); //记录在缓存中已迭代过的关键字
+                                        yield cache_k.clone()
+                                    }
                                 }
                             } else {
                                 //顺序
                                 if cache_k < &k {
                                     cache_b = 2;
                                     b = 1;
-                                    ignores.insert(cache_k.clone(), ()); //记录在缓存中已迭代过的关键字
 
-                                    yield cache_k.clone()
+                                    if let Some(_cache_v) = opt {
+                                        //只返回缓存中有值的关键字
+                                        ignores.insert(cache_k.clone(), ()); //记录在缓存中已迭代过的关键字
+                                        yield cache_k.clone()
+                                    }
                                 } else if cache_k > &k {
                                     cache_b = 1;
                                     b = 2;
@@ -1050,9 +1062,12 @@ impl<
                                 } else {
                                     cache_b = 2;
                                     b = 2;
-                                    ignores.insert(cache_k.clone(), ()); //记录在缓存中已迭代过的关键字
 
-                                    yield cache_k.clone()
+                                    if let Some(_cache_v) = opt {
+                                        //只返回缓存中有值的关键字
+                                        ignores.insert(cache_k.clone(), ()); //记录在缓存中已迭代过的关键字
+                                        yield cache_k.clone()
+                                    }
                                 }
                             }
 
@@ -1068,13 +1083,16 @@ impl<
                                 yield k;
                             }
                         },
-                        (Some(cache_k), None) => {
+                        (Some(Entry(cache_k, opt)), None) => {
                             //只有缓存迭代器有关键字
                             cache_b = 2;
                             b = 0; //关闭文件迭代器
-                            ignores.insert(cache_k.clone(), ()); //记录在缓存中已迭代过的关键字
 
-                            yield cache_k.clone()
+                            if let Some(_cache_v) = opt {
+                                //只返回缓存中有值的关键字
+                                ignores.insert(cache_k.clone(), ()); //记录在缓存中已迭代过的关键字
+                                yield cache_k.clone()
+                            }
                         },
                         _ => {
                             //迭代已结束
@@ -1106,7 +1124,7 @@ impl<
             };
 
             let mut cache_iterator = unsafe {
-                Box::from_raw(ptr as *mut <Tree<<Self as KVAction>::Key, <Self as KVAction>::Value> as pi_ordmap::ordmap::Iter<'_>>::IterType)
+                Box::from_raw(ptr as *mut <Tree<<Self as KVAction>::Key, Option<<Self as KVAction>::Value>> as pi_ordmap::ordmap::Iter<'_>>::IterType)
             };
 
             let table = if let Ok(table) = trans.open_table(DEFAULT_TABLE_NAME)
@@ -1114,8 +1132,11 @@ impl<
                 table
             } else {
                 //当前表还未创建完成，则只迭代缓存中的键值对
-                while let Some(Entry(key, value)) = cache_iterator.next() {
-                    yield (key.clone(), value.clone());
+                while let Some(Entry(key, opt)) = cache_iterator.next() {
+                    if let Some(value) = opt {
+                        //只返回缓存中有值的键值对
+                        yield (key.clone(), value.clone());
+                    }
                 }
                 return;
             };
@@ -1152,7 +1173,7 @@ impl<
                     };
 
                     match (cache_key_value, &key_value) {
-                        (Some(Entry(cache_k, cache_v)), Some(Ok((key_, value_)))) => {
+                        (Some(Entry(cache_k, opt)), Some(Ok((key_, value_)))) => {
                             //缓存和文件迭代器都有键值对
                             let k = key_.value();
                             if descending {
@@ -1160,9 +1181,12 @@ impl<
                                 if cache_k > &k {
                                     cache_b = 2;
                                     b = 1;
-                                    ignores.insert(cache_k.clone(), ()); //记录在缓存中已迭代过的键值对
 
-                                    yield (cache_k.clone(), cache_v.clone())
+                                    if let Some(cache_v) = opt {
+                                        //只返回缓存中有值的键值对
+                                        ignores.insert(cache_k.clone(), ()); //记录在缓存中已迭代过的键值对
+                                        yield (cache_k.clone(), cache_v.clone())
+                                    }
                                 } else if cache_k < &k {
                                     cache_b = 1;
                                     b = 2;
@@ -1174,18 +1198,24 @@ impl<
                                 } else {
                                     cache_b = 2;
                                     b = 2;
-                                    ignores.insert(cache_k.clone(), ()); //记录在缓存中已迭代过的键值对
 
-                                    yield (cache_k.clone(), cache_v.clone())
+                                    if let Some(cache_v) = opt {
+                                        //只返回缓存中有值的键值对
+                                        ignores.insert(cache_k.clone(), ()); //记录在缓存中已迭代过的键值对
+                                        yield (cache_k.clone(), cache_v.clone())
+                                    }
                                 }
                             } else {
                                 //顺序
                                 if cache_k < &k {
                                     cache_b = 2;
                                     b = 1;
-                                    ignores.insert(cache_k.clone(), ()); //记录在缓存中已迭代过的键值对
 
-                                    yield (cache_k.clone(), cache_v.clone())
+                                    if let Some(cache_v) = opt {
+                                        //只返回缓存中有值的键值对
+                                        ignores.insert(cache_k.clone(), ()); //记录在缓存中已迭代过的键值对
+                                        yield (cache_k.clone(), cache_v.clone())
+                                    }
                                 } else if cache_k > &k {
                                     cache_b = 1;
                                     b = 2;
@@ -1197,9 +1227,12 @@ impl<
                                 } else {
                                     cache_b = 2;
                                     b = 2;
-                                    ignores.insert(cache_k.clone(), ()); //记录在缓存中已迭代过的键值对
 
-                                    yield (cache_k.clone(), cache_v.clone())
+                                    if let Some(cache_v) = opt {
+                                        //只返回缓存中有值的键值对
+                                        ignores.insert(cache_k.clone(), ()); //记录在缓存中已迭代过的键值对
+                                        yield (cache_k.clone(), cache_v.clone())
+                                    }
                                 }
                             }
                         },
@@ -1214,13 +1247,16 @@ impl<
                                 yield (k, value_.value());
                             }
                         },
-                        (Some(Entry(cache_k, cache_v)), None) => {
+                        (Some(Entry(cache_k, opt)), None) => {
                             //只有缓存迭代器有键值对
                             cache_b = 2;
                             b = 0; //关闭文件迭代器
-                            ignores.insert(cache_k.clone(), ()); //记录在缓存中已迭代过的键值对
 
-                            yield (cache_k.clone(), cache_v.clone())
+                            if let Some(cache_v) = opt {
+                                //只返回缓存中有值的键值对
+                                ignores.insert(cache_k.clone(), ()); //记录在缓存中已迭代过的键值对
+                                yield (cache_k.clone(), cache_v.clone())
+                            }
                         },
                         _ => {
                             //迭代已结束
