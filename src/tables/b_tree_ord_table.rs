@@ -864,15 +864,22 @@ impl<
                 let _ = actions_locked.insert(key.clone(), KVActionLog::Read);
             }
 
-            if let Some(Some(value)) = tr.0.cache_mut.lock().get(&key) {
-                //指定关键字在临时缓存中存在
+            let locked = tr.0.cache_mut.lock();
+            if let Some(Some(value)) = locked.get(&key) {
+                //指定关键字的值在临时缓存中存在
                 return Some(value.clone());
             } else {
-                //指定关键字在临时缓存中不存在，则直接从内部表中获取
-                if let Ok(trans) = tr.0.table.0.inner.read().begin_read() {
-                    if let Ok(inner_table) = trans.open_table(DEFAULT_TABLE_NAME) {
-                        if let Ok(Some(value)) = inner_table.get(&key) {
-                            return Some(value.value());
+                if locked.has(&key) {
+                    //指定关键字在临时缓存中存在，但值已移除
+                    return None;
+                } else {
+                    //指定关键字在临时缓存中不存在，则直接从内部表中获取
+                    drop(locked);
+                    if let Ok(trans) = tr.0.table.0.inner.read().begin_read() {
+                        if let Ok(inner_table) = trans.open_table(DEFAULT_TABLE_NAME) {
+                            if let Ok(Some(value)) = inner_table.get(&key) {
+                                return Some(value.value());
+                            }
                         }
                     }
                 }
