@@ -16,6 +16,7 @@ use pi_async_rt::rt::{AsyncRuntime, startup_global_time_loop,
                       multi_thread::MultiTaskRuntimeBuilder};
 use pi_async_transaction::{ErrorLevel, Transaction2Pc,
                            manager_2pc::Transaction2PcManager};
+use pi_ordmap::ordmap::OrdMap;
 use pi_store::{log_store::log_file::{PairLoader, LogFile, LogMethod},
                commit_logger::CommitLoggerBuilder};
 
@@ -63,6 +64,30 @@ fn test_table_meta() {
     let meta1 = EnumType::Struct(Arc::new(struct_info));
 
     assert_eq!(meta0, meta1);
+}
+
+#[test]
+fn test_ordmap() {
+    let mut map: OrdMap<pi_ordmap::asbtree::Tree<usize, usize>> = OrdMap::new(None);
+    for _ in 0..1000 {
+        if map.insert(100000, 100000) {
+            let mut iter: pi_ordmap::asbtree::IterTree<usize, usize> = map.iter(None, false);
+            let mut count = 0;
+            if let Some(_) = iter.next() {
+                count += 1;
+            }
+            assert_eq!(count, 1);
+
+            map.delete(&100000, false);
+
+            let mut iter: pi_ordmap::asbtree::IterTree<usize, usize> = map.iter(None, false);
+            if let Some(_) = iter.next() {
+                panic!("invalid delete");
+            }
+        } else {
+            panic!("invalid insert");
+        }
+    }
 }
 
 #[test]
@@ -553,6 +578,209 @@ fn test_memory_table_conflict() {
                     let last_value = binary_to_usize((&r[0]).as_ref().unwrap()).unwrap();
 
                     assert_eq!(last_value, 1000);
+                }
+            },
+        }
+    });
+
+    thread::sleep(Duration::from_millis(1000000000));
+}
+
+#[test]
+fn test_memory_table_read_write_delete_iteraton() {
+    use std::thread;
+    use std::time::Duration;
+
+    env_logger::init();
+
+    let _handle = startup_global_time_loop(100);
+    let builder = MultiTaskRuntimeBuilder::default();
+    let rt = builder.build();
+    let rt_copy = rt.clone();
+
+    rt.spawn(async move {
+        let guid_gen = GuidGen::new(run_nanos(), 0);
+        let commit_logger_builder = CommitLoggerBuilder::new(rt_copy.clone(), "./.commit_log");
+        let commit_logger = commit_logger_builder
+            .build()
+            .await
+            .unwrap();
+
+        let tr_mgr = Transaction2PcManager::new(rt_copy.clone(),
+                                                guid_gen,
+                                                commit_logger);
+
+        let mut builder = KVDBManagerBuilder::new(rt_copy.clone(), tr_mgr, "./db");
+        match builder.startup().await {
+            Err(e) => {
+                panic!("{:?}", e);
+            },
+            Ok(db) => {
+                println!("!!!!!!db table size: {:?}", db.table_size().await);
+
+                let table_name = Atom::from("test_log/a/b/c");
+                let tr = db.transaction(table_name.clone(), true, 500, 500).unwrap();
+                if let Err(e) = tr.create_table(table_name.clone(),
+                                                KVTableMeta::new(KVDBTableType::MemOrdTab,
+                                                                 false,
+                                                                 EnumType::Usize,
+                                                                 EnumType::Usize)).await {
+                    //创建有序内存表失败
+                    println!("!!!!!!create b-tree ordered table failed, reason: {:?}", e);
+                }
+                let output = tr.prepare_modified().await.unwrap();
+                let _ = tr.commit_modified(output).await;
+
+                println!("!!!!!!db table size: {:?}", db.table_size().await);
+
+                //查询表信息
+                rt_copy.timeout(1500).await;
+                println!("");
+
+                println!("!!!!!!test_log is exist: {:?}", db.is_exist(&table_name).await);
+                println!("!!!!!!test_log is ordered table: {:?}", db.is_ordered_table(&table_name).await);
+                println!("!!!!!!test_log is persistent table: {:?}", db.is_persistent_table(&table_name).await);
+                println!("!!!!!!test_log table_dir: {:?}", db.table_path(&table_name).await);
+                println!("!!!!!!test_log table len: {:?}", db.table_record_size(&table_name).await);
+
+                //操作数据库事务
+                rt_copy.timeout(1500).await;
+                println!("");
+
+                let (sender, receiver) = unbounded();
+                let db_copy = db.clone();
+                let table_name_copy = table_name.clone();
+                let sender_copy = sender.clone();
+                let start = Instant::now();
+                let _ = rt_copy.spawn(async move {
+                    let index = 100000;
+                    for n in 0..3000 {
+                        let tr = db_copy.transaction(Atom::from("test b-tree table"), true, 500, 500).unwrap();
+                        let _r = tr.upsert(vec![
+                            TableKV {
+                                table: table_name_copy.clone(),
+                                key: usize_to_binary(index),
+                                value: Some(usize_to_binary(index))
+                            }
+                        ]).await;
+                        match tr.prepare_modified().await {
+                            Err(_e) => {
+                                if let Err(e) = tr.rollback_modified().await {
+                                    println!("rollback failed, reason: {:?}", e);
+                                }
+                            },
+                            Ok(output) => {
+                                if let Err(e) = tr.commit_modified(output).await {
+                                    if let ErrorLevel::Fatal = &e.level() {
+                                        println!("rollback failed, reason: commit fatal error");
+                                    } else {
+                                        if let Err(e) = tr.rollback_modified().await {
+                                            println!("rollback failed, reason: {:?}", e);
+                                        }
+                                    }
+                                } else {
+                                    ()
+                                }
+                            },
+                        }
+
+
+
+                        let tr = db.transaction(Atom::from("test b-tree table"), false, 500, 500).unwrap();
+                        let mut values = tr.values(table_name.clone(), None, false).await.unwrap();
+                        while let Some((key, value)) = values.next().await {
+                            assert_eq!(binary_to_usize(&key).unwrap(), binary_to_usize(&value).unwrap())
+                        }
+
+
+
+                        let tr = db.transaction(Atom::from("test b-tree table"), false, 500, 500).unwrap();
+                        let r = tr.query(vec![
+                            TableKV {
+                                table: table_name.clone(),
+                                key: usize_to_binary(index),
+                                value: None
+                            }
+                        ]).await;
+                        assert!(r.len() == 1 && binary_to_usize((&r[0]).as_ref().unwrap()).unwrap() == index);
+
+
+
+                        let tr = db.transaction(Atom::from("test b-tree table"), true, 500, 500).unwrap();
+                        let r = tr.delete(vec![
+                            TableKV {
+                                table: table_name_copy.clone(),
+                                key: usize_to_binary(index),
+                                value: None
+                            }
+                        ]).await;
+                        assert!(r.is_ok());
+                        match tr.prepare_modified().await {
+                            Err(_e) => {
+                                if let Err(e) = tr.rollback_modified().await {
+                                    println!("rollback failed, reason: {:?}", e);
+                                }
+                            },
+                            Ok(output) => {
+                                if let Err(e) = tr.commit_modified(output).await {
+                                    if let ErrorLevel::Fatal = &e.level() {
+                                        println!("rollback failed, reason: commit fatal error");
+                                    } else {
+                                        if let Err(e) = tr.rollback_modified().await {
+                                            println!("rollback failed, reason: {:?}", e);
+                                        }
+                                    }
+                                } else {
+                                    ()
+                                }
+                            },
+                        }
+                        // assert_eq!(db_copy.table_record_size(&table_name_copy).await, Some(0));
+
+
+
+                        let tr = db.transaction(Atom::from("test b-tree table"), false, 500, 500).unwrap();
+                        let r = tr.query(vec![
+                            TableKV {
+                                table: table_name.clone(),
+                                key: usize_to_binary(index),
+                                value: None
+                            }
+                        ]).await;
+                        assert!(r.len() == 1 && r[0].is_none());
+
+
+
+                        let tr = db.transaction(Atom::from("test b-tree table"), false, 500, 500).unwrap();
+                        let mut values = tr.values(table_name.clone(), None, false).await.unwrap();
+                        while let Some((key, value)) = values.next().await {
+                            panic!("n: {:?}, key: {:?}, value: {:?}", n, binary_to_usize(&key).unwrap(), binary_to_usize(&value).unwrap());
+                        }
+                    }
+
+                    sender_copy.send(());
+                });
+
+                let mut count = 0;
+                loop {
+                    match receiver.recv_timeout(Duration::from_millis(10000)) {
+                        Err(e) => {
+                            println!(
+                                "!!!!!!recv timeout, len: {}, timer_len: {}, e: {:?}",
+                                rt_copy.wait_len(),
+                                rt_copy.len(),
+                                e
+                            );
+                            continue;
+                        },
+                        Ok(_result) => {
+                            count += 1;
+                            if count >= 1 {
+                                println!("======> insert and delete finish, time: {:?}, count: {}", start.elapsed(), count);
+                                break;
+                            }
+                        },
+                    }
                 }
             },
         }
@@ -2677,6 +2905,242 @@ fn test_b_tree_table_read_write_delete_iteraton() {
                     panic!("{:?}", e);
                 }
                 println!("======> Compact finish, time: {:?}", start.elapsed());
+            },
+        }
+    });
+
+    thread::sleep(Duration::from_millis(1000000000));
+}
+
+//需要清空数据库后再测试
+#[test]
+fn test_b_tree_table_delete_iteraton() {
+    use std::thread;
+    use std::time::Duration;
+
+    env_logger::init();
+
+    let _handle = startup_global_time_loop(100);
+    let builder = MultiTaskRuntimeBuilder::default();
+    let rt = builder.build();
+    let rt_copy = rt.clone();
+
+    rt.spawn(async move {
+        let guid_gen = GuidGen::new(run_nanos(), 0);
+        let commit_logger_builder = CommitLoggerBuilder::new(rt_copy.clone(), "./.commit_log");
+        let commit_logger = commit_logger_builder
+            .build()
+            .await
+            .unwrap();
+
+        let tr_mgr = Transaction2PcManager::new(rt_copy.clone(),
+                                                guid_gen,
+                                                commit_logger);
+
+        let mut builder = KVDBManagerBuilder::new(rt_copy.clone(), tr_mgr, "./db");
+        match builder.startup().await {
+            Err(e) => {
+                panic!("{:?}", e);
+            },
+            Ok(db) => {
+                println!("!!!!!!db table size: {:?}", db.table_size().await);
+
+                let table_name = Atom::from("test_log/a/b/c");
+                let tr = db.transaction(table_name.clone(), true, 500, 500).unwrap();
+                if let Err(e) = tr.create_table(table_name.clone(),
+                                                KVTableMeta::new(KVDBTableType::BtreeOrdTab,
+                                                                 true,
+                                                                 EnumType::Usize,
+                                                                 EnumType::Usize)).await {
+                    //创建有序内存表失败
+                    println!("!!!!!!create b-tree ordered table failed, reason: {:?}", e);
+                }
+                let output = tr.prepare_modified().await.unwrap();
+                let _ = tr.commit_modified(output).await;
+
+                println!("!!!!!!db table size: {:?}", db.table_size().await);
+
+                //查询表信息
+                rt_copy.timeout(1500).await;
+                println!("");
+
+                println!("!!!!!!test_log is exist: {:?}", db.is_exist(&table_name).await);
+                println!("!!!!!!test_log is ordered table: {:?}", db.is_ordered_table(&table_name).await);
+                println!("!!!!!!test_log is persistent table: {:?}", db.is_persistent_table(&table_name).await);
+                println!("!!!!!!test_log table_dir: {:?}", db.table_path(&table_name).await);
+                println!("!!!!!!test_log table len: {:?}", db.table_record_size(&table_name).await);
+
+                //操作数据库事务
+                rt_copy.timeout(1500).await;
+                println!("");
+
+                let index = 100000;
+                let tr = db.transaction(Atom::from("test b-tree table"), true, 500, 500).unwrap();
+                let _r = tr.upsert(vec![
+                    TableKV {
+                        table: table_name.clone(),
+                        key: usize_to_binary(index),
+                        value: Some(usize_to_binary(index))
+                    }
+                ]).await;
+                match tr.prepare_modified().await {
+                    Err(_e) => {
+                        if let Err(e) = tr.rollback_modified().await {
+                            println!("rollback failed, reason: {:?}", e);
+                        }
+                    },
+                    Ok(output) => {
+                        if let Err(e) = tr.commit_modified(output).await {
+                            if let ErrorLevel::Fatal = &e.level() {
+                                println!("rollback failed, reason: commit fatal error");
+                            } else {
+                                if let Err(e) = tr.rollback_modified().await {
+                                    println!("rollback failed, reason: {:?}", e);
+                                }
+                            }
+                        } else {
+                            ()
+                        }
+                    },
+                }
+
+                println!("wait 65s...");
+                rt_copy.timeout(65000).await;
+
+                let (sender, receiver) = unbounded();
+                let db_copy = db.clone();
+                let table_name_copy = table_name.clone();
+                let sender_copy = sender.clone();
+                let start = Instant::now();
+                let _ = rt_copy.spawn(async move {
+                    let index = 100000;
+                    for n in 0..100 {
+                        let tr = db_copy.transaction(Atom::from("test b-tree table"), true, 500, 500).unwrap();
+                        let _r = tr.upsert(vec![
+                            TableKV {
+                                table: table_name_copy.clone(),
+                                key: usize_to_binary(index),
+                                value: Some(usize_to_binary(index))
+                            }
+                        ]).await;
+                        match tr.prepare_modified().await {
+                            Err(_e) => {
+                                if let Err(e) = tr.rollback_modified().await {
+                                    println!("rollback failed, reason: {:?}", e);
+                                }
+                            },
+                            Ok(output) => {
+                                if let Err(e) = tr.commit_modified(output).await {
+                                    if let ErrorLevel::Fatal = &e.level() {
+                                        println!("rollback failed, reason: commit fatal error");
+                                    } else {
+                                        if let Err(e) = tr.rollback_modified().await {
+                                            println!("rollback failed, reason: {:?}", e);
+                                        }
+                                    }
+                                } else {
+                                    ()
+                                }
+                            },
+                        }
+
+
+
+                        let tr = db.transaction(Atom::from("test b-tree table"), false, 500, 500).unwrap();
+                        let mut values = tr.values(table_name.clone(), None, false).await.unwrap();
+                        while let Some((key, value)) = values.next().await {
+                            assert_eq!(binary_to_usize(&key).unwrap(), binary_to_usize(&value).unwrap())
+                        }
+
+
+
+                        let tr = db.transaction(Atom::from("test b-tree table"), false, 500, 500).unwrap();
+                        let r = tr.query(vec![
+                            TableKV {
+                                table: table_name.clone(),
+                                key: usize_to_binary(index),
+                                value: None
+                            }
+                        ]).await;
+                        assert!(r.len() == 1 && binary_to_usize((&r[0]).as_ref().unwrap()).unwrap() == index);
+
+
+
+                        let tr = db.transaction(Atom::from("test b-tree table"), true, 500, 500).unwrap();
+                        let r = tr.delete(vec![
+                            TableKV {
+                                table: table_name_copy.clone(),
+                                key: usize_to_binary(index),
+                                value: None
+                            }
+                        ]).await;
+                        assert!(r.is_ok());
+                        match tr.prepare_modified().await {
+                            Err(_e) => {
+                                if let Err(e) = tr.rollback_modified().await {
+                                    println!("rollback failed, reason: {:?}", e);
+                                }
+                            },
+                            Ok(output) => {
+                                if let Err(e) = tr.commit_modified(output).await {
+                                    if let ErrorLevel::Fatal = &e.level() {
+                                        println!("rollback failed, reason: commit fatal error");
+                                    } else {
+                                        if let Err(e) = tr.rollback_modified().await {
+                                            println!("rollback failed, reason: {:?}", e);
+                                        }
+                                    }
+                                } else {
+                                    ()
+                                }
+                            },
+                        }
+
+
+
+                        let tr = db.transaction(Atom::from("test b-tree table"), false, 500, 500).unwrap();
+                        let r = tr.query(vec![
+                            TableKV {
+                                table: table_name.clone(),
+                                key: usize_to_binary(index),
+                                value: None
+                            }
+                        ]).await;
+                        assert!(r.len() == 1 && r[0].is_none());
+
+
+
+                        let tr = db.transaction(Atom::from("test b-tree table"), false, 500, 500).unwrap();
+                        let mut values = tr.values(table_name.clone(), None, false).await.unwrap();
+                        while let Some((key, value)) = values.next().await {
+                            panic!("n: {:?}, key: {:?}, value: {:?}", n, binary_to_usize(&key).unwrap(), binary_to_usize(&value).unwrap());
+                        }
+                    }
+
+                    sender_copy.send(());
+                });
+
+                let mut count = 0;
+                loop {
+                    match receiver.recv_timeout(Duration::from_millis(30000)) {
+                        Err(e) => {
+                            println!(
+                                "!!!!!!recv timeout, len: {}, timer_len: {}, e: {:?}",
+                                rt_copy.wait_len(),
+                                rt_copy.len(),
+                                e
+                            );
+                            continue;
+                        },
+                        Ok(_result) => {
+                            count += 1;
+                            if count >= 1 {
+                                println!("======> insert and delete finish, time: {:?}, count: {}", start.elapsed(), count);
+                                break;
+                            }
+                        },
+                    }
+                }
             },
         }
     });
