@@ -929,20 +929,18 @@ impl<
             let _ = tr.0.actions.lock().insert(key.clone(), KVActionLog::Write(None));
 
             let mut locked = tr.0.cache_mut.lock();
-            let opt = if let Some(Some(Some(value))) = locked.delete(&key, true) {
-                //指定关键字存在，则标记删除
+            let _ = locked.delete(&key, true);
+            let result = if let Some(Some(Some(value))) = locked.delete(&key, true) {
+                //指定关键字存在
                 Some(value)
             } else {
                 None
             };
 
-            if let Some(value) = opt {
-                let _ = locked
-                    .upsert(key, None, false);
-                Ok(Some(value))
-            } else {
-                Ok(None)
-            }
+            //需要标记删除
+            let _ = locked.upsert(key, None, false);
+
+            Ok(result)
         }.boxed()
     }
 

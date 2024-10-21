@@ -2752,6 +2752,58 @@ fn test_b_tree_table_read_write_delete_iteraton() {
                 assert_eq!(index, 3000);
                 println!("======> iterate 3 finish, count: {:?}, time: {:?}", index, start.elapsed());
 
+                let tr = db.transaction(Atom::from("test b-tree table"), true, 500, 500).unwrap();
+                let _r = tr.delete(vec![
+                    TableKV {
+                        table: table_name.clone(),
+                        key: usize_to_binary(1000),
+                        value: None
+                    }
+                ]).await;
+                match tr.prepare_modified().await {
+                    Err(_e) => {
+                        if let Err(e) = tr.rollback_modified().await {
+                            println!("rollback failed, reason: {:?}", e);
+                        }
+                    },
+                    Ok(output) => {
+                        if let Err(e) = tr.commit_modified(output).await {
+                            if let ErrorLevel::Fatal = &e.level() {
+                                println!("rollback failed, reason: commit fatal error");
+                            } else {
+                                if let Err(e) = tr.rollback_modified().await {
+                                    println!("rollback failed, reason: {:?}", e);
+                                }
+                            }
+                        } else {
+                            ()
+                        }
+                    },
+                }
+                println!("======> delete key = 1000 finish, count: {:?}, time: {:?}", count, start.elapsed());
+
+                let start = Instant::now();
+                let tr = db.transaction(Atom::from("test b-tree table"), false, 500, 500).unwrap();
+                let r = tr.query(vec![
+                    TableKV {
+                        table: table_name.clone(),
+                        key: usize_to_binary(1000),
+                        value: None
+                    }
+                ]).await;
+                assert!(r.len() == 1 && r[0].is_none());
+                println!("======> query key = 1000 finish, count: 0, time: {:?}", start.elapsed());
+
+                let start = Instant::now();
+                let tr = db.transaction(Atom::from("test b-tree table"), false, 500, 500).unwrap();
+                let mut values = tr.values(table_name.clone(), None, false).await.unwrap();
+                while let Some((key, value)) = values.next().await {
+                    if binary_to_usize(&key).unwrap() == 1000 {
+                        panic!("key: {:?}, value: {:?}", binary_to_usize(&key).unwrap(), binary_to_usize(&value).unwrap());
+                    }
+                }
+                println!("======> iterate key = 1000 finish, count: 0, time: {:?}", start.elapsed());
+
                 let (sender, receiver) = unbounded();
                 let db_copy = db.clone();
                 let table_name_copy = table_name.clone();
