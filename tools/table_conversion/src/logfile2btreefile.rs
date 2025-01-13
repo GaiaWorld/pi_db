@@ -36,20 +36,38 @@ pub fn db_test(db: String) -> Result<(), String> {
     let builder = MultiTaskRuntimeBuilder::default();
     let rt = builder.build();
     let (s, r) = bounded(1);
+    let s_copy = s.clone();
+    let mut count = 0;
     rt.spawn(async move {
-        let db_mgr = start_db::<
-            fn(
-                &KVDBManager<usize, CommitLogger>,
-                &Transaction2PcManager<usize, CommitLogger>,
-                &mut Vec<KVDBEvent<Guid>>,
-            ),
-        >(db, None)
-        .await
-        .unwrap();
-        for (tab_name, _, size) in get_tables(db_mgr).await.unwrap() {
-            println!("tab_name:{tab_name}, size:{size}");
-        }
-        s.send(Ok(()));
+        let listener = move |db_mgr: &KVDBManager<usize, CommitLogger>,
+                             tr_mgr: &Transaction2PcManager<usize, CommitLogger>,
+                             events: &mut Vec<KVDBEvent<Guid>>| {
+            count += events.len();
+            events.clear();
+            println!(
+                "!!!!!!> start total: {:?}, end total: {:?}, active: {:?}, count:{count}",
+                tr_mgr.produced_transaction_total(),
+                tr_mgr.consumed_transaction_total(),
+                tr_mgr.transaction_len()
+            );
+            if tr_mgr.produced_transaction_total() == tr_mgr.consumed_transaction_total()
+                && tr_mgr.transaction_len() == 0
+                && count == tr_mgr.consumed_transaction_total()
+            {
+                s.send(Ok(()));
+            }
+        };
+
+        match start_db(db, Some(listener)).await {
+            Ok(db_mgr) => {
+                for (tab_name, _, size) in get_tables(db_mgr).await.unwrap() {
+                    println!("tab_name:{tab_name}, size:{size}");
+                }
+            }
+            Err(e) => {
+                s_copy.send(Err(e));
+            }
+        };
     });
     r.recv().or_else(|e| Err(e.to_string()))?
 }
