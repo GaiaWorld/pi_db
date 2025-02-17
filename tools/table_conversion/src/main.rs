@@ -69,7 +69,12 @@ fn main() {
             println!("conversion r:{:?}, time:{:?}", r, start.elapsed());
         }
         TableConversion::Test { path } => {
-            println!("r:{:?}", db_test(path));
+            // 判断path是否存在
+            if Path::new(&path).exists() {
+                println!("r:{:?}", db_test(path));
+            } else {
+                println!("path:{:?} not exist", path);
+            }
         }
     }
     // thread::sleep(Duration::from_millis(1000000000));
