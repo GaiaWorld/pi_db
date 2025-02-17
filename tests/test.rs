@@ -2486,6 +2486,10 @@ fn test_b_tree_table() {
     thread::sleep(Duration::from_millis(1000000000));
 }
 
+/// 测试 B-tree 表的读、写、删除和迭代操作。
+///
+/// 该函数初始化数据库，执行一系列基本操作，包括插入数据、查询特定键值、更新数据、删除数据以及遍历所有表项，
+/// 并验证这些操作是否正确。
 #[test]
 fn test_b_tree_table_read_write_delete_iteraton() {
     use std::thread;
