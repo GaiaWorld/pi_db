@@ -1,6 +1,6 @@
 [package]
 name = "pi_db"
-version = "0.10.21"
+version = "0.10.22"
 authors = ["vmos <vmosone007@gmail.com>"]
 edition = "2018"
 description = "Full cache based database，support transaction"
@@ -32,9 +32,8 @@ pi_guid = "~0.1"
 pi_bon = "~0.2"
 pi_sinfo = { version = "~0.3", path = "../pi_sinfo" }
 pi_ordmap = "~0.2"
-pi_logger = "~0.2"
 pi_hash = "~0.1"
-redb = "~2.1"
+redb = "~2.2"
 opentelemetry = { version = "~0.18", optional = true }
 tracing-opentelemetry = { version = "~0.18", optional = true }
 tracing = { version = "~0.1", optional = true }
