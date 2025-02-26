@@ -1865,9 +1865,9 @@ dependencies = [
 
 [[package]]
 name = "pi_db"
-version = "0.10.10"
+version = "0.10.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "36d904231e61acb897e5bd9e85fee46690ae71f85b70fcb925aa72add9e43bbc"
+checksum = "3e276b4ae77a6237a0c324d51561c3480b8cd49fabe558577b2b558c2cf2da0c"
 dependencies = [
  "async-channel",
  "async-lock",

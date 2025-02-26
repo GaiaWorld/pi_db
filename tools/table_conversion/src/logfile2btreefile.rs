@@ -42,7 +42,21 @@ pub fn db_test(db: String) -> Result<(), String> {
         let listener = move |db_mgr: &KVDBManager<usize, CommitLogger>,
                              tr_mgr: &Transaction2PcManager<usize, CommitLogger>,
                              events: &mut Vec<KVDBEvent<Guid>>| {
-            count += events.len();
+            for e in events.iter() {
+                if e.is_confirm_commited() {
+                    match e {
+                        KVDBEvent::ConfirmCommited(_, _, tab_type, _, _) => {
+                            if tab_type == &KVDBTableType::LogOrdTab
+                                || tab_type == &KVDBTableType::BtreeOrdTab
+                            {
+                                count += 1;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            // count += events.len();
             events.clear();
             println!(
                 "!!!!!!> start total: {:?}, end total: {:?}, active: {:?}, count:{count}",
