@@ -867,6 +867,12 @@ impl<
             let locked = tr.0.cache_mut.lock();
             if let Some(Some(value)) = locked.get(&key) {
                 //指定关键字的值在临时缓存中存在
+
+                println!("!!!!!!query_in_cache, table: {:?}, key: {:?}, value len: {:?}",
+                         self.0.table.name().as_str(),
+                         String::from_utf8_lossy(key.as_ref()),
+                         value.as_ref().len());
+
                 return Some(value.clone());
             } else {
                 if locked.has(&key) {
@@ -878,6 +884,11 @@ impl<
                     if let Ok(trans) = tr.0.table.0.inner.read().begin_read() {
                         if let Ok(inner_table) = trans.open_table(DEFAULT_TABLE_NAME) {
                             if let Ok(Some(value)) = inner_table.get(&key) {
+                                println!("!!!!!!query_in_redb, table: {:?}, key: {:?}, value len: {:?}",
+                                         self.0.table.name().as_str(),
+                                         String::from_utf8_lossy(key.as_ref()),
+                                         value.value().as_ref().len());
+
                                 return Some(value.value());
                             }
                         }
@@ -905,6 +916,11 @@ impl<
         async move {
             //记录对指定关键字的最新插入或更新操作
             let _ = tr.0.actions.lock().insert(key.clone(), KVActionLog::Write(Some(value.clone())));
+
+            println!("!!!!!!upsert, table: {:?}, key: {:?}, value len: {:?}",
+                     self.0.table.name().as_str(),
+                     String::from_utf8_lossy(key.as_ref()),
+                     value.as_ref().len());
 
             //插入或更新指定的键值对
             let _ = tr.0.cache_mut.lock().upsert(key, Some(value), false);

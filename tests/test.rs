@@ -3237,9 +3237,21 @@ fn test_b_tree_table_conflict() {
             Ok(db) => {
                 println!("!!!!!!db table size: {:?}", db.table_size().await);
 
-                let table_name = Atom::from("test_log/a/b/c");
-                let tr = db.transaction(table_name.clone(), true, 500, 500).unwrap();
-                if let Err(e) = tr.create_table(table_name.clone(),
+                let table_name0 = Atom::from("test_log/a/b/c");
+                let tr = db.transaction(table_name0.clone(), true, 500, 500).unwrap();
+                if let Err(e) = tr.create_table(table_name0.clone(),
+                                                KVTableMeta::new(KVDBTableType::BtreeOrdTab,
+                                                                 true,
+                                                                 EnumType::Usize,
+                                                                 EnumType::Usize)).await {
+                    //创建有序内存表失败
+                    println!("!!!!!!create b-tree ordered table failed, reason: {:?}", e);
+                }
+                let output = tr.prepare_modified().await.unwrap();
+                let _ = tr.commit_modified(output).await;
+                let table_name1 = Atom::from("test_log/x/y/z");
+                let tr = db.transaction(table_name1.clone(), true, 500, 500).unwrap();
+                if let Err(e) = tr.create_table(table_name1.clone(),
                                                 KVTableMeta::new(KVDBTableType::BtreeOrdTab,
                                                                  true,
                                                                  EnumType::Usize,
@@ -3256,26 +3268,35 @@ fn test_b_tree_table_conflict() {
                 rt_copy.timeout(1500).await;
                 println!("");
 
-                println!("!!!!!!test_log is exist: {:?}", db.is_exist(&table_name).await);
-                println!("!!!!!!test_log is ordered table: {:?}", db.is_ordered_table(&table_name).await);
-                println!("!!!!!!test_log is persistent table: {:?}", db.is_persistent_table(&table_name).await);
-                println!("!!!!!!test_log table_dir: {:?}", db.table_path(&table_name).await);
-                println!("!!!!!!test_log table len: {:?}", db.table_record_size(&table_name).await);
+                println!("!!!!!!test_log is exist: {:?}", db.is_exist(&table_name0).await && db.is_exist(&table_name1).await);
+                println!("!!!!!!test_log is ordered table: {:?}", db.is_ordered_table(&table_name0).await.clone().unwrap_or(false) && db.is_ordered_table(&table_name1).await.clone().unwrap_or(false));
+                println!("!!!!!!test_log is persistent table: {:?}", db.is_persistent_table(&table_name0).await.clone().unwrap_or(false) && db.is_persistent_table(&table_name1).await.clone().unwrap_or(false));
+                println!("!!!!!!test_log table_dir: {:?}, {:?}", db.table_path(&table_name0).await, db.table_path(&table_name1).await);
+                println!("!!!!!!test_log table len: {:?}, {:?}", db.table_record_size(&table_name0).await, db.table_record_size(&table_name1).await);
 
                 //操作数据库事务
                 rt_copy.timeout(1500).await;
                 println!("");
 
                 {
-                    let tr = db.transaction(table_name.clone(), true, 500, 500).unwrap();
+                    let tr = db.transaction(table_name0.clone(), true, 500, 500).unwrap();
 
-                    let _r = tr.upsert(vec![
-                        TableKV {
-                            table: table_name.clone(),
-                            key: usize_to_binary(0),
+                    let mut tkvs = Vec::with_capacity(10);
+                    for index in 0..10 {
+                        let tkv = TableKV {
+                            table: table_name0.clone(),
+                            key: usize_to_binary(index),
                             value: Some(usize_to_binary(0))
-                        }
-                    ]).await;
+                        };
+                        tkvs.push(tkv);
+                        let tkv = TableKV {
+                            table: table_name1.clone(),
+                            key: usize_to_binary(index),
+                            value: Some(usize_to_binary(0))
+                        };
+                        tkvs.push(tkv);
+                    }
+                    let _r = tr.upsert(tkvs).await;
 
                     if let Ok(output) = tr.prepare_modified().await {
                         tr.commit_modified(output).await.is_ok();
@@ -3284,65 +3305,81 @@ fn test_b_tree_table_conflict() {
 
                 let (sender, receiver) = unbounded();
                 let start = Instant::now();
-                for _ in 0..1000 {
+                for index in 0..10 {
                     let rt_copy_ = rt_copy.clone();
                     let db_copy = db.clone();
-                    let table_name_copy = table_name.clone();
+                    let table_name0_copy = table_name0.clone();
+                    let table_name1_copy = table_name1.clone();
                     let sender_copy = sender.clone();
 
+                    let key = usize_to_binary(index);
                     rt_copy.spawn(async move {
                         let now = Instant::now();
                         let mut is_ok = false;
 
-                        while now.elapsed().as_millis() <= 120000 {
-                            let tr = db_copy.transaction(Atom::from("test b-tree table"), true, 500, 500).unwrap();
-                            let r = tr.query(vec![
-                                TableKV {
-                                    table: table_name_copy.clone(),
-                                    key: usize_to_binary(0),
-                                    value: None
-                                }
-                            ]).await;
-                            let last_value = binary_to_usize((&r[0]).as_ref().unwrap()).unwrap();
-
-                            let new_value = last_value + 1;
-                            let _r = tr.upsert(vec![
-                                TableKV {
-                                    table: table_name_copy.clone(),
-                                    key: usize_to_binary(0),
-                                    value: Some(usize_to_binary(new_value))
-                                }
-                            ]).await;
-
-                            match tr.prepare_modified().await {
-                                Err(_e) => {
-                                    if let Err(e) = tr.rollback_modified().await {
-                                        println!("rollback failed, reason: {:?}", e);
-                                    } else {
-                                        rt_copy_.timeout(1).await;
-                                        continue;
+                        for _ in 0..1000 {
+                            while now.elapsed().as_millis() <= 120000 {
+                                let tr = db_copy.transaction(Atom::from("test b-tree table"), true, 500, 500).unwrap();
+                                let r = tr.query(vec![
+                                    TableKV {
+                                        table: table_name0_copy.clone(),
+                                        key: key.clone(),
+                                        value: None
+                                    },
+                                    TableKV {
+                                        table: table_name1_copy.clone(),
+                                        key: key.clone(),
+                                        value: None
                                     }
-                                },
-                                Ok(output) => {
-                                    match tr.commit_modified(output).await {
-                                        Err(e) => {
-                                            if let ErrorLevel::Fatal = &e.level() {
-                                                println!("rollback failed, reason: commit fatal error");
-                                            } else {
-                                                if let Err(e) = tr.rollback_modified().await {
-                                                    println!("rollback failed, reason: {:?}", e);
+                                ]).await;
+                                let last_value0 = binary_to_usize((&r[0]).as_ref().unwrap()).unwrap();
+                                let last_value1 = binary_to_usize((&r[1]).as_ref().unwrap()).unwrap();
+
+                                let new_value0 = last_value0 + 1;
+                                let new_value1 = last_value1 + 1;
+                                let _r = tr.upsert(vec![
+                                    TableKV {
+                                        table: table_name0_copy.clone(),
+                                        key: key.clone(),
+                                        value: Some(usize_to_binary(new_value0))
+                                    },
+                                    TableKV {
+                                        table: table_name1_copy.clone(),
+                                        key: key.clone(),
+                                        value: Some(usize_to_binary(new_value1))
+                                    }
+                                ]).await;
+
+                                match tr.prepare_modified().await {
+                                    Err(_e) => {
+                                        if let Err(e) = tr.rollback_modified().await {
+                                            println!("rollback failed, reason: {:?}", e);
+                                        } else {
+                                            rt_copy_.timeout(1).await;
+                                            continue;
+                                        }
+                                    },
+                                    Ok(output) => {
+                                        match tr.commit_modified(output).await {
+                                            Err(e) => {
+                                                if let ErrorLevel::Fatal = &e.level() {
+                                                    println!("rollback failed, reason: commit fatal error");
                                                 } else {
-                                                    rt_copy_.timeout(1).await;
-                                                    continue;
+                                                    if let Err(e) = tr.rollback_modified().await {
+                                                        println!("rollback failed, reason: {:?}", e);
+                                                    } else {
+                                                        rt_copy_.timeout(1).await;
+                                                        continue;
+                                                    }
                                                 }
-                                            }
-                                        },
-                                        Ok(()) => {
-                                            is_ok = true;
-                                            break;
-                                        },
-                                    }
-                                },
+                                            },
+                                            Ok(()) => {
+                                                is_ok = true;
+                                                break;
+                                            },
+                                        }
+                                    },
+                                }
                             }
                         }
 
@@ -3368,7 +3405,7 @@ fn test_b_tree_table_conflict() {
                         },
                         Ok(_result) => {
                             count += 1;
-                            if count >= 1000 {
+                            if count >= 10 {
                                 println!("!!!!!!time: {:?}, count: {}", start.elapsed(), count);
                                 break;
                             }
@@ -3379,16 +3416,27 @@ fn test_b_tree_table_conflict() {
                 {
                     let tr = db.transaction(Atom::from("test b-tree table"), true, 500, 500).unwrap();
 
-                    let r = tr.query(vec![
-                        TableKV {
-                            table: table_name.clone(),
-                            key: usize_to_binary(0),
+                    let mut tkvs = Vec::with_capacity(10);
+                    for index in 0..10 {
+                        let tkv = TableKV {
+                            table: table_name0.clone(),
+                            key: usize_to_binary(index),
                             value: None
-                        }
-                    ]).await;
-                    let last_value = binary_to_usize((&r[0]).as_ref().unwrap()).unwrap();
-
-                    assert_eq!(last_value, 1000);
+                        };
+                        tkvs.push(tkv);
+                        let tkv = TableKV {
+                            table: table_name1.clone(),
+                            key: usize_to_binary(index),
+                            value: None
+                        };
+                        tkvs.push(tkv);
+                    }
+                    let rs = tr.query(tkvs).await;
+                    assert_eq!(rs.len(), 20);
+                    for r in rs {
+                        assert_eq!(binary_to_usize(r.as_ref().unwrap()).unwrap(), 1000);
+                    }
+                    println!("!!!!!!test_b_tree_table_conflict finished");
                 }
             },
         }
