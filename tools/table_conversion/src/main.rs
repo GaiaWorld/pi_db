@@ -10,6 +10,7 @@ use std::ffi::OsString;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use btreefile2logfile::conversion as btreefile2logfile_conversion;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use crossbeam_channel::bounded;
 use env_logger;
@@ -19,6 +20,7 @@ use pi_async_file::file::rename;
 use pi_async_rt::rt::startup_global_time_loop;
 use pi_async_rt::rt::{multi_thread::MultiTaskRuntimeBuilder, AsyncRuntime};
 
+mod btreefile2logfile;
 mod logfile2btreefile;
 
 #[macro_use]
@@ -37,6 +39,17 @@ enum TableConversion {
     /// logfile转btreefile
     #[command(arg_required_else_help = true)]
     Logfile2btreefile {
+        /// 待转换路径
+        src: String,
+        /// 目标路径
+        out: String,
+        /// 单次处理数量
+        #[clap(short, long, default_value_t = 10000)]
+        batch: usize,
+    },
+    /// btreefile转logfile
+    #[command(arg_required_else_help = true)]
+    Btreefile2logfile {
         /// 待转换路径
         src: String,
         /// 目标路径
@@ -67,6 +80,17 @@ fn main() {
             let r = conversion(src, out, batch);
 
             println!("conversion r:{:?}, time:{:?}", r, start.elapsed());
+        }
+        TableConversion::Btreefile2logfile { src, out, batch } => {
+            println!("Btreefile2logfile {src} {out}");
+            let start = Instant::now();
+            let r = btreefile2logfile_conversion(src, out, batch);
+
+            println!(
+                "conversion Btreefile2logfile r:{:?}, time:{:?}",
+                r,
+                start.elapsed()
+            );
         }
         TableConversion::Test { path } => {
             // 判断path是否存在
