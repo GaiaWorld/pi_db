@@ -904,7 +904,7 @@ impl<
 
         async move {
             //记录对指定关键字的最新插入或更新操作
-            let _ = tr.0.actions.lock().insert(key.clone(), KVActionLog::DirtyWrite(Some(value.clone())));
+            let _ = tr.0.actions.lock().insert(key.clone(), KVActionLog::Write(Some(value.clone())));
 
             //插入或更新指定的键值对
             let _ = tr.0.cache_mut.lock().upsert(key, Some(value), false);
