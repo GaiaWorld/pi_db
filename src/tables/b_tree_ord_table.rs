@@ -431,15 +431,15 @@ struct InnerBtreeOrderedTable<
     rt:             MultiTaskRuntime<()>,
     //是否允许对有序B树表进行整理压缩
     enable_compact: AtomicBool,
-    //等待异步写日志文件的已提交的有序日志事务列表
+    //等待异步写B树文件持久化确认的已提交的事务列表
     waits:          AsyncMutex<VecDeque<(BtreeOrdTabTr<C, Log>, XHashMap<Binary, KVActionLog>, <BtreeOrdTabTr<C, Log> as Transaction2Pc>::CommitConfirm)>>,
-    //等待异步写日志文件的已提交的有序日志事务的键值对大小
+    //等待写入B树文件的已提交的待确认事务的键值对大小
     waits_size:     AtomicUsize,
-    //等待异步写日志文件的已提交的有序日志事务大小限制
+    //等待写入B树文件的已提交的待确认事务大小限制
     waits_limit:    usize,
-    //等待异步写日志文件的超时时长，单位毫秒
+    //等待异步写B树文件的超时时长，单位毫秒
     wait_timeout:   usize,
-    //是否正在整理等待异步写日志文件的已提交的有序日志事务列表
+    //是否正在整理等待写入B树文件的已提交的待确认事务列表
     collecting:     AtomicBool,
     //表事件通知器
     notifier:       Option<Sender<KVDBEvent<Guid>>>,
@@ -713,7 +713,7 @@ impl<
             };
 
             if tr.is_require_persistence() {
-                //持久化的有序B树表事务，则异步将表的修改写入日志文件后，再确认提交成功
+                //持久化的有序B树表事务，则异步将表的修改写入B树文件后，再确认提交成功
                 let table_copy = tr.0.table.clone();
                 let _ = self.0.table.0.rt.spawn(async move {
                     let mut size = 0;
@@ -868,10 +868,12 @@ impl<
             if let Some(Some(value)) = locked.get(&key) {
                 //指定关键字的值在临时缓存中存在
 
-                println!("!!!!!!query_in_cache, table: {:?}, key: {:?}, value len: {:?}",
-                         self.0.table.name().as_str(),
-                         String::from_utf8_lossy(key.as_ref()),
-                         value.as_ref().len());
+                if self.0.table.name().as_str() == "app/db/bag.CoinBagDb" {
+                    println!("!!!!!!query_in_cache, trans: {:?}, key: {:?}, value len: {:?}",
+                             self.get_transaction_uid(),
+                             key.as_ref(),
+                             value.as_ref().len());
+                }
 
                 return Some(value.clone());
             } else {
@@ -884,10 +886,12 @@ impl<
                     if let Ok(trans) = tr.0.table.0.inner.read().begin_read() {
                         if let Ok(inner_table) = trans.open_table(DEFAULT_TABLE_NAME) {
                             if let Ok(Some(value)) = inner_table.get(&key) {
-                                println!("!!!!!!query_in_redb, table: {:?}, key: {:?}, value len: {:?}",
-                                         self.0.table.name().as_str(),
-                                         String::from_utf8_lossy(key.as_ref()),
-                                         value.value().as_ref().len());
+                                if self.0.table.name().as_str() == "app/db/bag.CoinBagDb" {
+                                    println!("!!!!!!query_in_redb, trans: {:?}, key: {:?}, value len: {:?}",
+                                             self.get_transaction_uid(),
+                                             key.as_ref(),
+                                             value.value().as_ref().len());
+                                }
 
                                 return Some(value.value());
                             }
@@ -917,10 +921,12 @@ impl<
             //记录对指定关键字的最新插入或更新操作
             let _ = tr.0.actions.lock().insert(key.clone(), KVActionLog::Write(Some(value.clone())));
 
-            println!("!!!!!!upsert, table: {:?}, key: {:?}, value len: {:?}",
-                     self.0.table.name().as_str(),
-                     String::from_utf8_lossy(key.as_ref()),
-                     value.as_ref().len());
+            if self.0.table.name().as_str() == "app/db/bag.CoinBagDb" {
+                println!("!!!!!!upsert, trans: {:?}, key: {:?}, value len: {:?}",
+                         self.get_transaction_uid(),
+                         key.as_ref(),
+                         value.as_ref().len());
+            }
 
             //插入或更新指定的键值对
             let _ = tr.0.cache_mut.lock().upsert(key, Some(value), false);
@@ -2066,7 +2072,7 @@ async fn collect_waits<
 
     let now = Instant::now();
     {
-        //在锁保护下迭代当前有序B树表的等待异步写日志文件的已提交的有序日志事务列表
+        //在锁保护下迭代当前有序B树表的等待异步写B树文件的已提交的有序B树文件事务列表
         let mut locked = table
             .0
             .waits
@@ -2219,16 +2225,16 @@ async fn collect_waits<
     table.0.collecting.store(false, Ordering::Release); //设置为已整理结束
 
     //清理已经持久化提交后的关键字在缓存中的值
-    let clean_cache_transaction = table.transaction(Atom::from("Collect_waits_cache"),
-                      false,
-                      false,
-                      5000,
-                      5000);
-    clean_cache_transaction
-        .delete_cache(cache_keys
-            .keys()
-            .map(|key| key.clone())
-            .collect());
+    // let clean_cache_transaction = table.transaction(Atom::from("Collect_waits_cache"),
+    //                   false,
+    //                   false,
+    //                   5000,
+    //                   5000);
+    // clean_cache_transaction
+    //     .delete_cache(cache_keys
+    //         .keys()
+    //         .map(|key| key.clone())
+    //         .collect());
 
     Ok((now.elapsed(), (trs_len, keys_len, bytes_len)))
 }
