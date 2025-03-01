@@ -1,6 +1,6 @@
 use std::{mem, thread};
 use std::path::{Path, PathBuf};
-use std::collections::{VecDeque, HashMap, BTreeMap};
+use std::collections::{VecDeque, HashMap, BTreeMap, hash_map::Entry as HashMapEntry};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use std::sync::{Arc,
@@ -21,6 +21,7 @@ use pi_async_transaction::{AsyncCommitLog,
                            SequenceTransaction,
                            TransactionTree,
                            manager_2pc::Transaction2PcStatus};
+use pi_atom::Atom;
 use futures::{future::{FutureExt, BoxFuture},
               stream::{StreamExt, BoxStream}};
 use parking_lot::{Mutex, RwLock};
@@ -28,7 +29,6 @@ use pi_async_file::file::create_dir;
 use redb::{Key, Value, ReadableTableMetadata, ReadableTable, Builder as TableBuilder, Database, TypeName, TableDefinition, ReadTransaction, WriteTransaction, ReadOnlyTable, Table, Range, Durability, DatabaseError};
 use async_stream::stream;
 use dashmap::DashMap;
-use pi_atom::Atom;
 use pi_guid::Guid;
 use pi_hash::XHashMap;
 use pi_bon::ReadBuffer;
@@ -353,7 +353,7 @@ impl<
             Ok(db) => {
                 let inner = RwLock::new(db);
                 let cache = Mutex::new(OrdMap::new(None));
-                let cache_flags = DashMap::new();
+                let cache_flags = Mutex::new(XHashMap::default());
                 let prepare = Mutex::new(XHashMap::default());
                 let waits = AsyncMutex::new(VecDeque::new());
                 let waits_size = AtomicUsize::new(0);
@@ -428,7 +428,7 @@ struct InnerBtreeOrderedTable<
     //有序B树表的临时缓存，缓存有序B树表两次持久化之间写入的数据，并在有序B树表持久化后清除缓存的数据
     cache:          Mutex<OrdMap<Tree<Binary, Option<Binary>>>>,
     //有序B树表的临时缓存标记
-    cache_flags:    DashMap<Binary, Guid>,
+    cache_flags:    Mutex<XHashMap<Binary, Guid>>,
     //有序B树表的预提交表
     prepare:        Mutex<XHashMap<Guid, XHashMap<Binary, KVActionLog>>>,
     //异步运行时
@@ -682,7 +682,12 @@ impl<
                 //更新有序B树表的临时缓存的根节点
                 if let Some(actions) = actions {
                     {
-                        let mut locked = tr.0.table.0.cache.lock();
+                        let mut cache_flags = tr
+                            .0
+                            .table
+                            .0
+                            .cache_flags.lock(); //首先锁住缓存标记
+                        let mut locked = tr.0.table.0.cache.lock(); //再锁住缓存
                         if !locked.ptr_eq(&tr.0.cache_ref) {
                             //有序B树表的临时缓存的根节点在当前事务执行过程中已改变，
                             //一般是因为其它事务更新了与当前事务无关的关键字，
@@ -695,34 +700,38 @@ impl<
                                             //指定关键字存在，则标记删除
                                             let _ = locked.upsert(key.clone(), None, false);
 
-                                            //标记最新改动的关键字
-                                            tr
-                                                .0
-                                                .table
-                                                .0
-                                                .cache_flags
-                                                .insert(key.clone(),
-                                                        transaction_uid.clone());
+                                            //标记最新删除的关键字
+                                            cache_flags.insert(key.clone(), transaction_uid.clone());
                                         }
                                     },
                                     KVActionLog::Write(Some(value)) | KVActionLog::DirtyWrite(Some(value)) => {
                                         //插入或更新指定关键字
                                         let _ = locked.upsert(key.clone(), Some(value.clone()), false);
 
-                                        //标记最新改动的关键字
-                                        tr
-                                            .0
-                                            .table
-                                            .0
-                                            .cache_flags
-                                            .insert(key.clone(),
-                                                    transaction_uid.clone());
+                                        //标记最新插入或更新的关键字
+                                        cache_flags.insert(key.clone(), transaction_uid.clone());
                                     },
                                     KVActionLog::Read => (), //忽略读操作
                                 }
                             }
                         } else {
                             //有序B树表的临时缓存的根节点在当前事务执行过程中未改变，则用本次事务修改并提交成功的根节点替换有序B树表的临时缓存的根节点
+                            for (key, action) in actions.iter() {
+                                match action {
+                                    KVActionLog::Write(None) | KVActionLog::DirtyWrite(None) => {
+                                        //删除指定关键字
+                                        if let Some(Some(Some(_))) = locked.delete(key, true) {
+                                            //标记最新删除的关键字
+                                            cache_flags.insert(key.clone(), transaction_uid.clone());
+                                        }
+                                    },
+                                    KVActionLog::Write(Some(value)) | KVActionLog::DirtyWrite(Some(value)) => {
+                                        //标记最新插入或更新的关键字
+                                        cache_flags.insert(key.clone(), transaction_uid.clone());
+                                    },
+                                    KVActionLog::Read => (), //忽略读操作
+                                }
+                            }
                             *locked = tr.0.cache_mut.lock().clone();
                         }
                     }
@@ -1534,13 +1543,20 @@ impl<
         let mut require_delete_keys = Vec::with_capacity(keys.len());
 
         //为了减少在锁内阻塞的时间，对需要删除的缓存中的关键字进行预处理
+        let mut cache_flags = self
+            .0
+            .table
+            .0
+            .cache_flags
+            .lock(); //锁住缓存标记
         for (key, transaction_uid) in &keys {
-            if let Some(item) = self.0.table.0.cache_flags.get(key) {
+            if let HashMapEntry::Occupied(mut o) = cache_flags.entry(key.clone()) {
                 if let Some(tid) = transaction_uid {
-                    if item.value() == tid {
+                    if o.get() == tid {
                         //如果当前需要删除的缓存中的关键字是由对应事务写入的，则删除
                         let _ = self.0.cache_mut.lock().delete(key, false);
                         require_delete_keys.push(key);
+                        let _ = o.remove(); //从缓存标记中移除
                     }
                 }
             }
