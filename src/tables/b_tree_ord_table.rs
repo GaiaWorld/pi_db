@@ -353,6 +353,7 @@ impl<
             Ok(db) => {
                 let inner = RwLock::new(db);
                 let cache = Mutex::new(OrdMap::new(None));
+                let cache_flags = DashMap::new();
                 let prepare = Mutex::new(XHashMap::default());
                 let waits = AsyncMutex::new(VecDeque::new());
                 let waits_size = AtomicUsize::new(0);
@@ -363,6 +364,7 @@ impl<
                     path: path.clone(),
                     inner,
                     cache,
+                    cache_flags,
                     prepare,
                     rt,
                     enable_compact: AtomicBool::new(enable_compact),
@@ -425,6 +427,8 @@ struct InnerBtreeOrderedTable<
     inner:          RwLock<Database>,
     //有序B树表的临时缓存，缓存有序B树表两次持久化之间写入的数据，并在有序B树表持久化后清除缓存的数据
     cache:          Mutex<OrdMap<Tree<Binary, Option<Binary>>>>,
+    //有序B树表的临时缓存标记
+    cache_flags:    DashMap<Binary, Guid>,
     //有序B树表的预提交表
     prepare:        Mutex<XHashMap<Guid, XHashMap<Binary, KVActionLog>>>,
     //异步运行时
@@ -690,11 +694,29 @@ impl<
                                         if let Some(Some(Some(_))) = locked.delete(key, true) {
                                             //指定关键字存在，则标记删除
                                             let _ = locked.upsert(key.clone(), None, false);
+
+                                            //标记最新改动的关键字
+                                            tr
+                                                .0
+                                                .table
+                                                .0
+                                                .cache_flags
+                                                .insert(key.clone(),
+                                                        transaction_uid.clone());
                                         }
                                     },
                                     KVActionLog::Write(Some(value)) | KVActionLog::DirtyWrite(Some(value)) => {
                                         //插入或更新指定关键字
                                         let _ = locked.upsert(key.clone(), Some(value.clone()), false);
+
+                                        //标记最新改动的关键字
+                                        tr
+                                            .0
+                                            .table
+                                            .0
+                                            .cache_flags
+                                            .insert(key.clone(),
+                                                    transaction_uid.clone());
                                     },
                                     KVActionLog::Read => (), //忽略读操作
                                 }
@@ -867,14 +889,6 @@ impl<
             let locked = tr.0.cache_mut.lock();
             if let Some(Some(value)) = locked.get(&key) {
                 //指定关键字的值在临时缓存中存在
-
-                if self.0.table.name().as_str() == "app/db/bag.CoinBagDb" {
-                    println!("!!!!!!query_in_cache, trans: {:?}, key: {:?}, value len: {:?}",
-                             self.get_transaction_uid(),
-                             key.as_ref(),
-                             value.as_ref().len());
-                }
-
                 return Some(value.clone());
             } else {
                 if locked.has(&key) {
@@ -886,13 +900,6 @@ impl<
                     if let Ok(trans) = tr.0.table.0.inner.read().begin_read() {
                         if let Ok(inner_table) = trans.open_table(DEFAULT_TABLE_NAME) {
                             if let Ok(Some(value)) = inner_table.get(&key) {
-                                if self.0.table.name().as_str() == "app/db/bag.CoinBagDb" {
-                                    println!("!!!!!!query_in_redb, trans: {:?}, key: {:?}, value len: {:?}",
-                                             self.get_transaction_uid(),
-                                             key.as_ref(),
-                                             value.value().as_ref().len());
-                                }
-
                                 return Some(value.value());
                             }
                         }
@@ -920,13 +927,6 @@ impl<
         async move {
             //记录对指定关键字的最新插入或更新操作
             let _ = tr.0.actions.lock().insert(key.clone(), KVActionLog::Write(Some(value.clone())));
-
-            if self.0.table.name().as_str() == "app/db/bag.CoinBagDb" {
-                println!("!!!!!!upsert, trans: {:?}, key: {:?}, value len: {:?}",
-                         self.get_transaction_uid(),
-                         key.as_ref(),
-                         value.as_ref().len());
-            }
 
             //插入或更新指定的键值对
             let _ = tr.0.cache_mut.lock().upsert(key, Some(value), false);
@@ -1529,9 +1529,21 @@ impl<
     }
 
     // 立即删除缓存中指定关键字的值，只允许在指定关键字的值被持久化后调用
-    pub(crate) fn delete_cache(&self, keys: Vec<<Self as KVAction>::Key>) {
-        for key in &keys {
-            let _ = self.0.cache_mut.lock().delete(key, false);
+    pub(crate) fn delete_cache(&self, keys: Vec<(<Self as KVAction>::Key, Option<Guid>)>) {
+        //记录需要删除的缓存中的关键字，只用于有序B树表的临时缓存的根节点在当前事务执行过程中已改变
+        let mut require_delete_keys = Vec::with_capacity(keys.len());
+
+        //为了减少在锁内阻塞的时间，对需要删除的缓存中的关键字进行预处理
+        for (key, transaction_uid) in &keys {
+            if let Some(item) = self.0.table.0.cache_flags.get(key) {
+                if let Some(tid) = transaction_uid {
+                    if item.value() == tid {
+                        //如果当前需要删除的缓存中的关键字是由对应事务写入的，则删除
+                        let _ = self.0.cache_mut.lock().delete(key, false);
+                        require_delete_keys.push(key);
+                    }
+                }
+            }
         }
 
         //更新有序B树表的临时缓存的根节点
@@ -1541,7 +1553,7 @@ impl<
                 //有序B树表的临时缓存的根节点在当前事务执行过程中已改变，
                 //一般是因为其它事务更新了与当前事务无关的关键字，
                 //则将当前事务的修改直接作用在当前有序B树表的临时缓存中
-                for key in &keys {
+                for key in require_delete_keys {
                     let _ = locked.delete(key, false);
                 }
             } else {
@@ -2119,6 +2131,7 @@ async fn collect_waits<
 
                 while let Some((wait_tr, actions, confirm)) = locked.pop_front()
                 {
+                    let transaction_uid = wait_tr.get_transaction_uid();
                     for (key, actions) in actions.iter() {
                         match actions {
                             KVActionLog::Write(None) | KVActionLog::DirtyWrite(None) => {
@@ -2152,7 +2165,10 @@ async fn collect_waits<
                             KVActionLog::Read => (), //忽略读操作
                         }
 
-                        cache_keys.insert(key.clone(), ()); //记录需要在持久化提交成功后，从缓存中清理的关键字
+                        //记录需要在持久化提交成功后，可能从缓存中清理的关键字
+                        cache_keys
+                            .insert(key.clone(),
+                                    transaction_uid.clone());
                     }
 
                     trs_len += 1;
@@ -2225,16 +2241,13 @@ async fn collect_waits<
     table.0.collecting.store(false, Ordering::Release); //设置为已整理结束
 
     //清理已经持久化提交后的关键字在缓存中的值
-    // let clean_cache_transaction = table.transaction(Atom::from("Collect_waits_cache"),
-    //                   false,
-    //                   false,
-    //                   5000,
-    //                   5000);
-    // clean_cache_transaction
-    //     .delete_cache(cache_keys
-    //         .keys()
-    //         .map(|key| key.clone())
-    //         .collect());
+    let clean_cache_transaction = table.transaction(Atom::from("Collect_waits_cache"),
+                      false,
+                      false,
+                      5000,
+                      5000);
+    clean_cache_transaction
+        .delete_cache(cache_keys.into_iter().collect());
 
     Ok((now.elapsed(), (trs_len, keys_len, bytes_len)))
 }
