@@ -750,6 +750,9 @@ impl<
             }
 
             if let Some(value) = tr.0.root_mut.lock().get(&key) {
+                if tr.0.table.0.name.as_str() == "CoinBagDb" {
+                    info!("!!!!!!query table, key: {:?}, value: {:?}", key.as_ref(), value.as_ref());
+                }
                 //指定关键值存在
                 return Some(value.clone());
             }
