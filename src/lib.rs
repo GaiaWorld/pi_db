@@ -1,4 +1,3 @@
-#![feature(effects)]
 #![feature(fn_traits)]
 #![feature(once_cell)]
 #![feature(const_trait_impl)]

@@ -33,7 +33,7 @@ use pi_atom::Atom;
 use pi_bon::{WriteBuffer, ReadBuffer, Encode, Decode, ReadBonErr};
 use pi_guid::Guid;
 use pi_async_rt::{lock::spin_lock::SpinLock,
-                  rt::{AsyncRuntime, AsyncValueNonBlocking,
+                  rt::{AsyncRuntime, AsyncValue,
                        multi_thread::MultiTaskRuntime}};
 use pi_async_transaction::{AsyncTransaction, Transaction2Pc, UnitTransaction, SequenceTransaction, TransactionTree, AsyncCommitLog, ErrorLevel, TransactionError,
                            manager_2pc::{Transaction2PcStatus, Transaction2PcManager}};
@@ -2719,7 +2719,7 @@ impl<
         }
 
         //并发创建待创建的表
-        let result = AsyncValueNonBlocking::new();
+        let result = AsyncValue::new();
         let count = Arc::new(AtomicU64::new(require_create_tables.len() as u64));
         for (name, meta, options) in require_create_tables.clone() {
             let db_rt = self.0.db_mgr.0.rt.clone();
