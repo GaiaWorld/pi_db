@@ -778,6 +778,7 @@ impl<
                             = <MetaTable<C, Log> as KVTable>::get_all_key_value_from_table_prepare_output(&prepare_output, &table, kvs_len, new_offset);
 
                         if table == meta_table_name {
+                            println!("!!!!!!Repair meta table, name: {:?}, len: {:?}", table.as_str(), writes.len());
                             //未确认的提交日志操作的表是元信息表，则创建或删除表
                             for write in writes {
                                 if let Some(value) = write.value {
@@ -816,6 +817,7 @@ impl<
                                 .lock()
                                 .await
                                 .insert(table.clone(), ());
+                            println!("!!!!!!Repair log table, name: {:?}, len: {:?}", table.as_str(), writes.len());
                             for write in writes {
                                 if write.exist_value() {
                                     //有值，则执行插入或更新操作
