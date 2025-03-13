@@ -755,13 +755,12 @@ impl<
         //构建重播回调
         let db_mgr = self.clone();
 
-        let counter = Arc::new(DashMap::new());
-        let counter_copy = counter.clone();
-
         let tables = Arc::new(Mutex::new(BTreeMap::new()));
         let tables_copy = tables.clone();
         let replay_callback = move |commit_uid: Guid, prepare_output: Vec<u8>| -> IOResult<()> {
             //异步执行重播
+            let counter = Arc::new(DashMap::new());
+            let counter_copy = counter.clone();
             let db_mgr_copy = db_mgr.clone();
             let commit_uid_copy = commit_uid.clone();
             let meta_table_name = Atom::from(DEFAULT_DB_TABLES_META_DIR);
