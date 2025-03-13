@@ -278,18 +278,6 @@ impl<
             let mut table_metas = Vec::with_capacity(table_metas_buf.len());
             swap(&mut table_metas_buf, &mut table_metas);
 
-            let mut log_tables = Vec::new();
-            let mut b_tree_tables = Vec::new();
-            for table_meta in &table_metas {
-                if table_meta.1.table_type.clone() as u8 == 2 {
-                    log_tables.push(table_meta.0.as_str().to_string());
-                } else if table_meta.1.table_type.clone() as u8 == 4 {
-                    b_tree_tables.push(table_meta.0.as_str().to_string());
-                }
-            }
-            println!("!!!!!!log ord table: {:?}, {:?}", log_tables.len(), log_tables);
-            println!("!!!!!!b tree table: {:?}, {:?}", b_tree_tables.len(), b_tree_tables);
-
             //异步批量加载表
             if let Err(e) = tr.create_multiple_tables(table_metas, true).await {
                 //加载指定的表失败，则立即返回错误原因
@@ -300,6 +288,17 @@ impl<
                                               e)));
             }
         }
+        let mut log_tables = Vec::new();
+        let mut b_tree_tables = Vec::new();
+        for table_meta in &table_metas_buf {
+            if table_meta.1.table_type.clone() as u8 == 2 {
+                log_tables.push(table_meta.0.as_str().to_string());
+            } else if table_meta.1.table_type.clone() as u8 == 4 {
+                b_tree_tables.push(table_meta.0.as_str().to_string());
+            }
+        }
+        println!("!!!!!!log ord table: {:?}, {:?}", log_tables.len(), log_tables);
+        println!("!!!!!!b tree table: {:?}, {:?}", b_tree_tables.len(), b_tree_tables);
         if table_metas_buf.len() > 0 {
             //异步批量加载剩余的表
             if let Err(e) = tr.create_multiple_tables(table_metas_buf, true).await {
@@ -755,17 +754,18 @@ impl<
         //构建重播回调
         let db_mgr = self.clone();
 
+        let counter = Arc::new(DashMap::new());
+        let counter_copy = counter.clone();
         let tables = Arc::new(Mutex::new(BTreeMap::new()));
         let tables_copy = tables.clone();
         let replay_callback = move |commit_uid: Guid, prepare_output: Vec<u8>| -> IOResult<()> {
             //异步执行重播
-            let counter = Arc::new(DashMap::new());
-            let counter_copy = counter.clone();
             let db_mgr_copy = db_mgr.clone();
             let commit_uid_copy = commit_uid.clone();
             let meta_table_name = Atom::from(DEFAULT_DB_TABLES_META_DIR);
             let (sender, receiver) = bounded(1);
 
+            let counter_clone = counter_copy.clone();
             let tables_clone = tables_copy.clone();
             let boxed = async move {
                 let bytes_len = prepare_output.len(); //获取日志缓冲区长度
@@ -831,7 +831,7 @@ impl<
                                 .await
                                 .insert(table.clone(), ());
                             for write in writes {
-                                let _ = counter_copy.insert(write.table.as_str().to_string(), ());
+                                let _ = counter_clone.insert(write.table.as_str().to_string(), ());
 
                                 if write.exist_value() {
                                     //有值，则执行插入或更新操作
@@ -897,7 +897,7 @@ impl<
                 },
                 Ok(result) => {
                     //同步阻塞的等待异步重播完成，则立即返回重播结果
-                    println!("!!!!!!counter: {:?}, {:#?}", counter.len(), counter);
+                    println!("!!!!!!counter: {:?}, {:#?}", counter_copy.len(), &counter_copy);
                     result
                 },
             }
