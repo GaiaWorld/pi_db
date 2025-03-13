@@ -281,9 +281,9 @@ impl<
             let mut log_tables = Vec::new();
             let mut b_tree_tables = Vec::new();
             for table_meta in &table_metas {
-                if table_meta.1.table_type.clone().into() == 2u8 {
+                if table_meta.1.table_type.clone() as u8 == 2 {
                     log_tables.push(table_meta.0.as_str().to_string());
-                } else if table_meta.1.table_type.clone().into() == 4u8 {
+                } else if table_meta.1.table_type.clone() as u8 == 4 {
                     b_tree_tables.push(table_meta.0.as_str().to_string());
                 }
             }
