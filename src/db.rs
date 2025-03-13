@@ -278,6 +278,18 @@ impl<
             let mut table_metas = Vec::with_capacity(table_metas_buf.len());
             swap(&mut table_metas_buf, &mut table_metas);
 
+            let mut log_tables = Vec::new();
+            let mut b_tree_tables = Vec::new();
+            for table_meta in &table_metas {
+                if table_meta.1.table_type.clone().into() == 2u8 {
+                    log_tables.push(table_meta.0.as_str().to_string());
+                } else if table_meta.1.table_type.clone().into() == 4u8 {
+                    b_tree_tables.push(table_meta.0.as_str().to_string());
+                }
+            }
+            println!("!!!!!!log ord table: {:?}, {:?}", log_tables.len(), log_tables);
+            println!("!!!!!!b tree table: {:?}, {:?}", b_tree_tables.len(), b_tree_tables);
+
             //异步批量加载表
             if let Err(e) = tr.create_multiple_tables(table_metas, true).await {
                 //加载指定的表失败，则立即返回错误原因
@@ -743,6 +755,9 @@ impl<
         //构建重播回调
         let db_mgr = self.clone();
 
+        let counter = Arc::new(DashMap::new());
+        let counter_copy = counter.clone();
+
         let tables = Arc::new(Mutex::new(BTreeMap::new()));
         let tables_copy = tables.clone();
         let replay_callback = move |commit_uid: Guid, prepare_output: Vec<u8>| -> IOResult<()> {
@@ -778,7 +793,6 @@ impl<
                             = <MetaTable<C, Log> as KVTable>::get_all_key_value_from_table_prepare_output(&prepare_output, &table, kvs_len, new_offset);
 
                         if table == meta_table_name {
-                            println!("!!!!!!Repair meta table, name: {:?}, len: {:?}", table.as_str(), writes.len());
                             //未确认的提交日志操作的表是元信息表，则创建或删除表
                             for write in writes {
                                 if let Some(value) = write.value {
@@ -817,8 +831,9 @@ impl<
                                 .lock()
                                 .await
                                 .insert(table.clone(), ());
-                            println!("!!!!!!Repair log table, name: {:?}, len: {:?}", table.as_str(), writes.len());
                             for write in writes {
+                                let _ = counter_copy.insert(write.table.as_str().to_string(), ());
+
                                 if write.exist_value() {
                                     //有值，则执行插入或更新操作
                                     if let Err(e) = tr.upsert(vec![write]).await {
@@ -883,6 +898,7 @@ impl<
                 },
                 Ok(result) => {
                     //同步阻塞的等待异步重播完成，则立即返回重播结果
+                    println!("!!!!!!counter: {:?}, {:#?}", counter.len(), counter);
                     result
                 },
             }
