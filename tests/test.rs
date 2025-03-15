@@ -4022,6 +4022,57 @@ fn test_commit_log_inspector() {
     thread::sleep(Duration::from_millis(1000000000));
 }
 
+// 需要先有提交日志
+#[test]
+fn test_commit_log_inspector_with_callback() {
+    use std::thread;
+    use std::time::Duration;
+    use chrono::{TimeZone, FixedOffset, Utc};
+    use std::sync::{Arc,
+                    atomic::{AtomicUsize, Ordering}};
+
+    let _handle = startup_global_time_loop(100);
+    let builder = MultiTaskRuntimeBuilder::default();
+    let rt = builder.build();
+
+    let rt_copy = rt.clone();
+    rt.spawn(async move {
+        let commit_logger_builder = CommitLoggerBuilder::new(rt_copy.clone(), "./.commit_log");
+        let commit_logger = commit_logger_builder
+            .log_file_limit(1024)
+            .build()
+            .await
+            .unwrap();
+
+        let offset = FixedOffset::east_opt(8 * 3600).unwrap();
+        let mut count = Arc::new(AtomicUsize::new(0));
+        let inspector = CommitLogInspector::new(rt_copy, commit_logger);
+        inspector.begin_with_callback(move |event| {
+            if let Some((tid, cid, table, method, time, key, value)) = event {
+                let datetime = Utc
+                    .timestamp_millis_opt(time as i64)
+                    .single()
+                    .unwrap();
+                let datetime_ = datetime.with_timezone(&offset);
+
+                println!("Inspect commit log, tid: {:?}, cid: {:?}, table: {:?}, method: {:?}, time: {:?}, key: {:?}, value: {:?}",
+                         tid,
+                         cid,
+                         table,
+                         method,
+                         datetime_,
+                         key.len(),
+                         value.len());
+                count.fetch_add(1, Ordering::AcqRel);
+            } else {
+                println!("Inspect commit log already finished, count: {:?}", count.load(Ordering::Acquire));
+            }
+        });
+    });
+
+    thread::sleep(Duration::from_millis(1000000000));
+}
+
 // 先执行test_multi_tables_repair，并等待写入表文件
 #[test]
 fn test_log_table_inspector() {

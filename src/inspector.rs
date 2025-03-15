@@ -2,14 +2,15 @@ use std::fmt::Debug;
 use std::convert::TryInto;
 use std::path::{Path, PathBuf};
 use std::io::{Error, Result, ErrorKind};
-use std::sync::{Arc, atomic::{AtomicIsize, Ordering}};
+use std::sync::{Arc,
+                atomic::{AtomicIsize, Ordering}};
 
 use crossbeam_channel::{Sender, Receiver, bounded};
 
 use pi_atom::Atom;
 use pi_async_rt::rt::{AsyncRuntime, multi_thread::MultiTaskRuntime};
 use pi_async_transaction::AsyncCommitLog;
-use pi_store::{commit_logger::CommitLogger,
+use pi_store::{commit_logger::{CommitLoggerExt, CommitLogger},
                log_store::log_file::{PairLoader, LogMethod, LogFile}};
 use pi_guid::Guid;
 
@@ -215,6 +216,146 @@ impl CommitLogInspector {
                 }
             },
         }
+    }
+
+    /// 注册回调，并开始侦听
+    pub fn begin_with_callback(&self,
+                               callback: impl Fn(Option<(Guid, Guid, String, LogMethod, u64, Vec<u8>, Vec<u8>)>) + Send + Sync + 'static)
+        -> bool
+    {
+        match self.status.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed) {
+            Err(_) => {
+                //不允许正在侦听时，开始侦听
+                return false;
+            },
+            Ok(_) => {
+                //侦听未开始，则开始侦听
+                ()
+            },
+        }
+
+        let inspect_callback = move |response: Option<(Guid, LogMethod, u64, Vec<u8>)>| -> Result<()>
+            {
+                let (commit_uid,
+                    method,
+                    time,
+                    prepare_output) = if let Some(response) = response
+                {
+                    response
+                } else {
+                    //侦听已完成
+                    callback(None);
+                    return Ok(());
+                };
+
+                let meta_table_name = Atom::from(DEFAULT_DB_TABLES_META_DIR);
+                let bytes_len = prepare_output.len(); //获取日志缓冲区长度
+                let mut offset = 0; //日志缓冲区偏移
+                let bytes = prepare_output.as_slice();
+                let uid = u128::from_le_bytes(bytes[0..16].try_into().unwrap()); //获取事务唯一id
+                let transaciton_uid = Guid(uid);
+                offset += 16; //移动缓冲区指针
+
+                //迭代日志缓冲区中，本次未确认的提交日志中执行写操作的表和相关键值对
+                while offset < bytes_len {
+                    //获取表名、操作的键值对数量和新的日志缓冲区偏移
+                    let (table, kvs_len, new_offset) =
+                        <MetaTable<usize, CommitLogger> as KVTable>::get_init_table_prepare_output(&prepare_output, offset);
+
+                    //获取操作的表键值列表和新的日志缓冲区偏移
+                    let (writes, new_offset)
+                        = <MetaTable<usize, CommitLogger> as KVTable>::get_all_key_value_from_table_prepare_output(&prepare_output, &table, kvs_len, new_offset);
+
+                    if table == meta_table_name {
+                        //未确认的提交日志操作的表是元信息表
+                        for write in writes {
+                            if let Some(value) = write.value {
+                                //有值，则创建表
+                                let table_name = match binary_to_table(&write.key) {
+                                    Err(e) => {
+                                        //反序列化表名失败
+                                        return Err(Error::new(ErrorKind::Other,
+                                                              format!("From binary to table name failed, reason: {:?}",
+                                                                      e)));
+                                    },
+                                    Ok(table_name) => {
+                                        //反序列化表名成功
+                                        table_name
+                                    }
+                                };
+                                let table_meta = KVTableMeta::from(value);
+
+                                //回调元信息表的插入日志
+                                let response = Some((transaciton_uid.clone(),
+                                                     commit_uid.clone(),
+                                                     meta_table_name.as_str().to_string(),
+                                                     method,
+                                                     time,
+                                                     table_name.as_str().as_bytes().to_vec(),
+                                                     format!("{:?}", table_meta).as_bytes().to_vec()));
+                                callback(response);
+                            } else {
+                                //无值，则删除表
+                                let table_name = Atom::from(write.key.as_ref());
+
+                                //回调元信息表的删除日志
+                                let response = Some((transaciton_uid.clone(),
+                                                     commit_uid.clone(),
+                                                     meta_table_name.as_str().to_string(),
+                                                     method,
+                                                     time,
+                                                     table_name.as_str().as_bytes().to_vec(),
+                                                     vec![0]));
+                                callback(response);
+                            }
+                        }
+                    } else {
+                        //未确认的提交日志操作的表是其它表
+                        for write in writes {
+                            if write.exist_value() {
+                                //有值则回调用户表的插入日志
+                                let response = Some((transaciton_uid.clone(),
+                                                     commit_uid.clone(),
+                                                     write.table.as_str().to_string(),
+                                                     method,
+                                                     time,
+                                                     write.key.as_ref().to_vec(),
+                                                     write.value.unwrap().as_ref().to_vec()));
+                                callback(response);
+                            } else {
+                                //无值，则回调用户表的删除日志
+                                let response = Some((transaciton_uid.clone(),
+                                                     commit_uid.clone(),
+                                                     write.table.as_str().to_string(),
+                                                     method,
+                                                     time,
+                                                     write.key.as_ref().to_vec(),
+                                                     vec![0]));
+                                callback(response);
+                            }
+                        }
+                    }
+
+                    //更新日志缓冲区偏移
+                    offset = new_offset;
+                }
+
+                Ok(())
+            };
+
+        let logger = self.logger.clone();
+        let status = self.status.clone();
+        let _ = self.rt.spawn(async move {
+            let _ = logger.start_replay_ext(Arc::new(inspect_callback)).await;
+
+            //侦听已结束
+            let _ = status.compare_exchange(1,
+                                            0,
+                                            Ordering::Acquire,
+                                            Ordering::Relaxed);
+        });
+
+        true
     }
 }
 
