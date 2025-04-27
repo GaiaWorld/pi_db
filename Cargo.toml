@@ -1,6 +1,6 @@
 [package]
 name = "pi_db"
-version = "0.11.1"
+version = "0.12.0"
 authors = ["vmos <vmosone007@gmail.com>"]
 edition = "2021"
 description = "Full cache based database，support transaction"
@@ -26,10 +26,10 @@ pi_atom = "~0.6"
 log = "~0.4"
 pi-async-rt = "~0.2"
 pi_async_file = "~0.7"
-pi_async_transaction = "~0.9"
-pi_store = { version = "~0.7", path = "../pi_store" }
+pi_async_transaction = "~0.10"
+pi_store = { version = "~0.8", path = "../pi_store" }
 pi_guid = "~0.1"
-pi_bon = "~0.2"
+pi_bon = "~0.3"
 pi_sinfo = "~0.5"
 pi_ordmap = "~0.2"
 pi_hash = "~0.1"

@@ -421,7 +421,7 @@ impl<
                                -> Self::Output {
         if let Err(e) = args.2 {
             //键值对数据库事务的子事务的异步提交错误
-            if let ErrorLevel::Fatal = &e.level {
+            if let ErrorLevel::Fatal = &e.level() {
                 //忽略提交的严重错误
                 return Err(e);
             }
@@ -497,9 +497,9 @@ static COMMITED_LEN: AtomicUsize = AtomicUsize::new(0);
 /// 键值对数据库事务错误
 ///
 #[derive(Debug)]
-pub struct KVTableTrError {
-    level:  ErrorLevel, //事务错误级别
-    reason: String,     //事务错误原因
+pub enum KVTableTrError {
+    Common(ErrorLevel, String), //普通错误
+    Conflicts(Atom, Binary),    //预提交冲突错误
 }
 
 unsafe impl Send for KVTableTrError {}
@@ -507,25 +507,60 @@ unsafe impl Sync for KVTableTrError {}
 
 impl TransactionError for KVTableTrError {
     fn new_transaction_error<E>(level: ErrorLevel, reason: E) -> Self
-        where E: Debug + Sized + 'static {
-        KVTableTrError {
+        where E: Debug + Sized + 'static
+    {
+        KVTableTrError::Common(
             level,
-            reason: format!("Table transaction error, reason: {:?}", reason),
-        }
+            format!("Table transaction error, reason: {:?}", reason),
+        )
     }
 }
 
 impl KVTableTrError {
+    /// 构建一个预提交冲突错误
+    pub fn new_conflicts_error(table: Atom, key: Binary) -> Self {
+        KVTableTrError::Conflicts(
+            table.as_ref().into(),
+            Binary::from_slice(key),
+        )
+    }
+
+    /// 判断是否是普通错误
+    pub fn is_common(&self) -> bool {
+        if let Self::Common(_, _) = self {
+            true
+        } else {
+            false
+        }
+    }
+
+    /// 判断是否是预提交冲突
+    pub fn is_conflicts(&self) -> bool {
+        if let Self::Conflicts(_, _) = self {
+            true
+        } else {
+            false
+        }
+    }
+
     /// 获取错误等级
     pub fn level(&self) -> ErrorLevel {
-        self.level.clone()
+        if let Self::Common(level, _) = self {
+            level.clone()
+        } else {
+            ErrorLevel::Normal
+        }
+    }
+
+    /// 获取预提交冲突的首个表名和关键字
+    pub fn conflicts(&self) -> Option<(&Atom, &Binary)> {
+        if let Self::Conflicts(table, binary) = self {
+            Some((table, binary))
+        } else {
+            None
+        }
     }
 }
-
-
-
-
-
 
 use std::sync::OnceLock;
 static TRANSACTION_DEBUG_LOGGER: OnceLock<TransactionDebugLogger> = OnceLock::new();

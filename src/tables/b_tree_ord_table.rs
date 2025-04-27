@@ -659,6 +659,84 @@ impl<
         }.boxed()
     }
 
+    fn prepare_conflicts(&self) -> BoxFuture<Result<Option<<Self as Transaction2Pc>::PrepareOutput>, <Self as Transaction2Pc>::PrepareError>> {
+        //开始预提交
+        let tr = self.clone();
+
+        async move {
+            if tr.is_writable() {
+                //可写事务预提交
+                #[allow(unused_assignments)]
+                let mut write_buf = None; //默认的写操作缓冲区
+
+                {
+                    //同步锁住有序B树表的预提交表，并进行预提交表的检查和修改
+                    let mut prepare_locked = tr.0.table.0.prepare.lock();
+
+                    //将事务的操作记录与表的预提交表进行比较
+                    let mut buf = Vec::new();
+                    let mut writed_count = 0;
+                    for (_key, action) in tr.0.actions.lock().iter() {
+                        match action {
+                            KVActionLog::Write(_) | KVActionLog::DirtyWrite(_) => {
+                                //对指定关键字进行了写操作，则增加本次事务写操作计数
+                                writed_count += 1;
+                            }
+                            KVActionLog::Read => (), //忽略指定关键字的读操作计数
+                        }
+                    }
+                    tr
+                        .0
+                        .table
+                        .init_table_prepare_output(&mut buf,
+                                                   writed_count); //初始化本次表事务的预提交输出缓冲区
+
+                    let init_buf_len = buf.len(); //获取初始化本次表事务的预提交输出缓冲区后，缓冲区的长度
+                    for (key, action) in tr.0.actions.lock().iter() {
+                        tr.check_prepare_conflict_result(&mut prepare_locked,
+                                                         key,
+                                                         action)?;
+
+                        if !action.is_dirty_writed() {
+                            //非脏写操作需要对根节点冲突进行检查
+                            tr.check_root_conflict_result(key)?;
+                        }
+
+                        //指定关键字的操作预提交成功，则将写操作写入预提交缓冲区
+                        match action {
+                            KVActionLog::Write(None) | KVActionLog::DirtyWrite(None) => {
+                                tr.0.table.append_key_value_to_table_prepare_output(&mut buf, key, None);
+                            },
+                            KVActionLog::Write(Some(value)) | KVActionLog::DirtyWrite(Some(value)) => {
+                                tr.0.table.append_key_value_to_table_prepare_output(&mut buf, key, Some(value));
+                            },
+                            _ => (), //忽略读操作
+                        }
+                    }
+
+                    if buf.len() <= init_buf_len {
+                        //本次事务没有对本地表的写操作，则设置写操作缓冲区为空
+                        write_buf = None;
+                    } else {
+                        //本次事务有对本地表的写操作，则写操作缓冲区为指定的预提交缓冲区
+                        write_buf = Some(buf);
+                    }
+
+                    //获取事务的当前操作记录，并重置事务的当前操作记录
+                    let actions = mem::replace(&mut *tr.0.actions.lock(), XHashMap::default());
+
+                    //将事务的当前操作记录，写入表的预提交表
+                    prepare_locked.insert(tr.get_transaction_uid().unwrap(), actions);
+                }
+
+                Ok(write_buf)
+            } else {
+                //只读事务，则不需要同步锁住有序B树表的预提交表，并立即返回
+                Ok(None)
+            }
+        }.boxed()
+    }
+
     fn commit(&self, confirm: <Self as Transaction2Pc>::CommitConfirm)
               -> BoxFuture<Result<<Self as AsyncTransaction>::Output, <Self as AsyncTransaction>::Error>>
     {
@@ -1414,6 +1492,55 @@ impl<
         Ok(())
     }
 
+    // 检查有序B树表的预提交表的读写冲突
+    fn check_prepare_conflict_result(&self,
+                                     prepare: &mut XHashMap<Guid, XHashMap<Binary, KVActionLog>>,
+                                     key: &Binary,
+                                     action: &KVActionLog)
+        -> Result<(), KVTableTrError>
+    {
+        for (_guid, actions) in prepare.iter() {
+            match actions.get(key) {
+                Some(KVActionLog::Read) => {
+                    match action {
+                        KVActionLog::Read | KVActionLog::DirtyWrite(_) => {
+                            //本地预提交事务对相同的关键字也执行了读操作或脏写操作，则不存在读写冲突，并继续检查预提交表中是否存在读写冲突
+                            continue;
+                        },
+                        KVActionLog::Write(_) => {
+                            //本地预提交事务对相同的关键字执行了写操作，则存在读写冲突
+                            return Err(<Self as Transaction2Pc>::PrepareError::new_conflicts_error(self.0.table.name().clone(),
+                                                                                                   key.clone()));
+                        },
+                    }
+                },
+                Some(KVActionLog::DirtyWrite(_)) => {
+                    //有序B树表的预提交表中的一个预提交事务与本地预提交事务操作了相同的关键字，且是脏写操作，则不存在读写冲突，并继续检查预提交表中是否存在读写冲突
+                    continue;
+                },
+                Some(KVActionLog::Write(_)) => {
+                    match action {
+                        KVActionLog::DirtyWrite(_) => {
+                            //本地预提交事务对相同的关键字也执行了脏写操作，则不存在读写冲突，并继续检查预提交表中是否存在读写冲突
+                            continue;
+                        },
+                        _ => {
+                            //有序B树表的预提交表中的一个预提交事务与本地预提交事务操作了相同的关键字，且是写操作，则存在读写冲突
+                            return Err(<Self as Transaction2Pc>::PrepareError::new_conflicts_error(self.0.table.name().clone(),
+                                                                                                   key.clone()));
+                        },
+                    }
+                },
+                None => {
+                    //有序B树表的预提交表中没有任何预提交事务与本地预提交事务操作了相同的关键字，则不存在读写冲突，并继续检查预提交表中是否存在读写冲突
+                    continue;
+                },
+            }
+        }
+
+        Ok(())
+    }
+
     // 检查有序B树表的临时缓存的根节点冲突
     fn check_root_conflict(&self, key: &Binary) -> Result<(), KVTableTrError> {
         let b = self.0.table.0.cache.lock().ptr_eq(&self.0.cache_ref);
@@ -1490,6 +1617,77 @@ impl<
                                                                                                              self.0.source,
                                                                                                              self.get_transaction_uid(),
                                                                                                              self.get_prepare_uid())));
+                        },
+                    }
+                },
+            }
+        }
+
+        Ok(())
+    }
+
+    // 检查有序B树表的临时缓存的根节点冲突
+    fn check_root_conflict_result(&self, key: &Binary) -> Result<(), KVTableTrError> {
+        let b = self.0.table.0.cache.lock().ptr_eq(&self.0.cache_ref);
+        if !b {
+            //有序B树表的临时缓存的根节点在当前事务执行过程中已改变
+            let key = key.clone();
+            match self.0.table.0.cache.lock().get(&key) {
+                None => {
+                    //事务的当前操作记录中的关键字，在当前表中不存在
+                    match self.0.cache_ref.get(&key) {
+                        None => {
+                            //事务的当前操作记录中的关键字，在事务创建时的表中也不存在
+                            //表示此关键字是在当前事务内新增的，则此关键字的操作记录可以预提交
+                            //并继续其它关键字的操作记录的预提交
+                            ()
+                        },
+                        _ => {
+                            //事务的当前操作记录中的关键字，在事务创建时的表中已存在
+                            //表示此关键字在当前事务执行过程中被删除，则此关键字的操作记录不允许预提交
+                            //并立即返回当前事务预提交冲突
+                            return Err(<Self as Transaction2Pc>::PrepareError::new_conflicts_error(self.0.table.name().clone(),
+                                                                                                   key.clone()));
+                        },
+                    }
+                },
+                Some(root_value) => {
+                    //事务的当前操作记录中的关键字，在当前表中已存在
+                    match self.0.cache_ref.get(&key) {
+                        Some(copy_value) => {
+                            if root_value.is_some() && copy_value.is_some() {
+                                //值都不为空，则比较内容
+                                if Binary::binary_equal(root_value.as_ref().unwrap(), copy_value.as_ref().unwrap()) {
+                                    //事务的当前操作记录中的关键字，在事务创建时的表中也存在，且值引用相同
+                                    //表示此关键字在当前事务执行过程中未改变，且值也未改变，则此关键字的操作记录允许预提交
+                                    //并继续其它关键字的操作记录的预提交
+                                    ()
+                                } else {
+                                    //事务的当前操作记录中的关键字，与事务创建时的表中的关键字不匹配
+                                    //表示此关键字在当前事务执行过程中未改变，但值已改变，则此关键字的操作记录不允许预提交
+                                    //并立即返回当前事务预提交冲突
+                                    return Err(<Self as Transaction2Pc>::PrepareError::new_conflicts_error(self.0.table.name().clone(),
+                                                                                                           key.clone()));
+                                }
+                            } else if root_value.is_none() && copy_value.is_none() {
+                                //事务的当前操作记录中的关键字，在事务创建时的表中也存在，且值引用相同
+                                //表示此关键字在当前事务执行过程中未改变，且值也未改变，则此关键字的操作记录允许预提交
+                                //并继续其它关键字的操作记录的预提交
+                                ()
+                            } else {
+                                //事务的当前操作记录中的关键字，与事务创建时的表中的关键字不匹配
+                                //表示此关键字在当前事务执行过程中未改变，但值已改变，则此关键字的操作记录不允许预提交
+                                //并立即返回当前事务预提交冲突
+                                return Err(<Self as Transaction2Pc>::PrepareError::new_conflicts_error(self.0.table.name().clone(),
+                                                                                                       key.clone()));
+                            }
+                        },
+                        _ => {
+                            //事务的当前操作记录中的关键字，与事务创建时的表中的关键字不匹配
+                            //表示此关键字在当前事务执行过程中未改变，但值已改变，则此关键字的操作记录不允许预提交
+                            //并立即返回当前事务预提交冲突
+                            return Err(<Self as Transaction2Pc>::PrepareError::new_conflicts_error(self.0.table.name().clone(),
+                                                                                                   key.clone()));
                         },
                     }
                 },

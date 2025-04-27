@@ -1975,6 +1975,16 @@ impl<
         }
     }
 
+    /// 在键值对数据库事务的根事务内，异步预提交本次事务对键值对数据库的所有修改，成功返回预提交的输出，失败返回预提交冲突的首个表名和关键字
+    pub async fn prepare_conflicts(&self) -> Result<Vec<u8>, KVTableTrError> {
+        match self {
+            KVDBTransaction::RootTr(tr) => {
+                tr.prepare_conflicts().await
+            },
+            _ => panic!("Prepare conflicts db failed, reason: invalid root transaction"),
+        }
+    }
+
     /// 在键值对数据库事务的根事务内，异步提交本次事务对键值对数据库的所有修改
     pub async fn commit_modified(&self,
                                  prepare_output: Vec<u8>) -> Result<(), KVTableTrError> {
@@ -3800,7 +3810,61 @@ impl<
             .await {
             Err(e) => {
                 //预提交键值对数据库的根事务失败，则立即返回错误原因
+                Err(e)
+            },
+            Ok(prepare_output) => {
+                //预提交键值对数据库的根事务成功
+                if self.is_require_persistence() {
+                    //本次键值对数据库的根事务，需要持久化
+                    if let Some(output) = prepare_output {
+                        //键值对数据库的预提交事务，有返回预提交输出
+                        if output.len() > 16 {
+                            //有效的预提交输出，根事务需要持久化，且至少有一个子事务需要持久化
+                            Ok(output)
+                        } else {
+                            //无效的预提交输出，根事务需要持久化，但所有子事务不需要持久化
+                            Ok(vec![])
+                        }
+                    } else {
+                        //预提交键值对数据库的子事务，没有返回预提交输出
+                        Ok(vec![])
+                    }
+                } else {
+                    //本次键值对数据库的根事务，不需要持久化
+                    Ok(vec![])
+                }
+            },
+        }
+    }
+
+    /// 异步预提交本次事务对键值对数据库的所有修改，成功返回预提交的输出，失败返回预提交冲突的首个表名和关键字
+    #[inline]
+    async fn prepare_conflicts(&self) -> Result<Vec<u8>, KVTableTrError> {
+        if self.get_status() != Transaction2PcStatus::Rollbacked {
+            //本次事务的当前状态只要不为回滚成功，则先初始化键值对数据库的根事务
+            if let Err(e) = self
+                .0
+                .db_mgr
+                .0
+                .tr_mgr
+                .start(KVDBTransaction::RootTr(self.clone()))
+                .await {
+                //初始化键值对数据库的根事务失败，则立即返回错误原因
                 return Err(e);
+            }
+        }
+
+        //预提交键值对数据库的根事务
+        match self
+            .0
+            .db_mgr
+            .0
+            .tr_mgr
+            .prepare(KVDBTransaction::RootTr(self.clone()))
+            .await {
+            Err(e) => {
+                //预提交键值对数据库的根事务失败，则立即返回错误原因
+                Err(e)
             },
             Ok(prepare_output) => {
                 //预提交键值对数据库的根事务成功
