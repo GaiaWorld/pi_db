@@ -3860,7 +3860,7 @@ impl<
             .db_mgr
             .0
             .tr_mgr
-            .prepare(KVDBTransaction::RootTr(self.clone()))
+            .prepare_conflicts(KVDBTransaction::RootTr(self.clone()))
             .await {
             Err(e) => {
                 //预提交键值对数据库的根事务失败，则立即返回错误原因
