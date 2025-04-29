@@ -1470,6 +1470,93 @@ impl<
         }
     }
 
+    fn prepare_conflicts(&self)
+        -> BoxFuture<Result<Option<<Self as Transaction2Pc>::PrepareOutput>, <Self as Transaction2Pc>::PrepareError>> {
+        #[cfg(feature = "trace")]
+        {
+            let mut carrier = HashMap::new();
+            carrier.insert(
+                "traceparent".to_string(),
+                self.get_source().as_str().to_string(),
+            );
+            let propagator = TraceContextPropagator::new();
+            let parent_context = propagator.extract(&carrier);
+            let cid = self.get_transaction_uid();
+            let span = tracing::debug_span!("db_prepare",
+                tid = cid.clone().unwrap_or(Guid(0)).0,
+                cid = self.get_commit_uid().unwrap_or(Guid(0)).0,
+                status = self.get_status() as u8);
+            span.set_parent(parent_context);
+
+            if let Some(key) = cid {
+                //当前事务的事务id存在，则记录预提交Span的上下文
+                let context = span.context();
+                TransactionSpans.insert(key, context);
+            }
+
+            match self {
+                KVDBTransaction::RootTr(tr) => {
+                    return tr
+                        .prepare_conflicts()
+                        .instrument(span)
+                        .boxed();
+                },
+                KVDBTransaction::MetaTabTr(tr) => {
+                    return tr
+                        .prepare_conflicts()
+                        .instrument(span)
+                        .boxed();
+                },
+                KVDBTransaction::MemOrdTabTr(tr) => {
+                    return tr
+                        .prepare_conflicts()
+                        .instrument(span)
+                        .boxed();
+                },
+                KVDBTransaction::LogOrdTabTr(tr) => {
+                    return tr
+                        .prepare_conflicts()
+                        .instrument(span)
+                        .boxed();
+                },
+                KVDBTransaction::LogWTabTr(tr) => {
+                    return tr
+                        .prepare_conflicts()
+                        .instrument(span)
+                        .boxed();
+                },
+                KVDBTransaction::BtreeOrdTabTr(tr) => {
+                    return tr
+                        .prepare_conflicts()
+                        .instrument(span)
+                        .boxed();
+                },
+            }
+        }
+
+        #[cfg(feature = "default")]
+        match self {
+            KVDBTransaction::RootTr(tr) => {
+                tr.prepare_conflicts()
+            },
+            KVDBTransaction::MetaTabTr(tr) => {
+                tr.prepare_conflicts()
+            },
+            KVDBTransaction::MemOrdTabTr(tr) => {
+                tr.prepare_conflicts()
+            },
+            KVDBTransaction::LogOrdTabTr(tr) => {
+                tr.prepare_conflicts()
+            },
+            KVDBTransaction::LogWTabTr(tr) => {
+                tr.prepare_conflicts()
+            },
+            KVDBTransaction::BtreeOrdTabTr(tr) => {
+                tr.prepare_conflicts()
+            },
+        }
+    }
+
     fn commit(&self, confirm: <Self as Transaction2Pc>::CommitConfirm)
               -> BoxFuture<Result<<Self as AsyncTransaction>::Output, <Self as AsyncTransaction>::Error>> {
         #[cfg(feature = "trace")]
@@ -1976,10 +2063,10 @@ impl<
     }
 
     /// 在键值对数据库事务的根事务内，异步预提交本次事务对键值对数据库的所有修改，成功返回预提交的输出，失败返回预提交冲突的首个表名和关键字
-    pub async fn prepare_conflicts(&self) -> Result<Vec<u8>, KVTableTrError> {
+    pub async fn prepare_modified_conflicts(&self) -> Result<Vec<u8>, KVTableTrError> {
         match self {
             KVDBTransaction::RootTr(tr) => {
-                tr.prepare_conflicts().await
+                tr.prepare_modified_conflicts().await
             },
             _ => panic!("Prepare conflicts db failed, reason: invalid root transaction"),
         }
@@ -2215,6 +2302,10 @@ impl<
                 Ok(None)
             }
         }.boxed()
+    }
+
+    fn prepare_conflicts(&self) -> BoxFuture<Result<Option<<Self as Transaction2Pc>::PrepareOutput>, <Self as Transaction2Pc>::PrepareError>> {
+        self.prepare()
     }
 
     fn commit(&self, _confirm: <Self as Transaction2Pc>::CommitConfirm)
@@ -3839,7 +3930,7 @@ impl<
 
     /// 异步预提交本次事务对键值对数据库的所有修改，成功返回预提交的输出，失败返回预提交冲突的首个表名和关键字
     #[inline]
-    async fn prepare_conflicts(&self) -> Result<Vec<u8>, KVTableTrError> {
+    async fn prepare_modified_conflicts(&self) -> Result<Vec<u8>, KVTableTrError> {
         if self.get_status() != Transaction2PcStatus::Rollbacked {
             //本次事务的当前状态只要不为回滚成功，则先初始化键值对数据库的根事务
             if let Err(e) = self
