@@ -1059,7 +1059,7 @@ impl<
         -> BoxStream<'a, <Self as KVAction>::Key>
     {
         let transaction = self.clone();
-        let ptr = Box::into_raw(Box::new(self.0.table.0.cache.lock().iter(key.as_ref(), descending))) as usize;
+        let ptr = Box::into_raw(Box::new(self.0.cache_mut.lock().iter(key.as_ref(), descending))) as usize;
         let stream = stream! {
             let trans = match transaction.0.table.0.inner.read().begin_read() {
                 Err(e) => {
@@ -1224,7 +1224,7 @@ impl<
         -> BoxStream<'a, (<Self as KVAction>::Key, <Self as KVAction>::Value)>
     {
         let transaction = self.clone();
-        let ptr = Box::into_raw(Box::new(self.0.table.0.cache.lock().iter(key.as_ref(), descending))) as usize;
+        let ptr = Box::into_raw(Box::new(self.0.cache_mut.lock().iter(key.as_ref(), descending))) as usize;
         let stream = stream! {
             let trans = match transaction.0.table.0.inner.read().begin_read() {
                 Err(e) => {
