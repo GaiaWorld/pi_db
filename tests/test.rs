@@ -3668,6 +3668,10 @@ fn test_b_tree_table_conflict() {
 
                     if let Ok(output) = tr.prepare_modified().await {
                         tr.commit_modified(output).await.is_ok();
+                        println!("Waiting init...");
+                        rt_copy.timeout(65000).await;
+                    } else {
+                        panic!("Init failed");
                     }
                 }
 
@@ -3692,7 +3696,11 @@ fn test_b_tree_table_conflict() {
                                     value: None
                                 }
                             ]).await;
-                            let last_value = binary_to_usize((&r[0]).as_ref().unwrap()).unwrap();
+                            let last_value = if r[0].is_none() {
+                                0
+                            }  else {
+                                binary_to_usize((&r[0]).as_ref().unwrap()).unwrap()
+                            };
 
                             let new_value = last_value + 1;
                             let _r = tr.upsert(vec![

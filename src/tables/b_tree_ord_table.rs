@@ -766,7 +766,7 @@ impl<
                             .0
                             .cache_flags.lock(); //首先锁住缓存标记
                         let mut locked = tr.0.table.0.cache.lock(); //再锁住缓存
-                        if !locked.ptr_eq(&tr.0.cache_ref) {
+                        if !locked.ptr_eq(&tr.0.cache_ref.lock()) {
                             //有序B树表的临时缓存的根节点在当前事务执行过程中已改变，
                             //一般是因为其它事务更新了与当前事务无关的关键字，
                             //则将当前事务的修改直接作用在当前有序B树表的临时缓存中
@@ -987,7 +987,9 @@ impl<
                     if let Ok(trans) = tr.0.table.0.inner.read().begin_read() {
                         if let Ok(inner_table) = trans.open_table(DEFAULT_TABLE_NAME) {
                             if let Ok(Some(value)) = inner_table.get(&key) {
-                                return Some(value.value());
+                                let val = value.value();
+                                let _ = tr.0.cache_ref.lock().upsert(key, Some(val.clone()), false);
+                                return Some(val);
                             }
                         }
                     }
@@ -1411,8 +1413,8 @@ impl<
            prepare_timeout: u64,
            commit_timeout: u64,
            table: BtreeOrderedTable<C, Log>) -> Self {
-        let cache_ref = table.0.cache.lock().clone();
-        let cache_mut = SpinLock::new(cache_ref.clone());
+        let cache_ref = SpinLock::new(table.0.cache.lock().clone());
+        let cache_mut = SpinLock::new(cache_ref.lock().clone());
         let inner = InnerBtreeOrdTabTr {
             source,
             tid: SpinLock::new(None),
@@ -1543,37 +1545,85 @@ impl<
 
     // 检查有序B树表的临时缓存的根节点冲突
     fn check_root_conflict(&self, key: &Binary) -> Result<(), KVTableTrError> {
-        let b = self.0.table.0.cache.lock().ptr_eq(&self.0.cache_ref);
+        let b = self.0.table.0.cache.lock().ptr_eq(&self.0.cache_ref.lock());
         if !b {
             //有序B树表的临时缓存的根节点在当前事务执行过程中已改变
             let key = key.clone();
             match self.0.table.0.cache.lock().get(&key) {
                 None => {
-                    //事务的当前操作记录中的关键字，在当前表中不存在
-                    match self.0.cache_ref.get(&key) {
-                        None => {
+                    //事务的当前操作记录中的关键字，在当前缓存表中不存在
+                    let root_value = if let Ok(trans) = self.0.table.0.inner.read().begin_read() {
+                        if let Ok(inner_table) = trans.open_table(DEFAULT_TABLE_NAME) {
+                            if let Ok(Some(value)) = inner_table.get(&key) {
+                                //事务的当前操作记录中的关键字，在内部表中已存在
+                                Some(value.value())
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+
+                    //事务的当前操作记录中的关键字，在内部表中也不存在
+                    match self.0.cache_ref.lock().get(&key) {
+                        None => if root_value.is_none() {
                             //事务的当前操作记录中的关键字，在事务创建时的表中也不存在
                             //表示此关键字是在当前事务内新增的，则此关键字的操作记录可以预提交
                             //并继续其它关键字的操作记录的预提交
                             ()
                         },
-                        _ => {
-                            //事务的当前操作记录中的关键字，在事务创建时的表中已存在
-                            //表示此关键字在当前事务执行过程中被删除，则此关键字的操作记录不允许预提交
+                        None => {
+                            //事务的当前操作记录中的关键字，与事务创建时的表中的关键字不匹配
+                            //表示此关键字在当前事务执行过程中未改变，但值已改变，则此关键字的操作记录不允许预提交
                             //并立即返回当前事务预提交冲突
                             return Err(<Self as Transaction2Pc>::PrepareError::new_transaction_error(ErrorLevel::Normal,
-                                                                                                     format!("Prepare b-tree ordered table conflicted, table: {:?}, key: {:?}, source: {:?}, transaction_uid: {:?}, prepare_uid: {:?}, reason: the key is deleted in table while the transaction is running",
+                                                                                                     format!("Prepare b-tree ordered table conflicted, table: {:?}, key: {:?}, source: {:?}, transaction_uid: {:?}, prepare_uid: {:?}, reason: the value is updated in table while the transaction is running",
                                                                                                              self.0.table.name().as_str(),
                                                                                                              key,
                                                                                                              self.0.source,
                                                                                                              self.get_transaction_uid(),
                                                                                                              self.get_prepare_uid())));
                         },
+                        Some(_copy_value) => if root_value.is_none() {
+                            //事务的当前操作记录中的关键字，与事务创建时的表中的关键字不匹配
+                            //表示此关键字在当前事务执行过程中未改变，但值已改变，则此关键字的操作记录不允许预提交
+                            //并立即返回当前事务预提交冲突
+                            return Err(<Self as Transaction2Pc>::PrepareError::new_transaction_error(ErrorLevel::Normal,
+                                                                                                     format!("Prepare b-tree ordered table conflicted, table: {:?}, key: {:?}, source: {:?}, transaction_uid: {:?}, prepare_uid: {:?}, reason: the value is updated in table while the transaction is running",
+                                                                                                             self.0.table.name().as_str(),
+                                                                                                             key,
+                                                                                                             self.0.source,
+                                                                                                             self.get_transaction_uid(),
+                                                                                                             self.get_prepare_uid())));
+                        },
+                        Some(copy_value) => {
+                            //值都不为空，则比较内容
+                            if Binary::binary_equal(root_value.as_ref().unwrap(), copy_value.as_ref().unwrap()) {
+                                //事务的当前操作记录中的关键字，在事务创建时的表中也存在，且值引用相同
+                                //表示此关键字在当前事务执行过程中未改变，且值也未改变，则此关键字的操作记录允许预提交
+                                //并继续其它关键字的操作记录的预提交
+                                ()
+                            } else {
+                                //事务的当前操作记录中的关键字，与事务创建时的表中的关键字不匹配
+                                //表示此关键字在当前事务执行过程中未改变，但值已改变，则此关键字的操作记录不允许预提交
+                                //并立即返回当前事务预提交冲突
+                                return Err(<Self as Transaction2Pc>::PrepareError::new_transaction_error(ErrorLevel::Normal,
+                                                                                                         format!("Prepare b-tree ordered table conflicted, table: {:?}, key: {:?}, source: {:?}, transaction_uid: {:?}, prepare_uid: {:?}, reason: the value is updated in table while the transaction is running",
+                                                                                                                 self.0.table.name().as_str(),
+                                                                                                                 key,
+                                                                                                                 self.0.source,
+                                                                                                                 self.get_transaction_uid(),
+                                                                                                                 self.get_prepare_uid())));
+                            }
+                        },
                     }
                 },
                 Some(root_value) => {
                     //事务的当前操作记录中的关键字，在当前表中已存在
-                    match self.0.cache_ref.get(&key) {
+                    match self.0.cache_ref.lock().get(&key) {
                         Some(copy_value) => {
                             if root_value.is_some() && copy_value.is_some() {
                                 //值都不为空，则比较内容
@@ -1586,7 +1636,13 @@ impl<
                                     //事务的当前操作记录中的关键字，与事务创建时的表中的关键字不匹配
                                     //表示此关键字在当前事务执行过程中未改变，但值已改变，则此关键字的操作记录不允许预提交
                                     //并立即返回当前事务预提交冲突
-                                    return Err(<Self as Transaction2Pc>::PrepareError::new_transaction_error(ErrorLevel::Normal, format!("Prepare b-tree ordered table conflicted, table: {:?}, key: {:?}, source: {:?}, transaction_uid: {:?}, prepare_uid: {:?}, reason: the value is updated in table while the transaction is running", self.0.table.name().as_str(), key, self.0.source, self.get_transaction_uid(), self.get_prepare_uid())));
+                                    return Err(<Self as Transaction2Pc>::PrepareError::new_transaction_error(ErrorLevel::Normal,
+                                                                                                             format!("Prepare b-tree ordered table conflicted, table: {:?}, key: {:?}, source: {:?}, transaction_uid: {:?}, prepare_uid: {:?}, reason: the value is updated in table while the transaction is running",
+                                                                                                                     self.0.table.name().as_str(),
+                                                                                                                     key,
+                                                                                                                     self.0.source,
+                                                                                                                     self.get_transaction_uid(),
+                                                                                                                     self.get_prepare_uid())));
                                 }
                             } else if root_value.is_none() && copy_value.is_none() {
                                 //事务的当前操作记录中的关键字，在事务创建时的表中也存在，且值引用相同
@@ -1628,32 +1684,70 @@ impl<
 
     // 检查有序B树表的临时缓存的根节点冲突
     fn check_root_conflict_result(&self, key: &Binary) -> Result<(), KVTableTrError> {
-        let b = self.0.table.0.cache.lock().ptr_eq(&self.0.cache_ref);
+        let b = self.0.table.0.cache.lock().ptr_eq(&self.0.cache_ref.lock());
         if !b {
             //有序B树表的临时缓存的根节点在当前事务执行过程中已改变
             let key = key.clone();
             match self.0.table.0.cache.lock().get(&key) {
                 None => {
-                    //事务的当前操作记录中的关键字，在当前表中不存在
-                    match self.0.cache_ref.get(&key) {
-                        None => {
+                    //事务的当前操作记录中的关键字，在当前缓存表中不存在
+                    let root_value = if let Ok(trans) = self.0.table.0.inner.read().begin_read() {
+                        if let Ok(inner_table) = trans.open_table(DEFAULT_TABLE_NAME) {
+                            if let Ok(Some(value)) = inner_table.get(&key) {
+                                //事务的当前操作记录中的关键字，在内部表中已存在
+                                Some(value.value())
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+
+                    //事务的当前操作记录中的关键字，在内部表中也不存在
+                    match self.0.cache_ref.lock().get(&key) {
+                        None => if root_value.is_none() {
                             //事务的当前操作记录中的关键字，在事务创建时的表中也不存在
                             //表示此关键字是在当前事务内新增的，则此关键字的操作记录可以预提交
                             //并继续其它关键字的操作记录的预提交
                             ()
                         },
-                        _ => {
-                            //事务的当前操作记录中的关键字，在事务创建时的表中已存在
-                            //表示此关键字在当前事务执行过程中被删除，则此关键字的操作记录不允许预提交
+                        None => {
+                            //事务的当前操作记录中的关键字，与事务创建时的表中的关键字不匹配
+                            //表示此关键字在当前事务执行过程中未改变，但值已改变，则此关键字的操作记录不允许预提交
                             //并立即返回当前事务预提交冲突
                             return Err(<Self as Transaction2Pc>::PrepareError::new_conflicts_error(self.0.table.name().clone(),
                                                                                                    key.clone()));
+                        },
+                        Some(_copy_value) => if root_value.is_none() {
+                            //事务的当前操作记录中的关键字，与事务创建时的表中的关键字不匹配
+                            //表示此关键字在当前事务执行过程中未改变，但值已改变，则此关键字的操作记录不允许预提交
+                            //并立即返回当前事务预提交冲突
+                            return Err(<Self as Transaction2Pc>::PrepareError::new_conflicts_error(self.0.table.name().clone(),
+                                                                                                   key.clone()));
+                        },
+                        Some(copy_value) => {
+                            //值都不为空，则比较内容
+                            if Binary::binary_equal(root_value.as_ref().unwrap(), copy_value.as_ref().unwrap()) {
+                                //事务的当前操作记录中的关键字，在事务创建时的表中也存在，且值引用相同
+                                //表示此关键字在当前事务执行过程中未改变，且值也未改变，则此关键字的操作记录允许预提交
+                                //并继续其它关键字的操作记录的预提交
+                                ()
+                            } else {
+                                //事务的当前操作记录中的关键字，与事务创建时的表中的关键字不匹配
+                                //表示此关键字在当前事务执行过程中未改变，但值已改变，则此关键字的操作记录不允许预提交
+                                //并立即返回当前事务预提交冲突
+                                return Err(<Self as Transaction2Pc>::PrepareError::new_conflicts_error(self.0.table.name().clone(),
+                                                                                                       key.clone()));
+                            }
                         },
                     }
                 },
                 Some(root_value) => {
                     //事务的当前操作记录中的关键字，在当前表中已存在
-                    match self.0.cache_ref.get(&key) {
+                    match self.0.cache_ref.lock().get(&key) {
                         Some(copy_value) => {
                             if root_value.is_some() && copy_value.is_some() {
                                 //值都不为空，则比较内容
@@ -1763,7 +1857,7 @@ impl<
         //更新有序B树表的临时缓存的根节点
         {
             let mut locked = self.0.table.0.cache.lock();
-            if !locked.ptr_eq(&self.0.cache_ref) {
+            if !locked.ptr_eq(&self.0.cache_ref.lock()) {
                 //有序B树表的临时缓存的根节点在当前事务执行过程中已改变，
                 //一般是因为其它事务更新了与当前事务无关的关键字，
                 //则将当前事务的修改直接作用在当前有序B树表的临时缓存中
@@ -1801,8 +1895,8 @@ struct InnerBtreeOrdTabTr<
     commit_timeout:     u64,
     //事务的临时缓存的可写引用
     cache_mut:          SpinLock<OrdMap<Tree<Binary, Option<Binary>>>>,
-    //事务的临时缓存的只读引用
-    cache_ref:          OrdMap<Tree<Binary, Option<Binary>>>,
+    //事务的临时缓存的只读引用，但会缓存在事务过程中从文件中查询并加载的记录
+    cache_ref:          SpinLock<OrdMap<Tree<Binary, Option<Binary>>>>,
     //事务对应的有序B树表
     table:              BtreeOrderedTable<C, Log>,
     //事务内操作记录
