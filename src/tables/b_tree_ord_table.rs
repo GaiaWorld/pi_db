@@ -88,9 +88,14 @@ impl Value for Binary {
 
 impl Key for Binary {
     fn compare(data1: &[u8], data2: &[u8]) -> std::cmp::Ordering {
-        ReadBuffer::new(data1, 0)
+        if let Some(ord) = ReadBuffer::new(data1, 0)
             .partial_cmp(&ReadBuffer::new(data2, 0))
-            .unwrap()
+        {
+            ord
+        } else {
+            //pi_bon比较失败，则强制判等
+            std::cmp::Ordering::Equal
+        }
     }
 }
 
