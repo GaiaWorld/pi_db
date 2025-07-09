@@ -94,6 +94,9 @@ impl Key for Binary {
             ord
         } else {
             //pi_bon比较失败，则强制判等
+            error!("Compare binary key failed with pi_bon, data1: {:?}, data2: {:?}",
+                data1,
+                data2);
             std::cmp::Ordering::Equal
         }
     }
