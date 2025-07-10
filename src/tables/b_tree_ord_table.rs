@@ -149,7 +149,8 @@ impl<
         if let Ok(tr) = self.0.inner.read().begin_read() {
             if let Ok(table) = tr.open_table(DEFAULT_TABLE_NAME) {
                 let mut table_len = table.len().unwrap_or(0) as usize;
-                let keys = self.0.cache.lock().keys(None, false);
+                let cache_copy = self.0.cache.lock().clone();
+                let keys = cache_copy.keys(None, false);
                 for key in keys {
                     if let Ok(None) = table.get(key) {
                         //记录只在缓存中的关键字
@@ -1557,7 +1558,8 @@ impl<
         if !b {
             //有序B树表的临时缓存的根节点在当前事务执行过程中已改变
             let key = key.clone();
-            match self.0.table.0.cache.lock().get(&key) {
+            let cache_copy = self.0.table.0.cache.lock().clone();
+            match cache_copy.get(&key) {
                 None => {
                     //事务的当前操作记录中的关键字，在当前缓存表中不存在
                     let root_value = if let Ok(trans) = self.0.table.0.inner.read().begin_read() {
@@ -1696,7 +1698,8 @@ impl<
         if !b {
             //有序B树表的临时缓存的根节点在当前事务执行过程中已改变
             let key = key.clone();
-            match self.0.table.0.cache.lock().get(&key) {
+            let cache_copy = self.0.table.0.cache.lock().clone();
+            match cache_copy.get(&key) {
                 None => {
                     //事务的当前操作记录中的关键字，在当前缓存表中不存在
                     let root_value = if let Ok(trans) = self.0.table.0.inner.read().begin_read() {

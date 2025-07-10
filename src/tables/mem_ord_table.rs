@@ -895,7 +895,8 @@ impl<
         if !b {
             //有序内存表的根节点在当前事务执行过程中已改变
             let key = key.clone();
-            match self.0.table.0.root.lock().get(&key) {
+            let root_copy = self.0.table.0.root.lock().clone();
+            match root_copy.get(&key) {
                 None => {
                     //事务的当前操作记录中的关键字，在当前表中不存在
                     match self.0.root_ref.get(&key) {
@@ -948,7 +949,8 @@ impl<
         if !b {
             //有序内存表的根节点在当前事务执行过程中已改变
             let key = key.clone();
-            match self.0.table.0.root.lock().get(&key) {
+            let root_copy = self.0.table.0.root.lock().clone();
+            match root_copy.get(&key) {
                 None => {
                     //事务的当前操作记录中的关键字，在当前表中不存在
                     match self.0.root_ref.get(&key) {

@@ -21,6 +21,7 @@ use pi_async_transaction::{ErrorLevel, Transaction2Pc,
 use pi_ordmap::ordmap::OrdMap;
 use pi_store::{log_store::log_file::{PairLoader, LogFile, LogMethod},
                commit_logger::CommitLoggerBuilder};
+use redb::{Builder, TableDefinition, ReadOnlyTable, Table};
 
 use pi_db::{Binary,
             KVDBTableType,
@@ -123,7 +124,7 @@ fn test_ordmap_concurrency() {
     loop {
         let rt_copy = rt.clone();
         let mut map_copy = map.clone();
-        let map_clone = map_copy.lock().clone();
+        let map_clone = map_copy.lock().clone(); //必须锁住Clone并在迭代器内部持续握有这个Ordmap的引用，否则会因为Ordmap在迭代器迭代完成前被回收导致段错误
         let iter: pi_ordmap::asbtree::IterTree<Binary, Option<Binary>> = map_copy.lock().clone().iter(None, false);
         let ptr = Box::into_raw(Box::new(iter)) as usize;
         let _ = rt.spawn(async move {
@@ -140,6 +141,73 @@ fn test_ordmap_concurrency() {
             println!("!!!!!!count: {:?}", count);
         });
         thread::sleep(Duration::from_millis(100));
+    }
+}
+
+// 测试迭代Ordmap时修改源
+// 测试需要多次长时间测试保证不会异常或崩溃
+#[test]
+fn test_ordmap_keys() {
+    let _handle = startup_global_time_loop(100);
+    let builder = MultiTaskRuntimeBuilder::default();
+    let rt = builder.build();
+    let mut map: Arc<Mutex<OrdMap<pi_ordmap::asbtree::Tree<Binary, Option<Binary>>>>> = Arc::new(Mutex::new(OrdMap::new(None)));
+
+    let db = Builder::new().create("./tests/table.dat").unwrap();
+    let tr = db.begin_write().unwrap();
+    {
+        let mut table = tr.open_table(TableDefinition::<Binary, Binary>::new("$default")).unwrap();
+        for index in 0..100 {
+            table.insert(usize_to_binary(index),
+                         usize_to_binary(index))
+                .unwrap();
+        }
+    }
+    tr.commit().unwrap();
+
+    let rt_copy = rt.clone();
+    let mut map_copy = map.clone();
+    let _ = rt.spawn(async move {
+        for index in 0..100 {
+            let mut map_mut = map_copy.lock().clone();
+            let _ = map_mut
+                .upsert(usize_to_binary(index),
+                        Some(usize_to_binary(index)),
+                        false);
+            let mut locked = map_copy.lock();
+            *locked = map_mut;
+        }
+        println!("!!!!!!insert finish");
+
+        rt_copy.timeout(5000).await;
+        loop {
+            for index in 0..100 {
+                let mut map_mut = map_copy.lock().clone(); //必须锁住Clone并保存在局部变量上，否则会因为Ordmap在迭代器迭代完成前被回收导致段错误
+                let _ = map_mut
+                    .upsert(usize_to_binary(index),
+                            Some(usize_to_binary(index)),
+                            false);
+                let mut locked = map_copy.lock();
+                *locked = map_mut;
+            }
+            rt_copy.timeout(16).await;
+        }
+    });
+
+    thread::sleep(Duration::from_millis(5000));
+
+    println!("!!!!!!start iterate");
+    loop {
+        let tr = db.begin_read().unwrap();
+        let table: ReadOnlyTable<Binary, Binary> = tr.open_table(TableDefinition::new("$default")).unwrap();
+        let map_copy = map.lock().clone();
+        let keys = map_copy.keys(None, false);
+        for key in keys {
+            if let Ok(None) = table.get(key) {
+                //记录只在缓存中的关键字
+            }
+        }
+        thread::sleep(Duration::from_millis(1000));
     }
 }
 
