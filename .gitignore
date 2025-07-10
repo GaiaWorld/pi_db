@@ -8,3 +8,4 @@ testlogfile
 **/.commit_log
 **/db
 **/specific_db
+tests/table.dat
