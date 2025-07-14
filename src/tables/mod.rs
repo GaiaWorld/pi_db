@@ -49,6 +49,9 @@ pub trait KVTable: Send + Sync + 'static {
     /// 获取表的记录数
     fn len(&self) -> usize;
 
+    /// 获取表的字节大小
+    fn size(&self) -> u64;
+
     /// 获取表事务
     fn transaction(&self,
                    source: Atom,

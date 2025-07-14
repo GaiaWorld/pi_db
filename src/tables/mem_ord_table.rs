@@ -22,7 +22,7 @@ use pi_async_transaction::{AsyncTransaction,
                            AsyncCommitLog,
                            ErrorLevel,
                            manager_2pc::Transaction2PcStatus};
-
+use pi_ordmap::ordmap::ImOrdMap;
 use crate::{Binary,
             KVAction,
             TableTrQos,
@@ -77,6 +77,11 @@ impl<
 
     fn len(&self) -> usize {
         self.0.root.lock().size()
+    }
+
+    fn size(&self) -> u64 {
+        let root_copy = self.0.root.lock().clone();
+        root_copy.full_bytes_size()
     }
 
     fn transaction(&self,

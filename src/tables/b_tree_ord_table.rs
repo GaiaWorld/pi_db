@@ -34,7 +34,7 @@ use pi_hash::XHashMap;
 use pi_bon::ReadBuffer;
 use log::{trace, debug, error, warn, info};
 use pi_ordmap::asbtree::{Tree, IterTree};
-use pi_ordmap::ordmap::{Entry, OrdMap};
+use pi_ordmap::ordmap::{Entry, ImOrdMap, OrdMap};
 use pi_store::log_store::log_file::LogMethod;
 
 use crate::{Binary, KVAction, KVActionLog, KVDBCommitConfirm, KVTableTrError, TableTrQos, TransactionDebugEvent, transaction_debug_logger, db::{KVDBChildTrList, KVDBTransaction}, tables::{KVTable,
@@ -165,6 +165,11 @@ impl<
         } else {
             0
         }
+    }
+
+    fn size(&self) -> u64 {
+        let cache_copy = self.0.cache.lock().clone();
+        cache_copy.full_bytes_size()
     }
 
     fn transaction(&self,

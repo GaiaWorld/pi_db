@@ -13,7 +13,8 @@ use log::{debug, info, error};
 use pi_atom::Atom;
 use pi_guid::Guid;
 use pi_hash::XHashMap;
-use pi_ordmap::{ordmap::{Iter, OrdMap}, asbtree::Tree};
+use pi_ordmap::{ordmap::{ImOrdMap, Iter, OrdMap},
+                asbtree::Tree};
 use pi_async_rt::{lock::spin_lock::SpinLock,
                rt::{AsyncRuntime, multi_thread::MultiTaskRuntime}};
 use pi_async_transaction::{AsyncTransaction,
@@ -89,6 +90,11 @@ impl<
 
     fn len(&self) -> usize {
         self.0.root.lock().size()
+    }
+
+    fn size(&self) -> u64 {
+        let root_copy = self.0.root.lock().clone();
+        root_copy.full_bytes_size()
     }
 
     fn transaction(&self,

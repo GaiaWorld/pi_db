@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::collections::{VecDeque, HashMap, BTreeMap};
 use std::io::{Error, Result as IOResult, ErrorKind};
 use std::sync::{Arc,
+                OnceLock,
                 atomic::{AtomicBool, AtomicU64, Ordering}};
 
 use futures::{future::{FutureExt, BoxFuture}, stream::BoxStream, StreamExt};
@@ -17,18 +18,10 @@ use bytes::BufMut;
 use log::{info, error};
 #[cfg(target_os = "linux")]
 use libc::malloc_trim;
-
 #[cfg(feature = "trace")]
-use tracing::Instrument;
-#[cfg(feature = "trace")]
-use opentelemetry::{Context,
-                    propagation::TextMapPropagator,
-                    sdk::propagation::TraceContextPropagator};
-#[cfg(feature = "trace")]
-use tracing_opentelemetry::OpenTelemetrySpanExt;
-#[cfg(feature = "trace")]
-use tracing_subscriber::prelude::*;
-
+use opentelemetry::{global,
+                    metrics::Meter,
+                    KeyValue};
 use pi_atom::Atom;
 use pi_bon::{WriteBuffer, ReadBuffer, Encode, Decode, ReadBonErr};
 use pi_guid::Guid;
@@ -106,9 +99,14 @@ const STARTUP_DB_SOURCE: &str = "Startup db";
 ///
 const REPAIR_DB_SOURCE: &str = "Repair db";
 
+// 表缓存大小仪表
 #[cfg(feature = "trace")]
-lazy_static! {
-    static ref TransactionSpans: DashMap<Guid, Context> = DashMap::default();
+static TABLE_CACHE_SIZE_METER: OnceLock<Meter> = OnceLock::new();
+
+// 获取表缓存大小仪表
+#[cfg(feature = "trace")]
+pub(crate) fn get_table_cache_size_meter<'a>() -> &'a Meter {
+    TABLE_CACHE_SIZE_METER.get_or_init(|| global::meter("table_cache_size"))
 }
 
 ///
@@ -333,7 +331,7 @@ impl<
                 .clone();
 
 
-            db_mgr.0.rt.spawn(async move {
+            let _ = db_mgr.0.rt.spawn(async move {
                 let mut events = Vec::with_capacity(3072);
                 loop {
                     let mut try_count = 5usize;
@@ -378,6 +376,16 @@ impl<
                         handle(&db_mgr_copy, &db_mgr_copy.0.tr_mgr, &mut events);
                     }
                 }
+            });
+        }
+
+        //启动跟踪系统
+        #[cfg(feature = "trace")]
+        {
+            let rt_copy = db_mgr.0.rt.clone();
+            let db_mgr_copy = db_mgr.clone();
+            let _ = db_mgr.0.rt.spawn(async move {
+                loop_tracing(rt_copy, db_mgr_copy, 15000).await;
             });
         }
 
@@ -642,6 +650,28 @@ impl<
             },
             Some(KVDBTable::BtreeOrdTab(table)) => {
                 Some(table.len())
+            },
+        }
+    }
+
+    /// 异步获取指定名称的数据表的缓存字节大小，返回空表示指定名称的表不存在
+    pub async fn table_cache_size(&self, table_name: &Atom) -> Option<u64> {
+        match self.0.tables.read().await.get(table_name) {
+            None => None,
+            Some(KVDBTable::MetaTab(table)) => {
+                Some(table.size())
+            },
+            Some(KVDBTable::MemOrdTab(table)) => {
+                Some(table.size())
+            },
+            Some(KVDBTable::LogOrdTab(table)) => {
+                Some(table.size())
+            },
+            Some(KVDBTable::LogWTab(table)) => {
+                Some(table.size())
+            },
+            Some(KVDBTable::BtreeOrdTab(table)) => {
+                Some(table.size())
             },
         }
     }
@@ -1385,68 +1415,6 @@ impl<
 
     fn prepare(&self)
                -> BoxFuture<Result<Option<<Self as Transaction2Pc>::PrepareOutput>, <Self as Transaction2Pc>::PrepareError>> {
-        #[cfg(feature = "trace")]
-        {
-            let mut carrier = HashMap::new();
-            carrier.insert(
-                "traceparent".to_string(),
-                self.get_source().as_str().to_string(),
-            );
-            let propagator = TraceContextPropagator::new();
-            let parent_context = propagator.extract(&carrier);
-            let cid = self.get_transaction_uid();
-            let span = tracing::debug_span!("db_prepare",
-                tid = cid.clone().unwrap_or(Guid(0)).0,
-                cid = self.get_commit_uid().unwrap_or(Guid(0)).0,
-                status = self.get_status() as u8);
-            span.set_parent(parent_context);
-
-            if let Some(key) = cid {
-                //当前事务的事务id存在，则记录预提交Span的上下文
-                let context = span.context();
-                TransactionSpans.insert(key, context);
-            }
-
-            match self {
-                KVDBTransaction::RootTr(tr) => {
-                    return tr
-                        .prepare()
-                        .instrument(span)
-                        .boxed();
-                },
-                KVDBTransaction::MetaTabTr(tr) => {
-                    return tr
-                        .prepare()
-                        .instrument(span)
-                        .boxed();
-                },
-                KVDBTransaction::MemOrdTabTr(tr) => {
-                    return tr
-                        .prepare()
-                        .instrument(span)
-                        .boxed();
-                },
-                KVDBTransaction::LogOrdTabTr(tr) => {
-                    return tr
-                        .prepare()
-                        .instrument(span)
-                        .boxed();
-                },
-                KVDBTransaction::LogWTabTr(tr) => {
-                    return tr
-                        .prepare()
-                        .instrument(span)
-                        .boxed();
-                },
-                KVDBTransaction::BtreeOrdTabTr(tr) => {
-                    return tr
-                        .prepare()
-                        .instrument(span)
-                        .boxed();
-                },
-            }
-        }
-
         #[cfg(feature = "default")]
         match self {
             KVDBTransaction::RootTr(tr) => {
@@ -1472,68 +1440,6 @@ impl<
 
     fn prepare_conflicts(&self)
         -> BoxFuture<Result<Option<<Self as Transaction2Pc>::PrepareOutput>, <Self as Transaction2Pc>::PrepareError>> {
-        #[cfg(feature = "trace")]
-        {
-            let mut carrier = HashMap::new();
-            carrier.insert(
-                "traceparent".to_string(),
-                self.get_source().as_str().to_string(),
-            );
-            let propagator = TraceContextPropagator::new();
-            let parent_context = propagator.extract(&carrier);
-            let cid = self.get_transaction_uid();
-            let span = tracing::debug_span!("db_prepare",
-                tid = cid.clone().unwrap_or(Guid(0)).0,
-                cid = self.get_commit_uid().unwrap_or(Guid(0)).0,
-                status = self.get_status() as u8);
-            span.set_parent(parent_context);
-
-            if let Some(key) = cid {
-                //当前事务的事务id存在，则记录预提交Span的上下文
-                let context = span.context();
-                TransactionSpans.insert(key, context);
-            }
-
-            match self {
-                KVDBTransaction::RootTr(tr) => {
-                    return tr
-                        .prepare_conflicts()
-                        .instrument(span)
-                        .boxed();
-                },
-                KVDBTransaction::MetaTabTr(tr) => {
-                    return tr
-                        .prepare_conflicts()
-                        .instrument(span)
-                        .boxed();
-                },
-                KVDBTransaction::MemOrdTabTr(tr) => {
-                    return tr
-                        .prepare_conflicts()
-                        .instrument(span)
-                        .boxed();
-                },
-                KVDBTransaction::LogOrdTabTr(tr) => {
-                    return tr
-                        .prepare_conflicts()
-                        .instrument(span)
-                        .boxed();
-                },
-                KVDBTransaction::LogWTabTr(tr) => {
-                    return tr
-                        .prepare_conflicts()
-                        .instrument(span)
-                        .boxed();
-                },
-                KVDBTransaction::BtreeOrdTabTr(tr) => {
-                    return tr
-                        .prepare_conflicts()
-                        .instrument(span)
-                        .boxed();
-                },
-            }
-        }
-
         #[cfg(feature = "default")]
         match self {
             KVDBTransaction::RootTr(tr) => {
@@ -1559,67 +1465,6 @@ impl<
 
     fn commit(&self, confirm: <Self as Transaction2Pc>::CommitConfirm)
               -> BoxFuture<Result<<Self as AsyncTransaction>::Output, <Self as AsyncTransaction>::Error>> {
-        #[cfg(feature = "trace")]
-        {
-            let cid = self.get_transaction_uid().unwrap_or(Guid(0));
-            //当前事务的事务id存在
-            let db_commit_span = if let Some((_, parent_context)) = TransactionSpans.remove(&cid) {
-                //当前事务有预提交Span
-                let span = tracing::debug_span!("db_commit",
-                        tid = cid.0,
-                        cid = self.get_commit_uid().unwrap_or(Guid(0)).0,
-                        status = self.get_status() as u8);
-                span.set_parent(parent_context);
-                span
-            } else {
-                //当前事务没有预提交Span
-                let span = tracing::debug_span!("db_commit",
-                        tid = cid.0,
-                        cid = self.get_commit_uid().unwrap_or(Guid(0)).0,
-                        status = self.get_status() as u8);
-                span
-            };
-
-            match self {
-                KVDBTransaction::RootTr(tr) => {
-                    return tr
-                        .commit(confirm)
-                        .instrument(db_commit_span)
-                        .boxed();
-                },
-                KVDBTransaction::MetaTabTr(tr) => {
-                    return tr
-                        .commit(confirm)
-                        .instrument(db_commit_span)
-                        .boxed();
-                },
-                KVDBTransaction::MemOrdTabTr(tr) => {
-                    return tr
-                        .commit(confirm)
-                        .instrument(db_commit_span)
-                        .boxed();
-                },
-                KVDBTransaction::LogOrdTabTr(tr) => {
-                    return tr
-                        .commit(confirm)
-                        .instrument(db_commit_span)
-                        .boxed();
-                },
-                KVDBTransaction::LogWTabTr(tr) => {
-                    return tr
-                        .commit(confirm)
-                        .instrument(db_commit_span)
-                        .boxed();
-                },
-                KVDBTransaction::BtreeOrdTabTr(tr) => {
-                    return tr
-                        .commit(confirm)
-                        .instrument(db_commit_span)
-                        .boxed();
-                },
-            }
-        }
-
         #[cfg(feature = "default")]
         match self {
             KVDBTransaction::RootTr(tr) => {
@@ -4187,6 +4032,34 @@ impl<
             Self::LogWTab(tab) => tab.is_persistent(),
             Self::BtreeOrdTab(tab) => tab.is_persistent(),
         }
+    }
+}
+
+// 数据库跟踪循环
+#[cfg(feature = "trace")]
+async fn loop_tracing<R, C, Log>(rt: R,
+                                 db_mgr: KVDBManager<C, Log>,
+                                 interval: usize)
+    where R: AsyncRuntime,
+          C: Clone + Send + 'static,
+          Log: AsyncCommitLog<C = C, Cid = Guid>,
+{
+    let table_cache_meter = get_table_cache_size_meter()
+        .u64_gauge("pi_db.db.table_cache_size")
+        .build();
+    loop {
+        rt.timeout(interval).await;
+        let now = Instant::now();
+        for table in db_mgr.tables().await {
+            if let Some(size) = db_mgr.table_cache_size(&table).await {
+                table_cache_meter.record(size, &[KeyValue::new("table",
+                                                               table.as_str().to_string())]);
+                rt.timeout(0).await;
+            }
+        }
+        info!("Loop tracing succeeded, interval: {:?}, time: {:?}",
+            interval,
+            now.elapsed());
     }
 }
 
