@@ -22,6 +22,8 @@ use libc::malloc_trim;
 use opentelemetry::{global,
                     metrics::Meter,
                     KeyValue};
+#[cfg(feature = "trace")]
+use pi_logger;
 use pi_atom::Atom;
 use pi_bon::{WriteBuffer, ReadBuffer, Encode, Decode, ReadBonErr};
 use pi_guid::Guid;
@@ -105,7 +107,14 @@ static TABLE_CACHE_SIZE_METER: OnceLock<Meter> = OnceLock::new();
 
 // 获取表缓存大小仪表
 #[cfg(feature = "trace")]
-pub(crate) fn get_table_cache_size_meter<'a>() -> &'a Meter {
+pub(crate) async fn get_table_cache_size_meter<'a, R>(rt: R) -> &'a Meter
+    where R: AsyncRuntime
+{
+    while !pi_logger::opentelemetry::is_init() {
+        //跟踪系统还未初始化，则稍候重试
+        rt.timeout(10000).await;
+    }
+
     TABLE_CACHE_SIZE_METER.get_or_init(|| global::meter("table_cache_size"))
 }
 
@@ -4044,7 +4053,8 @@ async fn loop_tracing<R, C, Log>(rt: R,
           C: Clone + Send + 'static,
           Log: AsyncCommitLog<C = C, Cid = Guid>,
 {
-    let table_cache_meter = get_table_cache_size_meter()
+    let table_cache_meter = get_table_cache_size_meter(rt.clone())
+        .await
         .u64_gauge("pi_db.db.table_cache_size")
         .build();
     loop {
@@ -4057,7 +4067,7 @@ async fn loop_tracing<R, C, Log>(rt: R,
                 rt.timeout(0).await;
             }
         }
-        info!("Loop tracing succeeded, interval: {:?}, time: {:?}",
+        info!("Loop tracing succeeded, interval: {:?}ms, time: {:?}",
             interval,
             now.elapsed());
     }

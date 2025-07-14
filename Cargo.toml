@@ -1,6 +1,6 @@
 [package]
 name = "pi_db"
-version = "0.12.9"
+version = "0.12.10"
 authors = ["vmos <vmosone007@gmail.com>"]
 edition = "2021"
 description = "Full cache based database，support transaction"
@@ -10,7 +10,7 @@ keywords = ["pi", "database", "transaction"]
 
 [features]
 default = []
-trace = ["opentelemetry"]
+trace = ["opentelemetry", "pi_logger"]
 log_table_debug = []
 
 [dependencies]
@@ -35,6 +35,7 @@ pi_ordmap = "~0.3"
 pi_hash = "~0.1"
 redb = "~2.5"
 opentelemetry = { version = "~0.30", optional = true }
+pi_logger = { version = "~0.4", optional = true}
 lazy_static = "~1.5"
 
 [target.'cfg(target_os = "linux")'.dependencies]
