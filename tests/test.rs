@@ -1,3 +1,5 @@
+#![feature(stmt_expr_attributes)]
+
 use std::thread;
 use std::sync::Arc;
 use std::path::PathBuf;
@@ -14,8 +16,7 @@ use pi_guid::{GuidGen, Guid};
 use pi_sinfo::EnumType;
 use pi_bon::{WriteBuffer, ReadBuffer, Encode, Decode, ReadBonErr};
 use pi_time::run_nanos;
-use pi_async_rt::rt::{AsyncRuntime, startup_global_time_loop,
-                      multi_thread::MultiTaskRuntimeBuilder};
+use pi_async_rt::rt::{AsyncRuntime, startup_global_time_loop, multi_thread::MultiTaskRuntimeBuilder, AsyncRuntimeBuilder};
 use pi_async_transaction::{ErrorLevel, Transaction2Pc,
                            manager_2pc::Transaction2PcManager};
 use pi_ordmap::ordmap::OrdMap;
@@ -221,7 +222,7 @@ fn test_memory_table() {
     let rt = builder.build();
     let rt_copy = rt.clone();
 
-    rt.spawn(async move {
+    let _ = rt.spawn(async move {
         let guid_gen = GuidGen::new(run_nanos(), 0);
         let commit_logger_builder = CommitLoggerBuilder::new(rt_copy.clone(), "./.commit_log");
         let commit_logger = commit_logger_builder
@@ -527,7 +528,7 @@ fn test_memory_table_conflict() {
     let rt = builder.build();
     let rt_copy = rt.clone();
 
-    rt.spawn(async move {
+    let _ = rt.spawn(async move {
         let guid_gen = GuidGen::new(run_nanos(), 0);
         let commit_logger_builder = CommitLoggerBuilder::new(rt_copy.clone(), "./.commit_log");
         let commit_logger = commit_logger_builder
@@ -600,7 +601,7 @@ fn test_memory_table_conflict() {
                     let table_name_copy = table_name.clone();
                     let sender_copy = sender.clone();
 
-                    rt_copy.spawn(async move {
+                    let _ = rt_copy.spawn(async move {
                         let now = Instant::now();
                         let mut is_ok = false;
 
@@ -719,7 +720,7 @@ fn test_memory_table_read_write_delete_iteraton() {
     let rt = builder.build();
     let rt_copy = rt.clone();
 
-    rt.spawn(async move {
+    let _ = rt.spawn(async move {
         let guid_gen = GuidGen::new(run_nanos(), 0);
         let commit_logger_builder = CommitLoggerBuilder::new(rt_copy.clone(), "./.commit_log");
         let commit_logger = commit_logger_builder
@@ -920,7 +921,7 @@ fn test_commit_log() {
     let rt = builder.build();
     let rt_copy = rt.clone();
 
-    rt.spawn(async move {
+    let _ = rt.spawn(async move {
         let guid_gen = GuidGen::new(run_nanos(), 0);
         let commit_logger_builder = CommitLoggerBuilder::new(rt_copy.clone(), "./.commit_log");
         let commit_logger = commit_logger_builder
@@ -1229,7 +1230,7 @@ fn test_load_log_table() {
     let rt = builder.build();
     let rt_copy = rt.clone();
 
-    rt.spawn(async move {
+    let _ = rt.spawn(async move {
         let guid_gen = GuidGen::new(run_nanos(), 0);
         let commit_logger_builder = CommitLoggerBuilder::new(rt_copy.clone(), "./.commit_log");
         let commit_logger = commit_logger_builder
@@ -1288,7 +1289,7 @@ fn test_log_table() {
     let rt = builder.build();
     let rt_copy = rt.clone();
 
-    rt.spawn(async move {
+    let _ = rt.spawn(async move {
         let guid_gen = GuidGen::new(run_nanos(), 0);
         let commit_logger_builder = CommitLoggerBuilder::new(rt_copy.clone(), "./.commit_log");
         let commit_logger = commit_logger_builder
@@ -1642,7 +1643,7 @@ fn test_log_table_read_only_while_writing() {
     let rt = builder.build();
     let rt_copy = rt.clone();
 
-    rt.spawn(async move {
+    let _ = rt.spawn(async move {
         let guid_gen = GuidGen::new(run_nanos(), 0);
         let commit_logger_builder = CommitLoggerBuilder::new(rt_copy.clone(), "./.commit_log");
         let commit_logger = commit_logger_builder
@@ -1766,7 +1767,7 @@ fn test_log_table_write_while_read_only() {
     let rt = builder.build();
     let rt_copy = rt.clone();
 
-    rt.spawn(async move {
+    let _ = rt.spawn(async move {
         let guid_gen = GuidGen::new(run_nanos(), 0);
         let commit_logger_builder = CommitLoggerBuilder::new(rt_copy.clone(), "./.commit_log");
         let commit_logger = commit_logger_builder
@@ -1890,7 +1891,7 @@ fn test_log_table_conflict() {
     let rt = builder.build();
     let rt_copy = rt.clone();
 
-    rt.spawn(async move {
+    let _ = rt.spawn(async move {
         let guid_gen = GuidGen::new(run_nanos(), 0);
         let commit_logger_builder = CommitLoggerBuilder::new(rt_copy.clone(), "./.commit_log");
         let commit_logger = commit_logger_builder
@@ -1963,7 +1964,7 @@ fn test_log_table_conflict() {
                     let table_name_copy = table_name.clone();
                     let sender_copy = sender.clone();
 
-                    rt_copy.spawn(async move {
+                    let _ = rt_copy.spawn(async move {
                         let now = Instant::now();
                         let mut is_ok = false;
 
@@ -2082,7 +2083,7 @@ fn test_log_write_table() {
     let rt = builder.build();
     let rt_copy = rt.clone();
 
-    rt.spawn(async move {
+    let _ = rt.spawn(async move {
         let guid_gen = GuidGen::new(run_nanos(), 0);
         let commit_logger_builder = CommitLoggerBuilder::new(rt_copy.clone(), "./.commit_log");
         let commit_logger = commit_logger_builder
@@ -2265,7 +2266,7 @@ fn test_b_tree_table() {
     let rt = builder.build();
     let rt_copy = rt.clone();
 
-    rt.spawn(async move {
+    let _ = rt.spawn(async move {
         let guid_gen = GuidGen::new(run_nanos(), 0);
         let commit_logger_builder = CommitLoggerBuilder::new(rt_copy.clone(), "./.commit_log");
         let commit_logger = commit_logger_builder
@@ -2623,7 +2624,7 @@ fn test_b_tree_table_read_write_delete_iteraton() {
     let rt = builder.build();
     let rt_copy = rt.clone();
 
-    rt.spawn(async move {
+    let _ = rt.spawn(async move {
         let guid_gen = GuidGen::new(run_nanos(), 0);
         let commit_logger_builder = CommitLoggerBuilder::new(rt_copy.clone(), "./.commit_log");
         let commit_logger = commit_logger_builder
@@ -3102,7 +3103,7 @@ fn test_b_tree_table_write_delete_iteraton() {
     let rt = builder.build();
     let rt_copy = rt.clone();
 
-    rt.spawn(async move {
+    let _ = rt.spawn(async move {
         let guid_gen = GuidGen::new(run_nanos(), 0);
         let commit_logger_builder = CommitLoggerBuilder::new(rt_copy.clone(), "./.commit_log");
         let commit_logger = commit_logger_builder
@@ -3263,7 +3264,7 @@ fn test_b_tree_table_delete_iteraton() {
     let rt = builder.build();
     let rt_copy = rt.clone();
 
-    rt.spawn(async move {
+    let _ = rt.spawn(async move {
         let guid_gen = GuidGen::new(run_nanos(), 0);
         let commit_logger_builder = CommitLoggerBuilder::new(rt_copy.clone(), "./.commit_log");
         let commit_logger = commit_logger_builder
@@ -3499,7 +3500,7 @@ fn test_b_tree_commit_before_clean() {
     let rt = builder.build();
     let rt_copy = rt.clone();
 
-    rt.spawn(async move {
+    let _ = rt.spawn(async move {
         let guid_gen = GuidGen::new(run_nanos(), 0);
         let commit_logger_builder = CommitLoggerBuilder::new(rt_copy.clone(), "./.commit_log");
         let commit_logger = commit_logger_builder
@@ -3674,7 +3675,7 @@ fn test_b_tree_table_conflict() {
     let rt = builder.build();
     let rt_copy = rt.clone();
 
-    rt.spawn(async move {
+    let _ = rt.spawn(async move {
         let guid_gen = GuidGen::new(run_nanos(), 0);
         let commit_logger_builder = CommitLoggerBuilder::new(rt_copy.clone(), "./.commit_log");
         let commit_logger = commit_logger_builder
@@ -3751,7 +3752,7 @@ fn test_b_tree_table_conflict() {
                     let table_name_copy = table_name.clone();
                     let sender_copy = sender.clone();
 
-                    rt_copy.spawn(async move {
+                    let _ = rt_copy.spawn(async move {
                         let now = Instant::now();
                         let mut is_ok = false;
 
@@ -3862,6 +3863,131 @@ fn test_b_tree_table_conflict() {
     thread::sleep(Duration::from_millis(1000000000));
 }
 
+/// 测试并发写和迭代对内存的影响
+#[test]
+fn test_b_tree_table_write_iteraton_for_memory() {
+    use std::thread;
+    use std::time::Duration;
+
+    env_logger::init();
+
+    let _handle = startup_global_time_loop(100);
+    let rt = AsyncRuntimeBuilder::default_multi_thread(None, None, None, None);
+    let rt_copy = rt.clone();
+
+    let _ = rt.spawn(async move {
+        let guid_gen = GuidGen::new(run_nanos(), 0);
+        let commit_logger_builder = CommitLoggerBuilder::new(rt_copy.clone(), "./.commit_log");
+        let commit_logger = commit_logger_builder
+            .build()
+            .await
+            .unwrap();
+
+        let tr_mgr = Transaction2PcManager::new(rt_copy.clone(),
+                                                guid_gen,
+                                                commit_logger);
+
+        let mut builder = KVDBManagerBuilder::new(rt_copy.clone(), tr_mgr, "./db");
+        match builder.startup().await {
+            Err(e) => {
+                panic!("{:?}", e);
+            },
+            Ok(db) => {
+                println!("!!!!!!db table size: {:?}", db.table_size().await);
+
+                let mut table_names = Vec::with_capacity(100);
+                let tr = db.transaction(Atom::from("create b-tree table"), true, 500, 500).unwrap();
+                for index in 0..100 {
+                    let table_name = Atom::from("test_log/".to_string() + &index.to_string());
+                    if let Err(e) = tr.create_table(table_name.clone(),
+                                                    KVTableMeta::new(KVDBTableType::BtreeOrdTab,
+                                                                     true,
+                                                                     EnumType::Usize,
+                                                                     EnumType::Str)).await {
+                        //创建有序内存表失败
+                        println!("!!!!!!create b-tree ordered table failed, reason: {:?}", e);
+                    } else {
+                        table_names.push(table_name);
+                    }
+                }
+                let output = tr.prepare_modified().await.unwrap();
+                let _ = tr.commit_modified(output).await;
+
+                println!("!!!!!!db table size: {:?}", db.table_size().await);
+
+                //操作数据库事务
+                rt_copy.timeout(1500).await;
+                println!("");
+
+                let rt_clone = rt_copy.clone();
+                let db_copy = db.clone();
+                let _ = rt_copy.spawn(async move {
+                    loop {
+                        rt_clone.timeout(65000).await;
+                        let mut b = false;
+                        #[cfg(target_os = "linux")]
+                        b = db_copy.cleanup_buffer_after_collect_table();
+                        println!("!!!!!!cleanup_buffer_after_collect_table: {:?}", b);
+                    }
+                });
+
+                let table_names_copy = table_names.clone();
+                for table_name_copy in table_names_copy {
+                    let rt_clone = rt_copy.clone();
+                    let db_copy = db.clone();
+                    let _ = rt_copy.spawn(async move {
+                        let value = generate_string_with_repeated_char(256, 'a');
+
+                        let now = Instant::now();
+                        let mut trs = Vec::with_capacity(10000);
+                        for index in 0..10000 {
+                            if (index + 1) % 1000 == 0 {
+                                println!("!!!!!!insert, table: {:?}, table_size: {:?}, count: {:?}, time: {:?}", table_name_copy, db_copy.table_cache_size(&table_name_copy).await, index + 1, now.elapsed());
+                            }
+
+                            let tr = db_copy.transaction(Atom::from("test b-tree table"), true, 500, 500).unwrap();
+                            let _r = tr.upsert(vec![
+                                TableKV {
+                                    table: table_name_copy.clone(),
+                                    key: usize_to_binary(index),
+                                    value: Some(string_to_binary(value.clone()))
+                                }
+                            ]).await;
+                            match tr.prepare_modified().await {
+                                Err(_e) => {
+                                    if let Err(e) = tr.rollback_modified().await {
+                                        println!("upsert rollback failed, reason: {:?}", e);
+                                    }
+                                },
+                                Ok(output) => {
+                                    if let Err(e) = tr.commit_modified(output).await {
+                                        if let ErrorLevel::Fatal = &e.level() {
+                                            println!("upsert rollback failed, reason: commit fatal error");
+                                        } else {
+                                            if let Err(e) = tr.rollback_modified().await {
+                                                println!("upsert rollback failed, reason: {:?}", e);
+                                            }
+                                        }
+                                    } else {
+                                        trs.push(tr);
+                                    }
+                                },
+                            }
+                        }
+
+                        println!("!!!!!!table0: {:?}, table_size: {:?}", table_name_copy, db_copy.table_cache_size(&table_name_copy).await);
+                        println!("transatction count: {:?}, wait release...", trs.len());
+                        rt_clone.timeout(65000).await;
+                        println!("!!!!!!table1: {:?}, table_size: {:?}", table_name_copy, db_copy.table_cache_size(&table_name_copy).await);
+                    });
+                }
+            },
+        }
+    });
+
+    thread::sleep(Duration::from_millis(1000000000));
+}
+
 //执行三次，第一次执行在数据落地前中止执行，第二次执行则等待数据落地后再退出，第三次执行查看所有值是否剩以1000000并加1
 #[test]
 fn test_db_repair() {
@@ -3875,7 +4001,7 @@ fn test_db_repair() {
     let rt = builder.build();
     let rt_copy = rt.clone();
 
-    rt.spawn(async move {
+    let _ = rt.spawn(async move {
         let guid_gen = GuidGen::new(run_nanos(), 0);
         let commit_logger_builder = CommitLoggerBuilder::new(rt_copy.clone(), "./.commit_log");
         let commit_logger = commit_logger_builder
@@ -4057,7 +4183,7 @@ fn test_db_repair_by_specific() {
                                   10000,
                                   10000);
 
-    rt.spawn(async move {
+    let _ = rt.spawn(async move {
         let guid_gen = GuidGen::new(run_nanos(), 0);
         let commit_logger_builder = CommitLoggerBuilder::new(rt_copy.clone(), "./specific_db/.commit_log");
         let commit_logger = commit_logger_builder
@@ -4098,7 +4224,7 @@ fn test_multi_tables_repair() {
 
     //异步构建数据库管理器
     let (sender, receiver) = bounded(1);
-    rt.spawn(async move {
+    let _ = rt.spawn(async move {
         let guid_gen = GuidGen::new(run_nanos(), 0);
         let commit_logger_builder = CommitLoggerBuilder::new(rt_copy.clone(), "./.commit_log");
         let commit_logger = commit_logger_builder
@@ -4146,7 +4272,7 @@ fn test_multi_tables_repair() {
     let db_copy = db.clone();
     let table_names_copy = table_names.clone();
     let (sender, receiver) = bounded(1);
-    rt.spawn(async move  {
+    let _ = rt.spawn(async move  {
         for table_name in &table_names_copy {
             let tr = db_copy.transaction(table_name.clone(), true, 500, 500).unwrap();
 
@@ -4197,7 +4323,7 @@ fn test_multi_tables_repair() {
             let table_names_copy = table_names.clone();
             let sender_copy = sender.clone();
 
-            rt.spawn(async move {
+            let _ = rt.spawn(async move {
                 let mut result = true;
                 let now = Instant::now();
                 while now.elapsed().as_millis() < 30000 {
@@ -4276,7 +4402,7 @@ fn test_commit_log_inspector() {
     let rt = builder.build();
 
     let rt_copy = rt.clone();
-    rt.spawn(async move {
+    let _ = rt.spawn(async move {
         let commit_logger_builder = CommitLoggerBuilder::new(rt_copy.clone(), "./.commit_log");
         let commit_logger = commit_logger_builder
             .log_file_limit(1024)
@@ -4326,7 +4452,7 @@ fn test_commit_log_inspector_with_callback() {
     let rt = builder.build();
 
     let rt_copy = rt.clone();
-    rt.spawn(async move {
+    let _ = rt.spawn(async move {
         let commit_logger_builder = CommitLoggerBuilder::new(rt_copy.clone(), "./.commit_log");
         let commit_logger = commit_logger_builder
             .log_file_limit(1024)
@@ -4374,7 +4500,7 @@ fn test_log_table_inspector() {
     let rt = builder.build();
 
     let rt_copy = rt.clone();
-    rt.spawn(async move {
+    let _ = rt.spawn(async move {
         let inspector = LogTableInspector::new(rt_copy, "./db/.tables/config/db/Record.DramaNumberRecord").unwrap();
         if inspector.begin() {
             while let Some(result) = inspector.next() {
@@ -4409,7 +4535,7 @@ fn test_multi_tables_write_and_repair() {
 
     //异步构建数据库管理器
     let (sender, receiver) = bounded(1);
-    rt.spawn(async move {
+    let _ = rt.spawn(async move {
         let guid_gen = GuidGen::new(run_nanos(), 0);
         let commit_logger_builder = CommitLoggerBuilder::new(rt_copy.clone(), "./.commit_log");
         let commit_logger = commit_logger_builder
@@ -4457,7 +4583,7 @@ fn test_multi_tables_write_and_repair() {
     let db_copy = db.clone();
     let table_names_copy = table_names.clone();
     let (sender, receiver) = bounded(1);
-    rt.spawn(async move  {
+    let _ = rt.spawn(async move  {
         for table_name in &table_names_copy {
             let tr = db_copy.transaction(table_name.clone(), true, 500, 500).unwrap();
 
@@ -4490,7 +4616,7 @@ fn test_multi_tables_write_and_repair() {
             let table_names_copy = table_names.clone();
             let sender_copy = sender.clone();
 
-            rt.spawn(async move {
+            let _ = rt.spawn(async move {
                 let mut result = true;
                 let now = Instant::now();
                 while now.elapsed().as_millis() < 60000 {
@@ -4571,7 +4697,7 @@ fn test_multi_tables_write_and_repair() {
             let table_names_copy = table_names.clone();
             let sender_copy = sender.clone();
 
-            rt.spawn(async move {
+            let _ = rt.spawn(async move {
                 let mut result = true;
                 let now = Instant::now();
                 while now.elapsed().as_millis() < 30000 {
@@ -4656,7 +4782,7 @@ fn test_multi_tables_write_and_repair1() {
 
     //异步构建数据库管理器
     let (sender, receiver) = bounded(1);
-    rt.spawn(async move {
+    let _ = rt.spawn(async move {
         let guid_gen = GuidGen::new(run_nanos(), 0);
         let commit_logger_builder = CommitLoggerBuilder::new(rt_copy.clone(), "./.commit_log");
         let commit_logger = commit_logger_builder
@@ -4704,7 +4830,7 @@ fn test_multi_tables_write_and_repair1() {
     let db_copy = db.clone();
     let table_names_copy = table_names.clone();
     let (sender, receiver) = bounded(1);
-    rt.spawn(async move  {
+    let _ = rt.spawn(async move  {
         for table_name in &table_names_copy {
             let tr = db_copy.transaction(table_name.clone(), true, 500, 500).unwrap();
 
@@ -4737,7 +4863,7 @@ fn test_multi_tables_write_and_repair1() {
             let table_names_copy = table_names.clone();
             let sender_copy = sender.clone();
 
-            rt.spawn(async move {
+            let _ = rt.spawn(async move {
                 let mut result = true;
                 let now = Instant::now();
                 while now.elapsed().as_millis() < 10000 {
@@ -4836,7 +4962,7 @@ fn test_multi_tables_write_commit_log() {
 
     //异步构建数据库管理器
     let (sender, receiver) = bounded(1);
-    rt.spawn(async move {
+    let _ = rt.spawn(async move {
         let guid_gen = GuidGen::new(run_nanos(), 0);
         let commit_logger_builder = CommitLoggerBuilder::new(rt_copy.clone(), "./.commit_log");
         let commit_logger = commit_logger_builder
@@ -4884,7 +5010,7 @@ fn test_multi_tables_write_commit_log() {
     let db_copy = db.clone();
     let table_names_copy = table_names.clone();
     let (sender, receiver) = bounded(1);
-    rt.spawn(async move  {
+    let _ = rt.spawn(async move  {
         for table_name in &table_names_copy {
             let tr = db_copy.transaction(table_name.clone(), true, 500, 500).unwrap();
 
@@ -4917,7 +5043,7 @@ fn test_multi_tables_write_commit_log() {
             let table_names_copy = table_names.clone();
             let sender_copy = sender.clone();
 
-            rt.spawn(async move {
+            let _ = rt.spawn(async move {
                 let mut result = true;
                 let now = Instant::now();
                 let mut retry_count = 0;
@@ -5028,7 +5154,7 @@ fn test_query_conflict() {
     let builder = MultiTaskRuntimeBuilder::default();
     let rt1 = builder.build();
 
-    rt.spawn(async move {
+    let _ = rt.spawn(async move {
         let guid_gen = GuidGen::new(run_nanos(), 0);
         let commit_logger_builder = CommitLoggerBuilder::new(rt_copy.clone(), "./.commit_log");
         let commit_logger = commit_logger_builder
@@ -5096,7 +5222,7 @@ fn test_query_conflict() {
                 let rt_copy_ = rt1.clone();
                 let db_copy = db.clone();
                 let table_name_copy = table_name.clone();
-                rt1.spawn(async move {
+                let _ = rt1.spawn(async move {
                     let mut conflict_count = 0;
                     for _ in 0..1000 {
                         let now = Instant::now();
@@ -5165,7 +5291,7 @@ fn test_query_conflict() {
                 let rt_copy_ = rt_copy.clone();
                 let db_copy = db.clone();
                 let table_name_copy = table_name.clone();
-                rt_copy.spawn(async move {
+                let _ = rt_copy.spawn(async move {
                     let mut conflict_count = 0;
                     for _ in 0..10000 {
                         let now = Instant::now();
@@ -5236,7 +5362,7 @@ fn test_dirty_query_conflict() {
     let builder = MultiTaskRuntimeBuilder::default();
     let rt1 = builder.build();
 
-    rt.spawn(async move {
+    let _ = rt.spawn(async move {
         let guid_gen = GuidGen::new(run_nanos(), 0);
         let commit_logger_builder = CommitLoggerBuilder::new(rt_copy.clone(), "./.commit_log");
         let commit_logger = commit_logger_builder
@@ -5304,7 +5430,7 @@ fn test_dirty_query_conflict() {
                 let rt_copy_ = rt1.clone();
                 let db_copy = db.clone();
                 let table_name_copy = table_name.clone();
-                rt1.spawn(async move {
+                let _ = rt1.spawn(async move {
                     let mut conflict_count = 0;
                     for _ in 0..1000 {
                         let now = Instant::now();
@@ -5373,7 +5499,7 @@ fn test_dirty_query_conflict() {
                 let rt_copy_ = rt_copy.clone();
                 let db_copy = db.clone();
                 let table_name_copy = table_name.clone();
-                rt_copy.spawn(async move {
+                let _ = rt_copy.spawn(async move {
                     let mut conflict_count = 0;
                     for _ in 0..10000 {
                         let now = Instant::now();
@@ -5444,7 +5570,7 @@ fn test_upsert_conflict() {
     let builder = MultiTaskRuntimeBuilder::default();
     let rt1 = builder.build();
 
-    rt.spawn(async move {
+    let _ = rt.spawn(async move {
         let guid_gen = GuidGen::new(run_nanos(), 0);
         let commit_logger_builder = CommitLoggerBuilder::new(rt_copy.clone(), "./.commit_log");
         let commit_logger = commit_logger_builder
@@ -5512,7 +5638,7 @@ fn test_upsert_conflict() {
                 let rt_copy_ = rt1.clone();
                 let db_copy = db.clone();
                 let table_name_copy = table_name.clone();
-                rt1.spawn(async move {
+                let _ = rt1.spawn(async move {
                     let mut conflict_count = 0;
                     for _ in 0..1000 {
                         let now = Instant::now();
@@ -5581,7 +5707,7 @@ fn test_upsert_conflict() {
                 let rt_copy_ = rt1.clone();
                 let db_copy = db.clone();
                 let table_name_copy = table_name.clone();
-                rt1.spawn(async move {
+                let _ = rt1.spawn(async move {
                     let mut conflict_count = 0;
                     for _ in 0..1000 {
                         let now = Instant::now();
@@ -5666,7 +5792,7 @@ fn test_dirty_upsert_conflict() {
     let builder = MultiTaskRuntimeBuilder::default();
     let rt1 = builder.build();
 
-    rt.spawn(async move {
+    let _ = rt.spawn(async move {
         let guid_gen = GuidGen::new(run_nanos(), 0);
         let commit_logger_builder = CommitLoggerBuilder::new(rt_copy.clone(), "./.commit_log");
         let commit_logger = commit_logger_builder
@@ -5734,7 +5860,7 @@ fn test_dirty_upsert_conflict() {
                 let rt_copy_ = rt1.clone();
                 let db_copy = db.clone();
                 let table_name_copy = table_name.clone();
-                rt1.spawn(async move {
+                let _ = rt1.spawn(async move {
                     let mut conflict_count = 0;
                     for _ in 0..1000 {
                         let now = Instant::now();
@@ -5803,7 +5929,7 @@ fn test_dirty_upsert_conflict() {
                 let rt_copy_ = rt1.clone();
                 let db_copy = db.clone();
                 let table_name_copy = table_name.clone();
-                rt1.spawn(async move {
+                let _ = rt1.spawn(async move {
                     let mut conflict_count = 0;
                     for _ in 0..1000 {
                         let now = Instant::now();
@@ -5888,7 +6014,7 @@ fn test_delete_conflict() {
     let builder = MultiTaskRuntimeBuilder::default();
     let rt1 = builder.build();
 
-    rt.spawn(async move {
+    let _ = rt.spawn(async move {
         let guid_gen = GuidGen::new(run_nanos(), 0);
         let commit_logger_builder = CommitLoggerBuilder::new(rt_copy.clone(), "./.commit_log");
         let commit_logger = commit_logger_builder
@@ -5956,7 +6082,7 @@ fn test_delete_conflict() {
                 let rt_copy_ = rt1.clone();
                 let db_copy = db.clone();
                 let table_name_copy = table_name.clone();
-                rt1.spawn(async move {
+                let _ = rt1.spawn(async move {
                     let mut conflict_count = 0;
                     for _ in 0..1000 {
                         let now = Instant::now();
@@ -6023,7 +6149,7 @@ fn test_delete_conflict() {
                 let rt_copy_ = rt1.clone();
                 let db_copy = db.clone();
                 let table_name_copy = table_name.clone();
-                rt1.spawn(async move {
+                let _ = rt1.spawn(async move {
                     let mut conflict_count = 0;
                     for _ in 0..1000 {
                         let now = Instant::now();
@@ -6106,7 +6232,7 @@ fn test_dirty_delete_conflict() {
     let builder = MultiTaskRuntimeBuilder::default();
     let rt1 = builder.build();
 
-    rt.spawn(async move {
+    let _ = rt.spawn(async move {
         let guid_gen = GuidGen::new(run_nanos(), 0);
         let commit_logger_builder = CommitLoggerBuilder::new(rt_copy.clone(), "./.commit_log");
         let commit_logger = commit_logger_builder
@@ -6174,7 +6300,7 @@ fn test_dirty_delete_conflict() {
                 let rt_copy_ = rt1.clone();
                 let db_copy = db.clone();
                 let table_name_copy = table_name.clone();
-                rt1.spawn(async move {
+                let _ = rt1.spawn(async move {
                     let mut conflict_count = 0;
                     for _ in 0..1000 {
                         let now = Instant::now();
@@ -6241,7 +6367,7 @@ fn test_dirty_delete_conflict() {
                 let rt_copy_ = rt1.clone();
                 let db_copy = db.clone();
                 let table_name_copy = table_name.clone();
-                rt1.spawn(async move {
+                let _ = rt1.spawn(async move {
                     let mut conflict_count = 0;
                     for _ in 0..1000 {
                         let now = Instant::now();
@@ -6328,7 +6454,7 @@ fn test_log_table_debug() {
                                   10000,
                                   10000);
 
-    rt.spawn(async move {
+    let _ = rt.spawn(async move {
         let guid_gen = GuidGen::new(run_nanos(), 0);
         let commit_logger_builder = CommitLoggerBuilder::new(rt_copy.clone(), "./db/.commit_log");
         let commit_logger = commit_logger_builder
@@ -6681,7 +6807,7 @@ fn test_append_new_commit_log() {
     let rt = builder.build();
     let rt_copy = rt.clone();
 
-    rt.spawn(async move {
+    let _ = rt.spawn(async move {
         let guid_gen = GuidGen::new(run_nanos(), 0);
         let commit_logger_builder = CommitLoggerBuilder::new(rt_copy.clone(), "./db/.commit_log");
         let commit_logger = commit_logger_builder
@@ -6793,7 +6919,7 @@ fn test_load_log_table_debug() {
     let rt = builder.build();
     let rt_copy = rt.clone();
 
-    rt.spawn(async move {
+    let _ = rt.spawn(async move {
         if let Ok(log) = LogFile::open(rt_copy,
                                        "./tests/db/.log_table_debug",
                                        8096,
@@ -7010,6 +7136,11 @@ impl LogTableDebugLoader {
     }
 }
 
+// 生成指定长度的重复字符串
+fn generate_string_with_repeated_char(len: usize, c: char) -> String {
+    std::iter::repeat(c).take(len).collect()
+}
+
 // 将u8序列化为二进制数据
 fn u8_to_binary(number: u8) -> Binary {
     let mut buffer = WriteBuffer::new();
@@ -7035,5 +7166,19 @@ fn binary_to_usize(bin: &Binary) -> Result<usize, ReadBonErr> {
     let mut buffer = ReadBuffer::new(bin, 0);
     usize::decode(&mut buffer)
 }
+
+// 将String序列化为二进制数据
+fn string_to_binary(str: String) -> Binary {
+    let mut buffer = WriteBuffer::new();
+    str.encode(&mut buffer);
+    Binary::new(buffer.bytes)
+}
+
+// 将二进制数据反序列化为String
+fn binary_to_string(bin: &Binary) -> Result<String, ReadBonErr> {
+    let mut buffer = ReadBuffer::new(bin, 0);
+    String::decode(&mut buffer)
+}
+
 
 

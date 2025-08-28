@@ -2,6 +2,7 @@
 #![feature(once_cell)]
 #![feature(const_trait_impl)]
 #![feature(unboxed_closures)]
+#![feature(min_specialization)]
 
 use std::ops::Deref;
 use std::fmt::Debug;
@@ -16,11 +17,12 @@ use bytes::{Buf, BufMut};
 use log::warn;
 
 use pi_bon::{WriteBuffer, ReadBuffer, Encode, Decode, ReadBonErr};
-use pi_guid::Guid;
 use pi_sinfo::EnumType;
 use pi_async_rt::rt::{AsyncRuntime,
                       multi_thread::MultiTaskRuntime};
 use pi_async_transaction::{AsyncCommitLog, TransactionError, ErrorLevel};
+use pi_guid::Guid;
+use pi_ordmap::asbtree::TreeByteSize;
 
 pub mod db;
 pub mod tables;
@@ -114,6 +116,12 @@ impl PartialEq for Binary {
 impl Default for Binary {
     fn default() -> Self {
         Binary(Arc::new(Vec::default()))
+    }
+}
+
+impl TreeByteSize for Binary {
+    fn tree_bytes_size(&self) -> u64 {
+        self.0.len() as u64
     }
 }
 
