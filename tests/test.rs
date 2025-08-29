@@ -3895,9 +3895,9 @@ fn test_b_tree_table_write_iteraton_for_memory() {
             Ok(db) => {
                 println!("!!!!!!db table size: {:?}", db.table_size().await);
 
-                let mut table_names = Vec::with_capacity(100);
+                let mut table_names = Vec::with_capacity(10);
                 let tr = db.transaction(Atom::from("create b-tree table"), true, 500, 500).unwrap();
-                for index in 0..100 {
+                for index in 0..10 {
                     let table_name = Atom::from("test_log/".to_string() + &index.to_string());
                     if let Err(e) = tr.create_table(table_name.clone(),
                                                     KVTableMeta::new(KVDBTableType::BtreeOrdTab,
@@ -3932,19 +3932,15 @@ fn test_b_tree_table_write_iteraton_for_memory() {
                 });
 
                 let table_names_copy = table_names.clone();
-                for table_name_copy in table_names_copy {
+                for table_name_copy in table_names_copy.clone() {
                     let rt_clone = rt_copy.clone();
                     let db_copy = db.clone();
                     let _ = rt_copy.spawn(async move {
-                        let value = generate_string_with_repeated_char(256, 'a');
+                        let value = generate_string_with_repeated_char(1 * 1024, 'a');
 
                         let now = Instant::now();
                         let mut trs = Vec::with_capacity(10000);
                         for index in 0..10000 {
-                            if (index + 1) % 1000 == 0 {
-                                println!("!!!!!!insert, table: {:?}, table_size: {:?}, count: {:?}, time: {:?}", table_name_copy, db_copy.table_cache_size(&table_name_copy).await, index + 1, now.elapsed());
-                            }
-
                             let tr = db_copy.transaction(Atom::from("test b-tree table"), true, 500, 500).unwrap();
                             let _r = tr.upsert(vec![
                                 TableKV {
@@ -3973,6 +3969,35 @@ fn test_b_tree_table_write_iteraton_for_memory() {
                                     }
                                 },
                             }
+
+                            let tr = db_copy.transaction(Atom::from("test b-tree table"), true, 500, 500).unwrap();
+                            let _r = tr.delete(vec![
+                                TableKV {
+                                    table: table_name_copy.clone(),
+                                    key: usize_to_binary(index),
+                                    value: None
+                                }
+                            ]).await;
+                            match tr.prepare_modified().await {
+                                Err(_e) => {
+                                    if let Err(e) = tr.rollback_modified().await {
+                                        println!("delete rollback failed, reason: {:?}", e);
+                                    }
+                                },
+                                Ok(output) => {
+                                    if let Err(e) = tr.commit_modified(output).await {
+                                        if let ErrorLevel::Fatal = &e.level() {
+                                            println!("delete rollback failed, reason: commit fatal error");
+                                        } else {
+                                            if let Err(e) = tr.rollback_modified().await {
+                                                println!("delete rollback failed, reason: {:?}", e);
+                                            }
+                                        }
+                                    } else {
+                                        trs.push(tr);
+                                    }
+                                },
+                            }
                         }
 
                         println!("!!!!!!table0: {:?}, table_size: {:?}", table_name_copy, db_copy.table_cache_size(&table_name_copy).await);
@@ -3980,6 +4005,41 @@ fn test_b_tree_table_write_iteraton_for_memory() {
                         rt_clone.timeout(65000).await;
                         println!("!!!!!!table1: {:?}, table_size: {:?}", table_name_copy, db_copy.table_cache_size(&table_name_copy).await);
                     });
+                }
+
+                println!("wait insert...");
+                rt_copy.timeout(60000).await;
+
+                for table_name_copy in table_names_copy.clone() {
+                    let rt_clone = rt_copy.clone();
+                    let db_copy = db.clone();
+                    let _ = rt_copy.spawn(async move {
+                        for index in 0..10000 {
+                            rt_clone.timeout(1000).await;
+                            let tr = db_copy.transaction(Atom::from("test b-tree table"), false, 500, 500).unwrap();
+                            let _ = tr.query(vec![
+                                TableKV {
+                                    table: table_name_copy.clone(),
+                                    key: usize_to_binary(index),
+                                    value: None,
+                                }
+                            ]).await;
+                        }
+                    });
+                }
+
+                for table_name_copy in table_names_copy {
+                    let rt_clone = rt_copy.clone();
+                    let db_copy = db.clone();
+                    let tr = db_copy.transaction(Atom::from("test b-tree table"), false, 500, 500).unwrap();
+                    let mut iter = tr.values(table_name_copy.clone(), None, false).await.unwrap();
+                    let _ = rt_copy.spawn(async move {
+                        while let Some((_key, _value)) = iter.next().await {
+                            rt_clone.timeout(1000).await;
+                        }
+                    });
+
+                    println!("!!!!!!table2: {:?}, table_size: {:?}", table_name_copy, db_copy.table_cache_size(&table_name_copy).await);
                 }
             },
         }
