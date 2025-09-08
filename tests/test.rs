@@ -3284,9 +3284,22 @@ fn test_b_tree_table_delete_iteraton() {
             Ok(db) => {
                 println!("!!!!!!db table size: {:?}", db.table_size().await);
 
-                let table_name = Atom::from("test_log/a/b/c");
-                let tr = db.transaction(table_name.clone(), true, 500, 500).unwrap();
-                if let Err(e) = tr.create_table(table_name.clone(),
+                let table_name0 = Atom::from("test_log/a/b/c");
+                let tr = db.transaction(table_name0.clone(), true, 500, 500).unwrap();
+                if let Err(e) = tr.create_table(table_name0.clone(),
+                                                KVTableMeta::new(KVDBTableType::BtreeOrdTab,
+                                                                 true,
+                                                                 EnumType::Usize,
+                                                                 EnumType::Usize)).await {
+                    //创建有序内存表失败
+                    println!("!!!!!!create b-tree ordered table failed, reason: {:?}", e);
+                }
+                let output = tr.prepare_modified().await.unwrap();
+                let _ = tr.commit_modified(output).await;
+
+                let table_name1 = Atom::from("test_log/e/f/g");
+                let tr = db.transaction(table_name1.clone(), true, 500, 500).unwrap();
+                if let Err(e) = tr.create_table(table_name1.clone(),
                                                 KVTableMeta::new(KVDBTableType::BtreeOrdTab,
                                                                  true,
                                                                  EnumType::Usize,
@@ -3303,11 +3316,11 @@ fn test_b_tree_table_delete_iteraton() {
                 rt_copy.timeout(1500).await;
                 println!("");
 
-                println!("!!!!!!test_log is exist: {:?}", db.is_exist(&table_name).await);
-                println!("!!!!!!test_log is ordered table: {:?}", db.is_ordered_table(&table_name).await);
-                println!("!!!!!!test_log is persistent table: {:?}", db.is_persistent_table(&table_name).await);
-                println!("!!!!!!test_log table_dir: {:?}", db.table_path(&table_name).await);
-                println!("!!!!!!test_log table len: {:?}", db.table_record_size(&table_name).await);
+                println!("!!!!!!test_log is exist: {:?}", db.is_exist(&table_name0).await);
+                println!("!!!!!!test_log is ordered table: {:?}", db.is_ordered_table(&table_name0).await);
+                println!("!!!!!!test_log is persistent table: {:?}", db.is_persistent_table(&table_name0).await);
+                println!("!!!!!!test_log table_dir: {:?}", db.table_path(&table_name0).await);
+                println!("!!!!!!test_log table len: {:?}", db.table_record_size(&table_name0).await);
 
                 //操作数据库事务
                 rt_copy.timeout(1500).await;
@@ -3317,7 +3330,7 @@ fn test_b_tree_table_delete_iteraton() {
                 let tr = db.transaction(Atom::from("test b-tree table"), true, 500, 500).unwrap();
                 let _r = tr.upsert(vec![
                     TableKV {
-                        table: table_name.clone(),
+                        table: table_name0.clone(),
                         key: usize_to_binary(index),
                         value: Some(usize_to_binary(index))
                     }
@@ -3348,7 +3361,8 @@ fn test_b_tree_table_delete_iteraton() {
 
                 let (sender, receiver) = unbounded();
                 let db_copy = db.clone();
-                let table_name_copy = table_name.clone();
+                let table_name0_copy = table_name0.clone();
+                let table_name1_copy = table_name1.clone();
                 let sender_copy = sender.clone();
                 let start = Instant::now();
                 let _ = rt_copy.spawn(async move {
@@ -3357,7 +3371,7 @@ fn test_b_tree_table_delete_iteraton() {
                         let tr = db_copy.transaction(Atom::from("test b-tree table"), true, 500, 500).unwrap();
                         let _r = tr.upsert(vec![
                             TableKV {
-                                table: table_name_copy.clone(),
+                                table: table_name0_copy.clone(),
                                 key: usize_to_binary(index),
                                 value: Some(usize_to_binary(index))
                             }
@@ -3386,7 +3400,7 @@ fn test_b_tree_table_delete_iteraton() {
 
 
                         let tr = db.transaction(Atom::from("test b-tree table"), false, 500, 500).unwrap();
-                        let mut values = tr.values(table_name.clone(), None, false).await.unwrap();
+                        let mut values = tr.values(table_name0.clone(), None, false).await.unwrap();
                         while let Some((key, value)) = values.next().await {
                             assert_eq!(binary_to_usize(&key).unwrap(), binary_to_usize(&value).unwrap())
                         }
@@ -3396,7 +3410,7 @@ fn test_b_tree_table_delete_iteraton() {
                         let tr = db.transaction(Atom::from("test b-tree table"), false, 500, 500).unwrap();
                         let r = tr.query(vec![
                             TableKV {
-                                table: table_name.clone(),
+                                table: table_name0.clone(),
                                 key: usize_to_binary(index),
                                 value: None
                             }
@@ -3408,10 +3422,25 @@ fn test_b_tree_table_delete_iteraton() {
                         let tr = db.transaction(Atom::from("test b-tree table"), true, 500, 500).unwrap();
                         let r = tr.delete(vec![
                             TableKV {
-                                table: table_name_copy.clone(),
+                                table: table_name0_copy.clone(),
                                 key: usize_to_binary(index),
                                 value: None
-                            }
+                            },
+                        ]).await;
+                        let r = tr.upsert(vec![
+                            TableKV {
+                                table: table_name0_copy.clone(),
+                                key: usize_to_binary(1),
+                                value: Some(usize_to_binary(1))
+                            },
+                        ]).await;
+                        assert!(r.is_ok());
+                        let r = tr.upsert(vec![
+                            TableKV {
+                                table: table_name1_copy.clone(),
+                                key: usize_to_binary(index),
+                                value: Some(usize_to_binary(index))
+                            },
                         ]).await;
                         assert!(r.is_ok());
                         match tr.prepare_modified().await {
@@ -3440,19 +3469,27 @@ fn test_b_tree_table_delete_iteraton() {
                         let tr = db.transaction(Atom::from("test b-tree table"), false, 500, 500).unwrap();
                         let r = tr.query(vec![
                             TableKV {
-                                table: table_name.clone(),
+                                table: table_name0.clone(),
                                 key: usize_to_binary(index),
                                 value: None
                             }
                         ]).await;
                         assert!(r.len() == 1 && r[0].is_none());
+                        let r = tr.query(vec![
+                            TableKV {
+                                table: table_name0.clone(),
+                                key: usize_to_binary(1),
+                                value: None
+                            }
+                        ]).await;
+                        assert!(r.len() == 1 && r[0].is_some());
 
 
 
                         let tr = db.transaction(Atom::from("test b-tree table"), false, 500, 500).unwrap();
-                        let mut values = tr.values(table_name.clone(), None, false).await.unwrap();
+                        let mut values = tr.values(table_name0.clone(), None, false).await.unwrap();
                         while let Some((key, value)) = values.next().await {
-                            panic!("n: {:?}, key: {:?}, value: {:?}", n, binary_to_usize(&key).unwrap(), binary_to_usize(&value).unwrap());
+                            assert_eq!(binary_to_usize(&key).unwrap(), 1);
                         }
                     }
 
@@ -3925,9 +3962,9 @@ fn test_b_tree_table_write_iteraton_for_memory() {
                     loop {
                         rt_clone.timeout(65000).await;
                         let mut b = false;
-                        #[cfg(target_os = "linux")]
-                        b = db_copy.cleanup_buffer_after_collect_table();
-                        println!("!!!!!!cleanup_buffer_after_collect_table: {:?}", b);
+                        // #[cfg(target_os = "linux")]
+                        // b = db_copy.cleanup_buffer_after_collect_table();
+                        // println!("!!!!!!cleanup_buffer_after_collect_table: {:?}", b);
                     }
                 });
 

@@ -989,10 +989,12 @@ impl<
 
             let locked = tr.0.cache_mut.lock();
             if let Some(Some(value)) = locked.get(&key) {
+                println!("!!!!!!query key in cache, key: {:?}, value: {:?}", key, value);
                 //指定关键字的值在临时缓存中存在
                 return Some(value.clone());
             } else {
                 if locked.has(&key) {
+                    println!("!!!!!!query key in cache, key: {:?}, value: None", key);
                     //指定关键字在临时缓存中存在，但值已移除
                     return None;
                 } else {
@@ -1002,8 +1004,11 @@ impl<
                         if let Ok(inner_table) = trans.open_table(DEFAULT_TABLE_NAME) {
                             if let Ok(Some(value)) = inner_table.get(&key) {
                                 let val = value.value();
+                                println!("!!!!!!query key in file, key: {:?}, value: {:?}", key, val);
                                 let _ = tr.0.cache_ref.lock().upsert(key, Some(val.clone()), false);
                                 return Some(val);
+                            } else {
+                                println!("!!!!!!query key in file, key: {:?}, value: None", key);
                             }
                         }
                     }
@@ -1031,6 +1036,7 @@ impl<
             //记录对指定关键字的最新插入或更新操作
             let _ = tr.0.actions.lock().insert(key.clone(), KVActionLog::Write(Some(value.clone())));
 
+            println!("!!!!!!upsert key, key: {:?}, value: {:?}", key, value);
             //插入或更新指定的键值对
             let _ = tr.0.cache_mut.lock().upsert(key, Some(value), false);
 
@@ -1062,6 +1068,7 @@ impl<
                 None
             };
 
+            println!("!!!!!!delete key, key: {:?}", key);
             //需要标记删除
             let _ = locked.upsert(key, None, false);
 
