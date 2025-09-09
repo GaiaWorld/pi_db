@@ -1,25 +1,24 @@
 [package]
 name    = "pi_db_table_conversion"
 version = "0.1.0"
-edition = "2018"
+edition = "2024"
 
 [profile.release]
 debug = true
 
 [dependencies]
 clap                 = { version = "4.5", features = ["derive"] }
-pi_async             = "0.2"
-pi_async_file        = "~0.6"
+pi_async_file        = "~0.7"
 crossbeam-channel    = "0.5"
 log                  = "0.4"
 env_logger           = "0.8"
-pi-async-rt          = "~0.1"
-pi_db                = "0.10"
+pi-async-rt          = "~0.2"
+pi_db                = "0.12"
 pi_guid              = "~0.1"
-pi_time              = "~0.3"
-pi_store             = "~0.6"
-pi_async_transaction = "~0.8"
-pi_atom              = "~0.5"
-pi_sinfo             = { version = "~0.3" }
+pi_time              = "~0.5"
+pi_store             = "~0.8"
+pi_async_transaction = "~0.10"
+pi_atom              = "~0.6"
+pi_sinfo             = { version = "~0.5" }
 futures              = "0.3"
 lazy_static          = "1.4"
