@@ -982,15 +982,11 @@ impl<
             }
 
             let locked = tr.0.cache_mut.lock();
-            let r = locked.get(&key);
-            println!("!!!!!!query key, key: {:?}, r: {:?}", key, r);
-            if let Some(Some(value)) = r {
-                println!("!!!!!!query key in cache, key: {:?}, value: {:?}", key, value);
+            if let Some(Some(value)) = locked.get(&key) {
                 //指定关键字的值在临时缓存中存在
                 return Some(value.clone());
             } else {
                 if locked.has(&key) {
-                    println!("!!!!!!query key in cache, key: {:?}, value: None", key);
                     //指定关键字在临时缓存中存在，但值已移除
                     return None;
                 } else {
@@ -1000,11 +996,8 @@ impl<
                         if let Ok(inner_table) = trans.open_table(DEFAULT_TABLE_NAME) {
                             if let Ok(Some(value)) = inner_table.get(&key) {
                                 let val = value.value();
-                                println!("!!!!!!query key in file, key: {:?}, value: {:?}", key, val);
                                 let _ = tr.0.cache_ref.lock().upsert(key, Some(val.clone()), false);
                                 return Some(val);
-                            } else {
-                                println!("!!!!!!query key in file, key: {:?}, value: None", key);
                             }
                         }
                     }
@@ -1032,7 +1025,6 @@ impl<
             //记录对指定关键字的最新插入或更新操作
             let _ = tr.0.actions.lock().insert(key.clone(), KVActionLog::Write(Some(value.clone())));
 
-            println!("!!!!!!upsert key, key: {:?}, value: {:?}", key, value);
             //插入或更新指定的键值对
             let _ = tr.0.cache_mut.lock().upsert(key, Some(value), false);
 
@@ -1065,11 +1057,7 @@ impl<
             };
 
             //需要标记删除
-            let r = locked.upsert(key.clone(), None, false);
-            println!("!!!!!!delete key, key: {:?}, r: {:?}", key, r);
-            let r = locked.get(&key);
-            println!("!!!!!!delete query, key: {:?}, r: {:?}", key, r);
-
+            let _ = locked.upsert(key, None, false);
 
             Ok(result)
         }.boxed()
@@ -1884,13 +1872,11 @@ impl<
                 //一般是因为其它事务更新了与当前事务无关的关键字，
                 //则将当前事务的修改直接作用在当前有序B树表的临时缓存中
                 for key in require_delete_keys {
-                    println!("!!!!!!delete cache, key: {:?}", key);
                     let _ = locked.delete(key, false);
                 }
             } else {
                 //有序B树表的临时缓存的根节点在当前事务执行过程中未改变，则用本次事务修改并提交成功的根节点替换有序B树表的临时缓存的根节点
                 *locked = self.0.cache_mut.lock().clone();
-                println!("!!!!!!delete cache");
             }
         }
     }
