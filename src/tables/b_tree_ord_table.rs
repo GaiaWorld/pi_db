@@ -989,7 +989,7 @@ impl<
 
             let locked = tr.0.cache_mut.lock();
             let r = locked.get(&key);
-            println!("!!!!!!query key, r: {:?}", r);
+            println!("!!!!!!query key, key: {:?}, r: {:?}", key, r);
             if let Some(Some(value)) = r {
                 println!("!!!!!!query key in cache, key: {:?}, value: {:?}", key, value);
                 //指定关键字的值在临时缓存中存在
@@ -1070,9 +1070,12 @@ impl<
                 None
             };
 
-            println!("!!!!!!delete key, key: {:?}", key);
             //需要标记删除
-            let _ = locked.upsert(key, None, false);
+            let r = locked.upsert(key.clone(), None, false);
+            println!("!!!!!!delete key, key: {:?}, r: {:?}", key, r);
+            let r = locked.get(&key);
+            println!("!!!!!!delete query, key: {:?}, r: {:?}", key, r);
+
 
             Ok(result)
         }.boxed()
