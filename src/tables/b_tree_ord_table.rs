@@ -1885,11 +1885,13 @@ impl<
                 //一般是因为其它事务更新了与当前事务无关的关键字，
                 //则将当前事务的修改直接作用在当前有序B树表的临时缓存中
                 for key in require_delete_keys {
+                    println!("!!!!!!delete cache, key: {:?}", key);
                     let _ = locked.delete(key, false);
                 }
             } else {
                 //有序B树表的临时缓存的根节点在当前事务执行过程中未改变，则用本次事务修改并提交成功的根节点替换有序B树表的临时缓存的根节点
                 *locked = self.0.cache_mut.lock().clone();
+                println!("!!!!!!delete cache");
             }
         }
     }
