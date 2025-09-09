@@ -988,7 +988,9 @@ impl<
             }
 
             let locked = tr.0.cache_mut.lock();
-            if let Some(Some(value)) = locked.get(&key) {
+            let r = locked.get(&key);
+            println!("!!!!!!query key, r: {:?}", r);
+            if let Some(Some(value)) = r {
                 println!("!!!!!!query key in cache, key: {:?}, value: {:?}", key, value);
                 //指定关键字的值在临时缓存中存在
                 return Some(value.clone());
