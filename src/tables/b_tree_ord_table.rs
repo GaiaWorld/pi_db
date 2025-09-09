@@ -787,14 +787,11 @@ impl<
                             for (key, action) in actions.iter() {
                                 match action {
                                     KVActionLog::Write(None) | KVActionLog::DirtyWrite(None) => {
-                                        //删除指定关键字
-                                        if let Some(Some(Some(_))) = locked.delete(key, true) {
-                                            //指定关键字存在，则标记删除
-                                            let _ = locked.upsert(key.clone(), None, false);
+                                        //删除指定关键字，则标记删除
+                                        let _ = locked.upsert(key.clone(), None, false);
 
-                                            //标记最新删除的关键字
-                                            cache_flags.insert(key.clone(), transaction_uid.clone());
-                                        }
+                                        //标记最新删除的关键字
+                                        cache_flags.insert(key.clone(), transaction_uid.clone());
                                     },
                                     KVActionLog::Write(Some(value)) | KVActionLog::DirtyWrite(Some(value)) => {
                                         //插入或更新指定关键字
@@ -811,11 +808,8 @@ impl<
                             for (key, action) in actions.iter() {
                                 match action {
                                     KVActionLog::Write(None) | KVActionLog::DirtyWrite(None) => {
-                                        //删除指定关键字
-                                        if let Some(Some(Some(_))) = locked.delete(key, true) {
-                                            //标记最新删除的关键字
-                                            cache_flags.insert(key.clone(), transaction_uid.clone());
-                                        }
+                                        //删除指定关键字，则标记最新删除的关键字
+                                        cache_flags.insert(key.clone(), transaction_uid.clone());
                                     },
                                     KVActionLog::Write(Some(value)) | KVActionLog::DirtyWrite(Some(value)) => {
                                         //标记最新插入或更新的关键字
