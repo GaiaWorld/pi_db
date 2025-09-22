@@ -52,7 +52,7 @@ use crate::{Binary,
                                      LogOrdTabTr},
                      log_write_table::{LogWriteTable,
                                        LogWTabTr},
-                     b_tree_ord_table::{BtreeOrderedTable,
+                     b_tree_ord_table::{DEFAULT_CACHE_SIZE, BtreeOrderedTable,
                                         BtreeOrdTabTr}},
             utils::{CreateTableOptions, KVDBEvent}};
 
@@ -2915,7 +2915,7 @@ impl<
                     BtreeOrderedTable::try_new(self.0.db_mgr.0.rt.clone(),
                                                table_path,
                                                name.clone(),
-                                               16 * 1024 * 1024,
+                                               DEFAULT_CACHE_SIZE,
                                                true,
                                                1024 * 1024,
                                                60 * 1000,

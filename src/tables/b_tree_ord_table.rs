@@ -50,7 +50,7 @@ const DEFAULT_TABLE_NAME: TableDefinition<Binary, Binary> = TableDefinition::new
 const MIN_CACHE_SIZE: usize = 32 * 1024;
 
 // 默认缓存大小
-const DEFAULT_CACHE_SIZE: usize = 16 * 1024 * 1024;
+pub(crate) const DEFAULT_CACHE_SIZE: usize = 2 * 1024 * 1024;
 
 impl Value for Binary {
     type SelfType<'a>
