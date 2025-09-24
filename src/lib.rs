@@ -29,6 +29,15 @@ pub mod tables;
 pub mod inspector;
 pub mod utils;
 
+static BINARY_SHARED_ADD_COUNTER: AtomicUsize = AtomicUsize::new(0);
+static BINARY_SHARED_SUB_COUNTER: AtomicUsize = AtomicUsize::new(0);
+pub fn binary_shared_count() -> usize {
+    BINARY_SHARED_ADD_COUNTER
+        .load(Ordering::Acquire)
+        .checked_sub(BINARY_SHARED_SUB_COUNTER.load(Ordering::Acquire))
+        .unwrap_or(0)
+}
+
 ///
 /// 二进制数据
 ///
@@ -37,8 +46,15 @@ pub struct Binary(Arc<Vec<u8>>);
 
 unsafe impl Send for Binary {}
 
+impl Drop for Binary {
+    fn drop(&mut self) {
+        BINARY_SHARED_SUB_COUNTER.fetch_add(1, Ordering::Release);
+    }
+}
+
 impl Clone for Binary {
     fn clone(&self) -> Self {
+        BINARY_SHARED_ADD_COUNTER.fetch_add(1, Ordering::Release);
         Binary(self.0.clone())
     }
 }
@@ -115,6 +131,7 @@ impl PartialEq for Binary {
 
 impl Default for Binary {
     fn default() -> Self {
+        BINARY_SHARED_ADD_COUNTER.fetch_add(1, Ordering::Release);
         Binary(Arc::new(Vec::default()))
     }
 }
@@ -128,6 +145,7 @@ impl TreeByteSize for Binary {
 impl Binary {
     /// 构建指定的二进制数据
     pub fn new(bin: Vec<u8>) -> Self {
+        BINARY_SHARED_ADD_COUNTER.fetch_add(1, Ordering::Release);
         Binary(Arc::new(bin))
     }
 
@@ -138,11 +156,13 @@ impl Binary {
 
     /// 从指定的共享二进制转换为二进制数据
     pub fn from_shared(shared: Arc<Vec<u8>>) -> Self {
+        BINARY_SHARED_ADD_COUNTER.fetch_add(1, Ordering::Release);
         Binary(shared)
     }
 
     /// 从指定的二进制分片复制为二进制数据
     pub fn from_slice<B: AsRef<[u8]>>(slice: B) -> Self {
+        BINARY_SHARED_ADD_COUNTER.fetch_add(1, Ordering::Release);
         Binary(Arc::new(Vec::from(slice.as_ref())))
     }
 
@@ -153,6 +173,7 @@ impl Binary {
 
     /// 将二进制数据转换为共享二进制
     pub fn to_shared(&self) -> Arc<Vec<u8>> {
+        BINARY_SHARED_ADD_COUNTER.fetch_add(1, Ordering::Release);
         self.0.clone()
     }
 }
