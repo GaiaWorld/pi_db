@@ -1,6 +1,6 @@
 [package]
 name = "pi_db"
-version = "0.12.21"
+version = "0.12.22"
 authors = ["vmos <vmosone007@gmail.com>"]
 edition = "2021"
 description = "Full cache based database，support transaction"
@@ -31,7 +31,7 @@ pi_store = { version = "~0.8", path = "../pi_store" }
 pi_guid = "~0.1"
 pi_bon = "~0.3"
 pi_sinfo = "~0.5"
-pi_ordmap = "~0.3"
+pi_ordmap = "~0.3.2"
 pi_hash = "~0.1"
 redb = "~2.6"
 opentelemetry = { version = "~0.30", optional = true }
@@ -46,3 +46,6 @@ env_logger = "~0.11"
 fastrand = "~1.5"
 pi_time = "~0.5"
 chrono = "0.4"
+
+#[patch.crates-io]
+#pi_ordmap = { path = "../pi_ordmap" }
