@@ -34,9 +34,8 @@ static BINARY_SHARED_DEFAULT_COUNTER: AtomicUsize = AtomicUsize::new(0);
 static BINARY_SHARED_NEW_COUNTER: AtomicUsize = AtomicUsize::new(0);
 static BINARY_SHARED_FROM_SHARED_COUNTER: AtomicUsize = AtomicUsize::new(0);
 static BINARY_SHARED_FROM_SLICE_COUNTER: AtomicUsize = AtomicUsize::new(0);
-static BINARY_SHARED_TO_SHARED_COUNTER: AtomicUsize = AtomicUsize::new(0);
 static BINARY_SHARED_SUB_COUNTER: AtomicUsize = AtomicUsize::new(0);
-pub fn binary_shared_count() -> (usize, usize, usize, usize, usize, usize, usize) {
+pub fn binary_shared_count() -> (usize, usize, usize, usize, usize, usize) {
     let a = BINARY_SHARED_CLONE_COUNTER
         .load(Ordering::Acquire);
     let b = BINARY_SHARED_DEFAULT_COUNTER
@@ -47,13 +46,11 @@ pub fn binary_shared_count() -> (usize, usize, usize, usize, usize, usize, usize
         .load(Ordering::Acquire);
     let e = BINARY_SHARED_FROM_SLICE_COUNTER
         .load(Ordering::Acquire);
-    let f = BINARY_SHARED_TO_SHARED_COUNTER
-        .load(Ordering::Acquire);
-    let add: usize = a + b + c + d + e + f;
+    let add: usize = a + b + c + d + e;
     let current = add
         .checked_sub(BINARY_SHARED_SUB_COUNTER.load(Ordering::Acquire))
         .unwrap_or(0);
-    (current, a, b, c, d, e, f)
+    (current, a, b, c, d, e)
 }
 
 ///
@@ -191,7 +188,6 @@ impl Binary {
 
     /// 将二进制数据转换为共享二进制
     pub fn to_shared(&self) -> Arc<Vec<u8>> {
-        BINARY_SHARED_TO_SHARED_COUNTER.fetch_add(1, Ordering::Release);
         self.0.clone()
     }
 }
