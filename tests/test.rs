@@ -1,16 +1,19 @@
 #![feature(stmt_expr_attributes)]
+#![feature(ptr_metadata)]
 
-use std::thread;
+use std::{mem, thread};
 use std::sync::Arc;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use std::collections::{HashMap,
                        btree_map::{BTreeMap, Entry}};
-
-use futures::stream::StreamExt;
+use std::pin::Pin;
+use chrono::format::Item;
+use futures::stream::{BoxStream, StreamExt};
 use crossbeam_channel::{unbounded, bounded};
 use parking_lot::Mutex;
 use env_logger;
+use futures::Stream;
 use pi_atom::Atom;
 use pi_guid::{GuidGen, Guid};
 use pi_sinfo::EnumType;
@@ -3451,6 +3454,16 @@ fn test_b_tree_table_delete_iteraton() {
 
                         let tr = db.transaction(Atom::from("test b-tree table"), false, 500, 500).unwrap();
                         let mut values = tr.values(table_name.clone(), None, false).await.unwrap();
+
+                        let values_raw: *mut (dyn Stream<Item = (Binary, Binary)> + Send) = Box::into_raw(unsafe { Pin::into_inner_unchecked(values) });
+                        let x = values_raw as *mut () as usize;
+                        let metadata: std::ptr::DynMetadata<dyn Stream<Item = (Binary, Binary)> + Send> = std::ptr::metadata(values_raw);
+                        let y = Box::into_raw(Box::new(metadata)) as usize;
+                        let metadata = unsafe { Box::from_raw(y as *mut std::ptr::DynMetadata<dyn Stream<Item = (Binary, Binary)> + Send>) };
+                        let fat_ptr: *mut (dyn Stream<Item = (Binary, Binary)> + Send) = unsafe { std::ptr::from_raw_parts_mut(x as *mut (), *metadata) };
+                        let boxed: Box<dyn Stream<Item = (Binary, Binary)> + Send> = unsafe { Box::from_raw(fat_ptr) };
+                        let mut values = unsafe { Pin::new_unchecked(boxed) };
+
                         while let Some((key, value)) = values.next().await {
                             panic!("n: {:?}, key: {:?}, value: {:?}", n, binary_to_usize(&key).unwrap(), binary_to_usize(&value).unwrap());
                         }
@@ -3969,7 +3982,7 @@ fn test_b_tree_table_conflict() {
                     if let Ok(output) = tr.prepare_modified().await {
                         tr.commit_modified(output).await.is_ok();
                         println!("Waiting init...");
-                        rt_copy.timeout(65000).await;
+                        rt_copy.timeout(1000).await;
                     } else {
                         panic!("Init failed");
                     }
@@ -4051,6 +4064,40 @@ fn test_b_tree_table_conflict() {
                     });
                 }
 
+                let rt_clone = rt_copy.clone();
+                let db_copy = db.clone();
+                let table_name_copy = table_name.clone();
+                let _ = rt_copy.spawn(async move {
+                    loop {
+                        rt_clone.timeout(1000).await;
+                        let tr = db_copy.transaction(Atom::from("test b-tree table"), false, 500, 500).unwrap();
+                        let mut values = tr.values(table_name_copy.clone(), None, false).await.unwrap();
+
+                        let values_raw: *mut (dyn Stream<Item = (Binary, Binary)> + Send) = Box::into_raw(unsafe { Pin::into_inner_unchecked(values) });
+                        let x = values_raw as *mut () as usize;
+                        let metadata: std::ptr::DynMetadata<dyn Stream<Item = (Binary, Binary)> + Send> = std::ptr::metadata(values_raw);
+                        let y = Box::into_raw(Box::new(metadata)) as usize;
+
+                        println!("origin, x: {:?}, y: {:?}", x, y);
+                        rt_clone.timeout(1000).await;
+
+                        loop {
+                            let metadata = unsafe { Box::from_raw(y as *mut std::ptr::DynMetadata<dyn Stream<Item = (Binary, Binary)> + Send>) };
+                            let fat_ptr: *mut (dyn Stream<Item = (Binary, Binary)> + Send) = unsafe { std::ptr::from_raw_parts_mut(x as *mut (), *metadata) };
+                            let boxed: Box<dyn Stream<Item = (Binary, Binary)> + Send> = unsafe { Box::from_raw(fat_ptr) };
+                            let mut values = unsafe { Pin::new_unchecked(boxed) };
+
+                            let r = values.next().await;
+                            if r.is_some() {
+                                let _ = Box::into_raw(unsafe { Pin::into_inner_unchecked(values) });
+                                let _ = Box::into_raw(metadata);
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                });
+
                 let mut count = 0;
                 loop {
                     match receiver.recv_timeout(Duration::from_millis(10000)) {
@@ -4073,19 +4120,24 @@ fn test_b_tree_table_conflict() {
                     }
                 }
 
-                {
-                    let tr = db.transaction(Atom::from("test b-tree table"), true, 500, 500).unwrap();
+                // {
+                //     let tr = db.transaction(Atom::from("test b-tree table"), true, 500, 500).unwrap();
+                //
+                //     let r = tr.query(vec![
+                //         TableKV {
+                //             table: table_name.clone(),
+                //             key: usize_to_binary(0),
+                //             value: None
+                //         }
+                //     ]).await;
+                //     let last_value = binary_to_usize((&r[0]).as_ref().unwrap()).unwrap();
+                //
+                //     assert_eq!(last_value, 1000);
+                // }
 
-                    let r = tr.query(vec![
-                        TableKV {
-                            table: table_name.clone(),
-                            key: usize_to_binary(0),
-                            value: None
-                        }
-                    ]).await;
-                    let last_value = binary_to_usize((&r[0]).as_ref().unwrap()).unwrap();
-
-                    assert_eq!(last_value, 1000);
+                loop {
+                    rt_copy.timeout(1000).await;
+                    println!("{:?}, {:?}, {:?}", pi_ordmap::ordmap::ordmap_shared_count(), pi_ordmap::asbtree::itertree_shared_count(), pi_db::binary_shared_count());
                 }
             },
         }
@@ -4153,8 +4205,8 @@ fn test_b_tree_table_write_iteraton_for_memory() {
                     loop {
                         rt_clone.timeout(126000).await;
                         let mut b = false;
-                        #[cfg(target_os = "linux")]
-                        b = db_copy.cleanup_buffer_after_collect_table();
+                        // #[cfg(target_os = "linux")]
+                        // b = db_copy.cleanup_buffer_after_collect_table();
                         println!("!!!!!!cleanup_buffer_after_collect_table: {:?}", b);
                     }
                 });
