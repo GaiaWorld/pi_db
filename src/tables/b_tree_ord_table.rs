@@ -282,14 +282,14 @@ impl<
     {
         Self::try_new(rt,
                       path,
-                      name,
+                      name.clone(),
                       cache_size,
                       enable_compact,
                       waits_limit,
                       wait_timeout,
                       notifier)
             .await
-            .unwrap()
+            .expect(format!("Open b-tree ordered table failed, table: {:?}, reason: Attempted to open a table that is already open", name.as_str()).as_str())
     }
 
     /// 尝试构建一个有序B树表，同时只允许构建一个同路径下的有序B树表，如果已经构建则返回空
