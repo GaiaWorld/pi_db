@@ -1,6 +1,6 @@
 [package]
 name = "pi_db"
-version = "0.12.26"
+version = "0.12.27"
 authors = ["vmos <vmosone007@gmail.com>"]
 edition = "2021"
 description = "Full cache based database，support transaction"
@@ -18,7 +18,7 @@ parking_lot = "~0.12"
 futures = "~0.3"
 crossbeam-channel = "~0.5"
 async-lock = "~3.4"
-async-channel = "~2.3"
+async-channel = "~2.5"
 async-stream = "~0.3"
 bytes = "~1.10"
 dashmap = "~6.1"
