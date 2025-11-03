@@ -165,15 +165,18 @@ impl<
     Log: AsyncCommitLog<C = C, Cid = Guid>,
 > KVDBManagerBuilder<C, Log> {
     /// 异步启动键值对数据库，并返回键值对数据库的管理器
-    pub async fn startup(self) -> IOResult<KVDBManager<C, Log>> {
+    pub async fn startup(self, enable_accelerated_repair: bool) -> IOResult<KVDBManager<C, Log>> {
         self
-            .startup_with_listener::<fn(&KVDBManager<C, Log>, &Transaction2PcManager<C, Log>, &mut Vec<KVDBEvent<Guid>>)>(None)
+            .startup_with_listener::<fn(&KVDBManager<C, Log>, &Transaction2PcManager<C, Log>, &mut Vec<KVDBEvent<Guid>>)>(enable_accelerated_repair, None)
             .await
     }
 
     /// 异步启动指定监听器的键值对数据库，并返回键值对数据库的管理器
-    pub async fn startup_with_listener<F>(self, db_event_listener: Option<F>)
-                                          -> IOResult<KVDBManager<C, Log>>
+    pub async fn startup_with_listener<F>(
+        self,
+        enable_accelerated_repair: bool,
+        db_event_listener: Option<F>
+    ) -> IOResult<KVDBManager<C, Log>>
     where F: FnMut(&KVDBManager<C, Log>, &Transaction2PcManager<C, Log>, &mut Vec<KVDBEvent<Guid>>) + Send + Sync + 'static
     {
         if !self.tables_meta_path.exists() {
@@ -286,7 +289,11 @@ impl<
             swap(&mut table_metas_buf, &mut table_metas);
 
             //异步批量加载表
-            if let Err(e) = tr.create_multiple_tables(table_metas, true).await {
+            if let Err(e) = tr.create_multiple_tables(
+                table_metas,
+                true,
+                enable_accelerated_repair
+            ).await {
                 //加载指定的表失败，则立即返回错误原因
                 db_mgr.0.status.store(DB_UNSTARTUP_STATUS, Ordering::SeqCst);
                 return Err(Error::new(ErrorKind::Other,
@@ -297,7 +304,11 @@ impl<
         }
         if table_metas_buf.len() > 0 {
             //异步批量加载剩余的表
-            if let Err(e) = tr.create_multiple_tables(table_metas_buf, true).await {
+            if let Err(e) = tr.create_multiple_tables(
+                table_metas_buf,
+                true,
+                enable_accelerated_repair
+            ).await {
                 //加载指定的表失败，则立即返回错误原因
                 db_mgr.0.status.store(DB_UNSTARTUP_STATUS, Ordering::SeqCst);
                 return Err(Error::new(ErrorKind::Other,
@@ -312,7 +323,7 @@ impl<
 
         //如果有未确认的提交日志，则尝试修复数据库表数据
         let now = Instant::now();
-        match db_mgr.try_repair().await {
+        match db_mgr.try_repair(enable_accelerated_repair).await {
             Err(e) => {
                 //有未确认的提交日志，且尝试修复数据库表数据失败，则立即返回错误原因
                 return Err(e);
@@ -778,7 +789,7 @@ impl<
 
     // 尝试幂等的重播未确认的提交日志，并修复数据库表数据
     // 注意如果在只有单个线程的运行时修复或并发修复，则可能会发生阻塞
-    pub(crate) async fn try_repair(&self) -> IOResult<(usize, usize)> {
+    pub(crate) async fn try_repair(&self, enable_accelerated_repair: bool) -> IOResult<(usize, usize)> {
         //构建重播回调
         let db_mgr = self.clone();
 
@@ -833,7 +844,11 @@ impl<
                                     };
                                     let table_meta = KVTableMeta::from(value);
 
-                                    if let Err(e) = tr.repair_create_table(table_name.clone(), table_meta.clone()).await {
+                                    if let Err(e) = tr.repair_create_table(
+                                        table_name.clone(),
+                                        table_meta.clone(),
+                                        enable_accelerated_repair,
+                                    ).await {
                                         //重播的创建表失败，则立即返回错误原因
                                         let _ = sender.send(Err(Error::new(ErrorKind::Other, format!("Repair tables meta failed, transaction_uid: {:?}, commit_uid: {:?}, table_name: {:?}, table_meta: {:?}, reason: {:?}", transaciton_uid, commit_uid_copy, table_name, table_meta, e))));
                                         return;
@@ -1716,10 +1731,16 @@ impl<
     pub async fn create_table_with_options(&self,
                                            name: Atom,
                                            meta: KVTableMeta,
-                                           options: CreateTableOptions) -> IOResult<()> {
+                                           options: CreateTableOptions,
+                                           enable_accelerated_repair: bool) -> IOResult<()> {
         match self {
             KVDBTransaction::RootTr(tr) => {
-                tr.create_table_with_options(name, meta, options).await
+                tr.create_table_with_options(
+                    name,
+                    meta,
+                    options,
+                    enable_accelerated_repair
+                ).await
             },
             _ => panic!("Create table failed, reason: invalid root transaction"),
         }
@@ -1728,10 +1749,15 @@ impl<
     /// 异步创建表，需要指定表名和表的元信息
     pub async fn create_table(&self,
                               name: Atom,
-                              meta: KVTableMeta) -> IOResult<()> {
+                              meta: KVTableMeta,
+                              enable_accelerated_repair: bool) -> IOResult<()> {
         match self {
             KVDBTransaction::RootTr(tr) => {
-                tr.create_table(name, meta).await
+                tr.create_table(
+                    name,
+                    meta,
+                    enable_accelerated_repair
+                ).await
             },
             _ => panic!("Create table failed, reason: invalid root transaction"),
         }
@@ -1740,12 +1766,17 @@ impl<
     /// 异步批量创建表，只允许在初始化加载表时使用
     pub(crate) async fn create_multiple_tables(&self,
                                                table_metas: Vec<(Atom, KVTableMeta, Option<CreateTableOptions>)>,
-                                               is_checksum: bool)
+                                               is_checksum: bool,
+                                               enable_accelerated_repair: bool)
         -> IOResult<()>
     {
         match self {
             KVDBTransaction::RootTr(tr) => {
-                tr.create_multiple_tables(table_metas, is_checksum).await
+                tr.create_multiple_tables(
+                    table_metas,
+                    is_checksum,
+                    enable_accelerated_repair
+                ).await
             },
             _ => panic!("Create multiple table failed, reason: invalid root transaction"),
         }
@@ -1754,10 +1785,11 @@ impl<
     /// 异步修复创建表，需要指定表名和表的元信息
     pub(crate) async fn repair_create_table(&self,
                                             name: Atom,
-                                            meta: KVTableMeta) -> IOResult<()> {
+                                            meta: KVTableMeta,
+                                            enable_accelerated_repair: bool) -> IOResult<()> {
         match self {
             KVDBTransaction::RootTr(tr) => {
-                tr.repair_create_table(name, meta).await
+                tr.repair_create_table(name, meta, enable_accelerated_repair).await
             },
             _ => panic!("Create table failed, reason: invalid root transaction"),
         }
@@ -2369,7 +2401,8 @@ impl<
     async fn create_table_with_options(&self,
                                        name: Atom,
                                        meta: KVTableMeta,
-                                       options: CreateTableOptions) -> IOResult<()>
+                                       options: CreateTableOptions,
+                                       enable_accelerated_repair: bool) -> IOResult<()>
     {
         //检查待创建的指定名称的表是否存在
         let meta_table_name = Atom::from(DEFAULT_DB_TABLES_META_DIR);
@@ -2508,6 +2541,7 @@ impl<
                                                enable_compact,
                                                1024 * 1024,
                                                60 * 1000,
+                                               enable_accelerated_repair,
                                                self.0.db_mgr.0.notifier.clone()).await;
 
                     //注册创建的有序日志表
@@ -2556,7 +2590,8 @@ impl<
     #[inline]
     async fn create_table(&self,
                           name: Atom,
-                          meta: KVTableMeta) -> IOResult<()>
+                          meta: KVTableMeta,
+                          enable_accelerated_repair: bool) -> IOResult<()>
     {
         match meta.table_type {
             KVDBTableType::LogOrdTab => {
@@ -2564,20 +2599,23 @@ impl<
                                                meta,
                                                CreateTableOptions::LogOrdTab(512 * 1024 * 1024,
                                                                              2 * 1024 * 1024,
-                                                                             2 * 1024 * 1024))
+                                                                             2 * 1024 * 1024),
+                                               enable_accelerated_repair)
                     .await
             },
             KVDBTableType::BtreeOrdTab => {
                 self.create_table_with_options(name,
                                                meta,
                                                CreateTableOptions::BtreeOrdTab(16 * 1024 * 1024,
-                                                                               true))
+                                                                               true),
+                                               enable_accelerated_repair)
                     .await
             },
             _ => {
                 self.create_table_with_options(name,
                                                meta,
-                                               CreateTableOptions::Empty)
+                                               CreateTableOptions::Empty,
+                                               enable_accelerated_repair)
                     .await
             },
         }
@@ -2587,7 +2625,8 @@ impl<
     /// 异步创建指定的多个表，表名可以是用文件分隔符分隔的路径，但必须是相对路径，且不允许使用".."
     async fn create_multiple_tables(&self,
                                     table_metas: Vec<(Atom, KVTableMeta, Option<CreateTableOptions>)>,
-                                    is_checksum: bool)
+                                    is_checksum: bool,
+                                    enable_accelerated_repair: bool)
         -> IOResult<()>
     {
         //创建表的操作，一定会创建元信息表事务，而元信息表事务是需要持久化的事务，则根事务也设置为需要持久化
@@ -2778,6 +2817,7 @@ impl<
                                                        enable_compact,
                                                        1024 * 1024,
                                                        60 * 1000,
+                                                       enable_accelerated_repair,
                                                        notifier).await;
 
                             //注册创建的有序日志表
@@ -2853,7 +2893,8 @@ impl<
     #[inline]
     async fn repair_create_table(&self,
                                  name: Atom,
-                                 meta: KVTableMeta) -> IOResult<()>
+                                 meta: KVTableMeta,
+                                 enable_accelerated_repair: bool) -> IOResult<()>
     {
         //检查待创建的指定名称的表是否存在
         let meta_table_name = Atom::from(DEFAULT_DB_TABLES_META_DIR);
@@ -2919,6 +2960,7 @@ impl<
                                                true,
                                                1024 * 1024,
                                                60 * 1000,
+                                               enable_accelerated_repair,
                                                self.0.db_mgr.0.notifier.clone()).await {
                     //尝试创建成功，则注册创建的有序日志表
                     tables.insert(name.clone(), KVDBTable::BtreeOrdTab(table));

@@ -225,6 +225,7 @@ impl<
                 Ok(transaction) => transaction,
             };
             transaction.set_durability(Durability::Immediate);
+            transaction.set_quick_repair(table.0.enable_accelerated_repair); //设置redb写事务是否打开快速修复
             if let Err(e) = transaction.commit() {
                 //写事务持久化提交失败，则立即返回错误原因
                 table.0.collecting.store(false, Ordering::Release); //设置为已整理结束
@@ -278,6 +279,7 @@ impl<
                                      enable_compact: bool,
                                      waits_limit: usize,
                                      wait_timeout: usize,
+                                     enable_accelerated_repair: bool,
                                      notifier: Option<Sender<KVDBEvent<Guid>>>) -> Self
     {
         Self::try_new(rt,
@@ -287,6 +289,7 @@ impl<
                       enable_compact,
                       waits_limit,
                       wait_timeout,
+                      enable_accelerated_repair,
                       notifier)
             .await
             .expect(format!("Open b-tree ordered table failed, table: {:?}, reason: Attempted to open a table that is already open", name.as_str()).as_str())
@@ -300,6 +303,7 @@ impl<
                                                 enable_compact: bool,
                                                 waits_limit: usize,
                                                 wait_timeout: usize,
+                                                enable_accelerated_repair: bool,
                                                 notifier: Option<Sender<KVDBEvent<Guid>>>) -> Option<Self>
     {
         let now = Instant::now();
@@ -388,6 +392,7 @@ impl<
                     wait_timeout,
                     collecting,
                     notifier,
+                    enable_accelerated_repair,
                 };
                 let table = BtreeOrderedTable(Arc::new(inner));
                 info!("Load b-tree ordered table succeeded, table: {:?}, keys: {:?}, cache_size: {:?}, enable_compact: {:?}, time: {:?}",
@@ -434,33 +439,35 @@ struct InnerBtreeOrderedTable<
     Log: AsyncCommitLog<C = C, Cid = Guid>,
 > {
     //表名
-    name:           Atom,
+    name:                       Atom,
     //有序B树表的实例的磁盘路径
-    path:           PathBuf,
+    path:                       PathBuf,
     //有序B树表的实例
-    inner:          RwLock<Database>,
+    inner:                      RwLock<Database>,
     //有序B树表的临时缓存，缓存有序B树表两次持久化之间写入的数据，并在有序B树表持久化后清除缓存的数据
-    cache:          Mutex<OrdMap<Tree<Binary, Option<Binary>>>>,
+    cache:                      Mutex<OrdMap<Tree<Binary, Option<Binary>>>>,
     //有序B树表的临时缓存标记
-    cache_flags:    Mutex<XHashMap<Binary, Guid>>,
+    cache_flags:                Mutex<XHashMap<Binary, Guid>>,
     //有序B树表的预提交表
-    prepare:        Mutex<XHashMap<Guid, XHashMap<Binary, KVActionLog>>>,
+    prepare:                    Mutex<XHashMap<Guid, XHashMap<Binary, KVActionLog>>>,
     //异步运行时
-    rt:             MultiTaskRuntime<()>,
+    rt:                         MultiTaskRuntime<()>,
     //是否允许对有序B树表进行整理压缩
-    enable_compact: AtomicBool,
+    enable_compact:             AtomicBool,
     //等待异步写B树文件持久化确认的已提交的事务列表
-    waits:          AsyncMutex<VecDeque<(BtreeOrdTabTr<C, Log>, XHashMap<Binary, KVActionLog>, <BtreeOrdTabTr<C, Log> as Transaction2Pc>::CommitConfirm)>>,
+    waits:                      AsyncMutex<VecDeque<(BtreeOrdTabTr<C, Log>, XHashMap<Binary, KVActionLog>, <BtreeOrdTabTr<C, Log> as Transaction2Pc>::CommitConfirm)>>,
     //等待写入B树文件的已提交的待确认事务的键值对大小
-    waits_size:     AtomicUsize,
+    waits_size:                 AtomicUsize,
     //等待写入B树文件的已提交的待确认事务大小限制
-    waits_limit:    usize,
+    waits_limit:                usize,
     //等待异步写B树文件的超时时长，单位毫秒
-    wait_timeout:   usize,
+    wait_timeout:               usize,
     //是否正在整理等待写入B树文件的已提交的待确认事务列表
-    collecting:     AtomicBool,
+    collecting:                 AtomicBool,
     //表事件通知器
-    notifier:       Option<Sender<KVDBEvent<Guid>>>,
+    notifier:                   Option<Sender<KVDBEvent<Guid>>>,
+    //是否加速有序B树表的修复过程，注意加速修复过程会降低有序B树表的内部事务的提交速度
+    enable_accelerated_repair:  bool,
 }
 
 ///
@@ -1423,6 +1430,7 @@ impl<
            table: BtreeOrderedTable<C, Log>) -> Self {
         let cache_ref = SpinLock::new(table.0.cache.lock().clone());
         let cache_mut = SpinLock::new(cache_ref.lock().clone());
+        let enable_accelerated_repair = table.0.enable_accelerated_repair;
         let inner = InnerBtreeOrdTabTr {
             source,
             tid: SpinLock::new(None),
@@ -1436,6 +1444,7 @@ impl<
             cache_ref,
             table,
             actions: SpinLock::new(XHashMap::default()),
+            enable_accelerated_repair,
         };
 
         BtreeOrdTabTr(Arc::new(inner))
@@ -1888,29 +1897,31 @@ struct InnerBtreeOrdTabTr<
     Log: AsyncCommitLog<C = C, Cid = Guid>,
 > {
     //事件源
-    source:             Atom,
+    source:                     Atom,
     //事务唯一id
-    tid:                SpinLock<Option<Guid>>,
+    tid:                        SpinLock<Option<Guid>>,
     //事务提交唯一id
-    cid:                SpinLock<Option<Guid>>,
+    cid:                        SpinLock<Option<Guid>>,
     //事务状态
-    status:             SpinLock<Transaction2PcStatus>,
+    status:                     SpinLock<Transaction2PcStatus>,
     //事务是否可写
-    writable:           bool,
+    writable:                   bool,
     //事务是否持久化
-    persistence:        AtomicBool,
+    persistence:                AtomicBool,
     //事务预提交超时时长，单位毫秒
-    prepare_timeout:    u64,
+    prepare_timeout:            u64,
     //事务提交超时时长，单位毫秒
-    commit_timeout:     u64,
+    commit_timeout:             u64,
     //事务的临时缓存的可写引用
-    cache_mut:          SpinLock<OrdMap<Tree<Binary, Option<Binary>>>>,
+    cache_mut:                  SpinLock<OrdMap<Tree<Binary, Option<Binary>>>>,
     //事务的临时缓存的只读引用，但会缓存在事务过程中从文件中查询并加载的记录
-    cache_ref:          SpinLock<OrdMap<Tree<Binary, Option<Binary>>>>,
+    cache_ref:                  SpinLock<OrdMap<Tree<Binary, Option<Binary>>>>,
     //事务对应的有序B树表
-    table:              BtreeOrderedTable<C, Log>,
+    table:                      BtreeOrderedTable<C, Log>,
     //事务内操作记录
-    actions:            SpinLock<XHashMap<Binary, KVActionLog>>,
+    actions:                    SpinLock<XHashMap<Binary, KVActionLog>>,
+    //是否加速有序B树表的修复过程，注意加速修复过程会降低有序B树表的内部事务的提交速度
+    enable_accelerated_repair:  bool,
 }
 
 // 内部事务
@@ -2427,6 +2438,7 @@ async fn collect_waits<
             },
             Ok(mut transaction) => {
                 //创建redb的写事务成功
+                transaction.set_quick_repair(table.0.enable_accelerated_repair); //设置redb写事务是否打开快速修复
                 let mut inner_table = match transaction.open_table(DEFAULT_TABLE_NAME) {
                     Err(e) => {
                         table
