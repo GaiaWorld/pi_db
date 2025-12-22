@@ -946,12 +946,12 @@ impl<
         //所有未确认的提交日志已完成重播，则立即返回数据库修复成功
         let _ = self.0.tr_mgr.finish_replay().await?; //通知事务管理器，已完成重播
 
-        for table in tables.lock().await.keys() {
-            if let Some(KVDBTable::BtreeOrdTab(tab)) = self.get_table(table).await {
-                //当前表存在且为有序B树表，则立即整理
-                tab.collect().await;
-            }
-        }
+        // for table in tables.lock().await.keys() {
+        //     if let Some(KVDBTable::BtreeOrdTab(tab)) = self.get_table(table).await {
+        //         //当前表存在且为有序B树表，则立即整理
+        //         tab.collect().await;
+        //     }
+        // }
 
         return Ok(replay_result);
     }
