@@ -238,7 +238,7 @@ fn test_memory_table() {
                                                 commit_logger);
 
         let mut builder = KVDBManagerBuilder::new(rt_copy.clone(), tr_mgr, "./db");
-        match builder.startup().await {
+        match builder.startup(true).await {
             Err(e) => {
                 panic!("{:?}", e);
             },
@@ -251,7 +251,8 @@ fn test_memory_table() {
                                                 KVTableMeta::new(KVDBTableType::MemOrdTab,
                                                                  false,
                                                                  EnumType::U8,
-                                                                 EnumType::Str)).await {
+                                                                 EnumType::Str),
+                                                true).await {
                     //创建有序内存表失败
                     println!("!!!!!!create memory ordered table failed, reason: {:?}", e);
                 }
@@ -544,7 +545,7 @@ fn test_memory_table_conflict() {
                                                 commit_logger);
 
         let mut builder = KVDBManagerBuilder::new(rt_copy.clone(), tr_mgr, "./db");
-        match builder.startup().await {
+        match builder.startup(true).await {
             Err(e) => {
                 panic!("{:?}", e);
             },
@@ -557,7 +558,8 @@ fn test_memory_table_conflict() {
                                                 KVTableMeta::new(KVDBTableType::MemOrdTab,
                                                                  false,
                                                                  EnumType::Usize,
-                                                                 EnumType::Usize)).await {
+                                                                 EnumType::Usize),
+                                                true).await {
                     //创建有序内存表失败
                     println!("!!!!!!create memory ordered table failed, reason: {:?}", e);
                 }
@@ -736,7 +738,7 @@ fn test_memory_table_read_write_delete_iteraton() {
                                                 commit_logger);
 
         let mut builder = KVDBManagerBuilder::new(rt_copy.clone(), tr_mgr, "./db");
-        match builder.startup().await {
+        match builder.startup(true).await {
             Err(e) => {
                 panic!("{:?}", e);
             },
@@ -749,7 +751,8 @@ fn test_memory_table_read_write_delete_iteraton() {
                                                 KVTableMeta::new(KVDBTableType::MemOrdTab,
                                                                  false,
                                                                  EnumType::Usize,
-                                                                 EnumType::Usize)).await {
+                                                                 EnumType::Usize),
+                                                true).await {
                     //创建有序内存表失败
                     println!("!!!!!!create b-tree ordered table failed, reason: {:?}", e);
                 }
@@ -937,7 +940,7 @@ fn test_commit_log() {
                                                 commit_logger);
 
         let mut builder = KVDBManagerBuilder::new(rt_copy.clone(), tr_mgr, "./db");
-        match builder.startup().await {
+        match builder.startup(true).await {
             Err(e) => {
                 panic!("{:?}", e);
             },
@@ -950,7 +953,8 @@ fn test_commit_log() {
                                                 KVTableMeta::new(KVDBTableType::MemOrdTab,
                                                                  true,
                                                                  EnumType::U8,
-                                                                 EnumType::Str)).await {
+                                                                 EnumType::Str),
+                                                true).await {
                     //创建有序内存表失败
                     println!("!!!!!!create memory ordered table failed, reason: {:?}", e);
                 }
@@ -1247,7 +1251,7 @@ fn test_load_log_table() {
 
         let mut builder = KVDBManagerBuilder::new(rt_copy.clone(), tr_mgr, "./db");
         let now = Instant::now();
-        match builder.startup().await {
+        match builder.startup(true).await {
             Err(e) => {
                 panic!("{:?}", e);
             },
@@ -1260,7 +1264,8 @@ fn test_load_log_table() {
                                                 KVTableMeta::new(KVDBTableType::LogOrdTab,
                                                                  true,
                                                                  EnumType::U8,
-                                                                 EnumType::Str)).await {
+                                                                 EnumType::Str),
+                                                true).await {
                     //创建有序内存表失败
                     println!("!!!!!!create log ordered table failed, reason: {:?}", e);
                 }
@@ -1305,7 +1310,7 @@ fn test_log_table() {
                                                 commit_logger);
 
         let mut builder = KVDBManagerBuilder::new(rt_copy.clone(), tr_mgr, "./db");
-        match builder.startup().await {
+        match builder.startup(true).await {
             Err(e) => {
                 panic!("{:?}", e);
             },
@@ -1318,7 +1323,8 @@ fn test_log_table() {
                                                 KVTableMeta::new(KVDBTableType::LogOrdTab,
                                                                  true,
                                                                  EnumType::U8,
-                                                                 EnumType::Str)).await {
+                                                                 EnumType::Str),
+                                                true).await {
                     //创建有序内存表失败
                     println!("!!!!!!create log ordered table failed, reason: {:?}", e);
                 }
@@ -1659,7 +1665,7 @@ fn test_log_table_read_only_while_writing() {
                                                 commit_logger);
 
         let mut builder = KVDBManagerBuilder::new(rt_copy.clone(), tr_mgr, "./db");
-        match builder.startup().await {
+        match builder.startup(true).await {
             Err(e) => {
                 panic!("{:?}", e);
             },
@@ -1672,7 +1678,8 @@ fn test_log_table_read_only_while_writing() {
                                                 KVTableMeta::new(KVDBTableType::LogOrdTab,
                                                                  true,
                                                                  EnumType::U8,
-                                                                 EnumType::Str)).await {
+                                                                 EnumType::Str),
+                                                true).await {
                     //创建有序内存表失败
                     println!("!!!!!!create log ordered table failed, reason: {:?}", e);
                 }
@@ -1783,7 +1790,7 @@ fn test_log_table_write_while_read_only() {
                                                 commit_logger);
 
         let mut builder = KVDBManagerBuilder::new(rt_copy.clone(), tr_mgr, "./db");
-        match builder.startup().await {
+        match builder.startup(true).await {
             Err(e) => {
                 panic!("{:?}", e);
             },
@@ -1796,7 +1803,8 @@ fn test_log_table_write_while_read_only() {
                                                 KVTableMeta::new(KVDBTableType::LogOrdTab,
                                                                  true,
                                                                  EnumType::U8,
-                                                                 EnumType::Str)).await {
+                                                                 EnumType::Str),
+                                                true).await {
                     //创建有序内存表失败
                     println!("!!!!!!create log ordered table failed, reason: {:?}", e);
                 }
@@ -1907,7 +1915,7 @@ fn test_log_table_conflict() {
                                                 commit_logger);
 
         let mut builder = KVDBManagerBuilder::new(rt_copy.clone(), tr_mgr, "./db");
-        match builder.startup().await {
+        match builder.startup(true).await {
             Err(e) => {
                 panic!("{:?}", e);
             },
@@ -1920,7 +1928,8 @@ fn test_log_table_conflict() {
                                                 KVTableMeta::new(KVDBTableType::LogOrdTab,
                                                                  true,
                                                                  EnumType::Usize,
-                                                                 EnumType::Usize)).await {
+                                                                 EnumType::Usize),
+                                                true).await {
                     //创建有序内存表失败
                     println!("!!!!!!create log ordered table failed, reason: {:?}", e);
                 }
@@ -2099,7 +2108,7 @@ fn test_log_write_table() {
                                                 commit_logger);
 
         let mut builder = KVDBManagerBuilder::new(rt_copy.clone(), tr_mgr, "./db");
-        match builder.startup().await {
+        match builder.startup(true).await {
             Err(e) => {
                 panic!("{:?}", e);
             },
@@ -2112,7 +2121,8 @@ fn test_log_write_table() {
                                                 KVTableMeta::new(KVDBTableType::LogWTab,
                                                                  true,
                                                                  EnumType::U8,
-                                                                 EnumType::Str)).await {
+                                                                 EnumType::Str),
+                                                true).await {
                     //创建有序内存表失败
                     println!("!!!!!!create log ordered table failed, reason: {:?}", e);
                 }
@@ -2282,7 +2292,7 @@ fn test_b_tree_table() {
                                                 commit_logger);
 
         let mut builder = KVDBManagerBuilder::new(rt_copy.clone(), tr_mgr, "./db");
-        match builder.startup().await {
+        match builder.startup(true).await {
             Err(e) => {
                 panic!("{:?}", e);
             },
@@ -2295,7 +2305,8 @@ fn test_b_tree_table() {
                                                 KVTableMeta::new(KVDBTableType::BtreeOrdTab,
                                                                  true,
                                                                  EnumType::U8,
-                                                                 EnumType::Str)
+                                                                 EnumType::Str),
+                                                true
                 ).await {
                     //创建有序B树表失败
                     println!("!!!!!!create b-tree ordered table failed, reason: {:?}", e);
@@ -2640,7 +2651,7 @@ fn test_b_tree_table_read_write_delete_iteraton() {
                                                 commit_logger);
 
         let mut builder = KVDBManagerBuilder::new(rt_copy.clone(), tr_mgr, "./db");
-        match builder.startup().await {
+        match builder.startup(true).await {
             Err(e) => {
                 panic!("{:?}", e);
             },
@@ -2653,7 +2664,8 @@ fn test_b_tree_table_read_write_delete_iteraton() {
                                                 KVTableMeta::new(KVDBTableType::BtreeOrdTab,
                                                                  true,
                                                                  EnumType::Usize,
-                                                                 EnumType::Usize)).await {
+                                                                 EnumType::Usize),
+                                                true).await {
                     //创建有序内存表失败
                     println!("!!!!!!create b-tree ordered table failed, reason: {:?}", e);
                 }
@@ -3119,7 +3131,7 @@ fn test_b_tree_table_write_delete_iteraton() {
                                                 commit_logger);
 
         let mut builder = KVDBManagerBuilder::new(rt_copy.clone(), tr_mgr, "./db");
-        match builder.startup().await {
+        match builder.startup(true).await {
             Err(e) => {
                 panic!("{:?}", e);
             },
@@ -3132,7 +3144,8 @@ fn test_b_tree_table_write_delete_iteraton() {
                                                 KVTableMeta::new(KVDBTableType::BtreeOrdTab,
                                                                  true,
                                                                  EnumType::Usize,
-                                                                 EnumType::Usize)).await {
+                                                                 EnumType::Usize),
+                                                true).await {
                     //创建有序内存表失败
                     println!("!!!!!!create b-tree ordered table failed, reason: {:?}", e);
                 }
@@ -3280,7 +3293,7 @@ fn test_b_tree_table_delete_iteraton() {
                                                 commit_logger);
 
         let mut builder = KVDBManagerBuilder::new(rt_copy.clone(), tr_mgr, "./db");
-        match builder.startup().await {
+        match builder.startup(true).await {
             Err(e) => {
                 panic!("{:?}", e);
             },
@@ -3293,7 +3306,8 @@ fn test_b_tree_table_delete_iteraton() {
                                                 KVTableMeta::new(KVDBTableType::BtreeOrdTab,
                                                                  true,
                                                                  EnumType::Usize,
-                                                                 EnumType::Usize)).await {
+                                                                 EnumType::Usize),
+                                                true).await {
                     //创建有序内存表失败
                     println!("!!!!!!create b-tree ordered table failed, reason: {:?}", e);
                 }
@@ -3527,7 +3541,7 @@ fn test_b_tree_table_delete_query() {
                                                 commit_logger);
 
         let mut builder = KVDBManagerBuilder::new(rt_copy.clone(), tr_mgr, "./db");
-        match builder.startup().await {
+        match builder.startup(true).await {
             Err(e) => {
                 panic!("{:?}", e);
             },
@@ -3540,7 +3554,8 @@ fn test_b_tree_table_delete_query() {
                                                 KVTableMeta::new(KVDBTableType::BtreeOrdTab,
                                                                  true,
                                                                  EnumType::Usize,
-                                                                 EnumType::Usize)).await {
+                                                                 EnumType::Usize),
+                                                true).await {
                     //创建有序内存表失败
                     println!("!!!!!!create b-tree ordered table failed, reason: {:?}", e);
                 }
@@ -3553,7 +3568,8 @@ fn test_b_tree_table_delete_query() {
                                                 KVTableMeta::new(KVDBTableType::BtreeOrdTab,
                                                                  true,
                                                                  EnumType::Usize,
-                                                                 EnumType::Usize)).await {
+                                                                 EnumType::Usize),
+                                                true).await {
                     //创建有序内存表失败
                     println!("!!!!!!create b-tree ordered table failed, reason: {:?}", e);
                 }
@@ -3757,7 +3773,7 @@ fn test_b_tree_commit_before_clean() {
                                                 commit_logger);
 
         let mut builder = KVDBManagerBuilder::new(rt_copy.clone(), tr_mgr, "./db");
-        match builder.startup().await {
+        match builder.startup(true).await {
             Err(e) => {
                 panic!("{:?}", e);
             },
@@ -3770,7 +3786,8 @@ fn test_b_tree_commit_before_clean() {
                                                 KVTableMeta::new(KVDBTableType::BtreeOrdTab,
                                                                  true,
                                                                  EnumType::Usize,
-                                                                 EnumType::Usize)).await {
+                                                                 EnumType::Usize),
+                                                true).await {
                     //创建有序内存表失败
                     println!("!!!!!!create b-tree ordered table failed, reason: {:?}", e);
                 }
@@ -3932,7 +3949,7 @@ fn test_b_tree_table_conflict() {
                                                 commit_logger);
 
         let mut builder = KVDBManagerBuilder::new(rt_copy.clone(), tr_mgr, "./db");
-        match builder.startup().await {
+        match builder.startup(true).await {
             Err(e) => {
                 panic!("{:?}", e);
             },
@@ -3945,7 +3962,8 @@ fn test_b_tree_table_conflict() {
                                                 KVTableMeta::new(KVDBTableType::BtreeOrdTab,
                                                                  true,
                                                                  EnumType::Usize,
-                                                                 EnumType::Usize)).await {
+                                                                 EnumType::Usize),
+                                                true).await {
                     //创建有序内存表失败
                     println!("!!!!!!create b-tree ordered table failed, reason: {:?}", e);
                 }
@@ -4137,7 +4155,7 @@ fn test_b_tree_table_conflict() {
 
                 loop {
                     rt_copy.timeout(1000).await;
-                    println!("{:?}, {:?}, {:?}", pi_ordmap::ordmap::ordmap_shared_count(), pi_ordmap::asbtree::itertree_shared_count(), pi_db::binary_shared_count());
+                    println!("{:?}, {:?}", pi_ordmap::ordmap::ordmap_shared_count(), pi_ordmap::asbtree::itertree_shared_count());
                 }
             },
         }
@@ -4172,7 +4190,7 @@ fn test_b_tree_table_write_iteraton_for_memory() {
                                                 commit_logger);
 
         let mut builder = KVDBManagerBuilder::new(rt_copy.clone(), tr_mgr, "./db");
-        match builder.startup().await {
+        match builder.startup(true).await {
             Err(e) => {
                 panic!("{:?}", e);
             },
@@ -4187,7 +4205,8 @@ fn test_b_tree_table_write_iteraton_for_memory() {
                                                     KVTableMeta::new(KVDBTableType::BtreeOrdTab,
                                                                      true,
                                                                      EnumType::Usize,
-                                                                     EnumType::Str)).await {
+                                                                     EnumType::Str),
+                                                    true).await {
                         //创建有序内存表失败
                         println!("!!!!!!create b-tree ordered table failed, reason: {:?}", e);
                     } else {
@@ -4303,7 +4322,7 @@ fn test_db_repair() {
                                                 commit_logger);
 
         let mut builder = KVDBManagerBuilder::new(rt_copy.clone(), tr_mgr, "./db");
-        match builder.startup().await {
+        match builder.startup(true).await {
             Err(e) => {
                 panic!("!!!!!!startup db failed, reason: {:?}", e);
             },
@@ -4317,7 +4336,8 @@ fn test_db_repair() {
                                                 KVTableMeta::new(KVDBTableType::LogOrdTab,
                                                                  true,
                                                                  EnumType::U8,
-                                                                 EnumType::Usize)).await {
+                                                                 EnumType::Usize),
+                                                true).await {
                     //创建有序内存表失败
                     println!("!!!!!!create log ordered table failed, reason: {:?}", e);
                 }
@@ -4325,7 +4345,8 @@ fn test_db_repair() {
                                                 KVTableMeta::new(KVDBTableType::LogOrdTab,
                                                                  true,
                                                                  EnumType::U8,
-                                                                 EnumType::Usize)).await {
+                                                                 EnumType::Usize),
+                                                true).await {
                     //创建有序内存表失败
                     println!("!!!!!!create log ordered table failed, reason: {:?}", e);
                 }
@@ -4485,7 +4506,7 @@ fn test_db_repair_by_specific() {
                                                 commit_logger);
 
         let mut builder = KVDBManagerBuilder::new(rt_copy.clone(), tr_mgr, "./specific_db");
-        match builder.startup().await {
+        match builder.startup(true).await {
             Err(e) => {
                 panic!("!!!!!!startup db failed, reason: {:?}", e);
             },
@@ -4527,7 +4548,7 @@ fn test_multi_tables_repair() {
                                                 commit_logger);
 
         let builder = KVDBManagerBuilder::new(rt_copy.clone(), tr_mgr, "./db");
-        match builder.startup().await {
+        match builder.startup(true).await {
             Err(e) => {
                 println!("!!!!!!startup db failed, reason: {:?}", e);
             },
@@ -4538,7 +4559,8 @@ fn test_multi_tables_repair() {
                                                     KVTableMeta::new(KVDBTableType::LogOrdTab,
                                                                      true,
                                                                      EnumType::Usize,
-                                                                     EnumType::Usize)).await {
+                                                                     EnumType::Usize),
+                                                    true).await {
                         //创建有序日志表失败
                         println!("!!!!!!create log ordered table failed, reason: {:?}", e);
                     }
@@ -4838,7 +4860,7 @@ fn test_multi_tables_write_and_repair() {
                                                 commit_logger);
 
         let builder = KVDBManagerBuilder::new(rt_copy.clone(), tr_mgr, "./db");
-        match builder.startup().await {
+        match builder.startup(true).await {
             Err(e) => {
                 println!("!!!!!!startup db failed, reason: {:?}", e);
             },
@@ -4849,7 +4871,8 @@ fn test_multi_tables_write_and_repair() {
                                                     KVTableMeta::new(KVDBTableType::LogOrdTab,
                                                                      true,
                                                                      EnumType::Usize,
-                                                                     EnumType::Usize)).await {
+                                                                     EnumType::Usize),
+                                                    true).await {
                         //创建有序日志表失败
                         println!("!!!!!!create log ordered table failed, reason: {:?}", e);
                     }
@@ -5085,7 +5108,7 @@ fn test_multi_tables_write_and_repair1() {
                                                 commit_logger);
 
         let builder = KVDBManagerBuilder::new(rt_copy.clone(), tr_mgr, "./db");
-        match builder.startup().await {
+        match builder.startup(true).await {
             Err(e) => {
                 println!("!!!!!!startup db failed, reason: {:?}", e);
             },
@@ -5096,7 +5119,8 @@ fn test_multi_tables_write_and_repair1() {
                                                     KVTableMeta::new(KVDBTableType::LogOrdTab,
                                                                      true,
                                                                      EnumType::Usize,
-                                                                     EnumType::Usize)).await {
+                                                                     EnumType::Usize),
+                                                    true).await {
                         //创建有序日志表失败
                         println!("!!!!!!create log ordered table failed, reason: {:?}", e);
                     }
@@ -5265,7 +5289,7 @@ fn test_multi_tables_write_commit_log() {
                                                 commit_logger);
 
         let builder = KVDBManagerBuilder::new(rt_copy.clone(), tr_mgr, "./db");
-        match builder.startup().await {
+        match builder.startup(true).await {
             Err(e) => {
                 println!("!!!!!!startup db failed, reason: {:?}", e);
             },
@@ -5276,7 +5300,8 @@ fn test_multi_tables_write_commit_log() {
                                                     KVTableMeta::new(KVDBTableType::LogOrdTab,
                                                                      true,
                                                                      EnumType::Usize,
-                                                                     EnumType::Usize)).await {
+                                                                     EnumType::Usize),
+                                                    true).await {
                         //创建有序日志表失败
                         println!("!!!!!!create log ordered table failed, reason: {:?}", e);
                     }
@@ -5456,7 +5481,7 @@ fn test_query_conflict() {
                                                 commit_logger);
 
         let mut builder = KVDBManagerBuilder::new(rt_copy.clone(), tr_mgr, "./db");
-        match builder.startup().await {
+        match builder.startup(true).await {
             Err(e) => {
                 panic!("{:?}", e);
             },
@@ -5469,7 +5494,8 @@ fn test_query_conflict() {
                                                 KVTableMeta::new(KVDBTableType::LogOrdTab,
                                                                  true,
                                                                  EnumType::Usize,
-                                                                 EnumType::Usize)).await {
+                                                                 EnumType::Usize),
+                                                true).await {
                     //创建有序内存表失败
                     println!("!!!!!!create log ordered table failed, reason: {:?}", e);
                 }
@@ -5664,7 +5690,7 @@ fn test_dirty_query_conflict() {
                                                 commit_logger);
 
         let mut builder = KVDBManagerBuilder::new(rt_copy.clone(), tr_mgr, "./db");
-        match builder.startup().await {
+        match builder.startup(true).await {
             Err(e) => {
                 panic!("{:?}", e);
             },
@@ -5677,7 +5703,8 @@ fn test_dirty_query_conflict() {
                                                 KVTableMeta::new(KVDBTableType::LogOrdTab,
                                                                  true,
                                                                  EnumType::Usize,
-                                                                 EnumType::Usize)).await {
+                                                                 EnumType::Usize),
+                                                true).await {
                     //创建有序内存表失败
                     println!("!!!!!!create log ordered table failed, reason: {:?}", e);
                 }
@@ -5872,7 +5899,7 @@ fn test_upsert_conflict() {
                                                 commit_logger);
 
         let mut builder = KVDBManagerBuilder::new(rt_copy.clone(), tr_mgr, "./db");
-        match builder.startup().await {
+        match builder.startup(true).await {
             Err(e) => {
                 panic!("{:?}", e);
             },
@@ -5885,7 +5912,8 @@ fn test_upsert_conflict() {
                                                 KVTableMeta::new(KVDBTableType::LogOrdTab,
                                                                  true,
                                                                  EnumType::Usize,
-                                                                 EnumType::Usize)).await {
+                                                                 EnumType::Usize),
+                                                true).await {
                     //创建有序内存表失败
                     println!("!!!!!!create log ordered table failed, reason: {:?}", e);
                 }
@@ -6094,7 +6122,7 @@ fn test_dirty_upsert_conflict() {
                                                 commit_logger);
 
         let mut builder = KVDBManagerBuilder::new(rt_copy.clone(), tr_mgr, "./db");
-        match builder.startup().await {
+        match builder.startup(true).await {
             Err(e) => {
                 panic!("{:?}", e);
             },
@@ -6107,7 +6135,8 @@ fn test_dirty_upsert_conflict() {
                                                 KVTableMeta::new(KVDBTableType::LogOrdTab,
                                                                  true,
                                                                  EnumType::Usize,
-                                                                 EnumType::Usize)).await {
+                                                                 EnumType::Usize),
+                                                true).await {
                     //创建有序内存表失败
                     println!("!!!!!!create log ordered table failed, reason: {:?}", e);
                 }
@@ -6316,7 +6345,7 @@ fn test_delete_conflict() {
                                                 commit_logger);
 
         let mut builder = KVDBManagerBuilder::new(rt_copy.clone(), tr_mgr, "./db");
-        match builder.startup().await {
+        match builder.startup(true).await {
             Err(e) => {
                 panic!("{:?}", e);
             },
@@ -6329,7 +6358,8 @@ fn test_delete_conflict() {
                                                 KVTableMeta::new(KVDBTableType::LogOrdTab,
                                                                  true,
                                                                  EnumType::Usize,
-                                                                 EnumType::Usize)).await {
+                                                                 EnumType::Usize),
+                                                true).await {
                     //创建有序内存表失败
                     println!("!!!!!!create log ordered table failed, reason: {:?}", e);
                 }
@@ -6534,7 +6564,7 @@ fn test_dirty_delete_conflict() {
                                                 commit_logger);
 
         let mut builder = KVDBManagerBuilder::new(rt_copy.clone(), tr_mgr, "./db");
-        match builder.startup().await {
+        match builder.startup(true).await {
             Err(e) => {
                 panic!("{:?}", e);
             },
@@ -6547,7 +6577,8 @@ fn test_dirty_delete_conflict() {
                                                 KVTableMeta::new(KVDBTableType::LogOrdTab,
                                                                  true,
                                                                  EnumType::Usize,
-                                                                 EnumType::Usize)).await {
+                                                                 EnumType::Usize),
+                                                true).await {
                     //创建有序内存表失败
                     println!("!!!!!!create log ordered table failed, reason: {:?}", e);
                 }
@@ -6756,7 +6787,7 @@ fn test_log_table_debug() {
                                                 commit_logger);
 
         let mut builder = KVDBManagerBuilder::new(rt_copy.clone(), tr_mgr, "./db");
-        match builder.startup().await {
+        match builder.startup(true).await {
             Err(e) => {
                 panic!("{:?}", e);
             },
@@ -6769,7 +6800,8 @@ fn test_log_table_debug() {
                                                 KVTableMeta::new(KVDBTableType::LogOrdTab,
                                                                  true,
                                                                  EnumType::U8,
-                                                                 EnumType::Str)).await {
+                                                                 EnumType::Str),
+                                                true).await {
                     //创建有序内存表失败
                     println!("!!!!!!create log ordered table failed, reason: {:?}", e);
                 }
@@ -7109,7 +7141,7 @@ fn test_append_new_commit_log() {
                                                 commit_logger);
 
         let mut builder = KVDBManagerBuilder::new(rt_copy.clone(), tr_mgr, "./db");
-        match builder.startup().await {
+        match builder.startup(true).await {
             Err(e) => {
                 panic!("{:?}", e);
             },
@@ -7122,7 +7154,8 @@ fn test_append_new_commit_log() {
                                                 KVTableMeta::new(KVDBTableType::LogOrdTab,
                                                                  true,
                                                                  EnumType::U8,
-                                                                 EnumType::Str)).await {
+                                                                 EnumType::Str),
+                                                true).await {
                     //创建有序内存表失败
                     println!("!!!!!!create log ordered table failed, reason: {:?}", e);
                 }
