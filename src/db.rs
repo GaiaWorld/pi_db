@@ -2410,7 +2410,6 @@ impl<
 
         self.require_persistence(); //创建表的操作，一定会创建元信息表事务，而元信息表事务是需要持久化的事务，则根事务也设置为需要持久化
         if tables.contains_key(&name) {
-            println!("!!!!!!!!!!!!!!!!!!!!!create_table_with_options, 1, {:?}", name);
             //指定名称的表已存在
             if let Some(meta_table) = tables.get(&meta_table_name) {
                 //元信息表存在，则获取元信息表事务，并查询指定表的元信息
@@ -2428,7 +2427,6 @@ impl<
                         //指定名称的表的元信息存在
                         let table_meta = KVTableMeta::from(value);
                         if table_meta == meta {
-                            println!("!!!!!!!!!!!!!!!!!!!!!create_table_with_options, 2, {:?}", name);
                             //待创建表的名称与已存在的表相同，且元信息相同，则立即返回创建成功
                             return Ok(());
                         } else {
@@ -2561,21 +2559,17 @@ impl<
 
         //注册表的元信息
         if let Some(meta_table) = tables.get(&meta_table_name) {
-            println!("!!!!!!!!!!!!!!!!!!!!!create_table_with_options, 3, {:?}", name);
             let mut childes_map = self.0.childs_map.lock();
             let meta_table_tr = if let Some(table_tr) = childes_map.get(&meta_table_name) {
-                println!("!!!!!!!!!!!!!!!!!!!!!create_table_with_options, 4, {:?}", name);
                 //元信息表的子事务存在，则设置子事务为需要持久化
                 table_tr.require_persistence();
                 table_tr.clone()
             } else {
-                println!("!!!!!!!!!!!!!!!!!!!!!create_table_with_options, 5, {:?}", name);
                 //元信息表的子事务不存在，则创建元信息表的事务，因为需要创建表，所以初始化元信息表的子事务为持久化事务
                 self.table_transaction(meta_table_name, meta_table, true, &mut *childes_map)
             };
 
             if let KVDBTransaction::MetaTabTr(tr) = &meta_table_tr {
-                println!("!!!!!!!!!!!!!!!!!!!!!create_table_with_options, 6, {:?}", name);
                 if let Err(e) = tr.upsert(table_to_binary(&name),
                                                Binary::from(meta.clone())).await {
                     //写入表的元信息失败，则立即返回错误原因
