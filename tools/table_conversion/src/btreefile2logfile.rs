@@ -152,7 +152,7 @@ where
 
         let mut builder = KVDBManagerBuilder::new(rt_copy.clone(), tr_mgr, path);
         let now = Instant::now();
-        match builder.startup_with_listener(listener).await {
+        match builder.startup_with_listener(true, listener).await {
             Err(e) => {
                 panic!("{:?}", e);
                 value.set(Err(e.to_string()));
@@ -219,7 +219,7 @@ async fn create_table(
                 meta.value_type().clone(),
             );
             // 创建表
-            tr.create_table(Atom::from(tab_name.clone()), btree_meta)
+            tr.create_table(Atom::from(tab_name.clone()), btree_meta, true)
                 .await
                 .or_else(|e| Err(e.to_string()))?;
         }
