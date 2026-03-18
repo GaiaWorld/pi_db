@@ -91,7 +91,7 @@ impl From<KVTableMeta> for Binary {
 
 impl Ord for Binary {
     fn cmp(&self, other: &Binary) -> CmpOrdering {
-        self.partial_cmp(other).unwrap()
+        self.partial_cmp(other).expect(&format!("Can't compare two binaries, {:?}, {:?}", self, other))
     }
 }
 
