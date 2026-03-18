@@ -38,7 +38,7 @@ pub fn db_test(db: String) -> Result<(), String> {
     let (s, r) = bounded(1);
     let s_copy = s.clone();
     let mut count = 0;
-    rt.spawn(async move {
+    let _ = rt.spawn(async move {
         let listener = move |db_mgr: &KVDBManager<usize, CommitLogger>,
                              tr_mgr: &Transaction2PcManager<usize, CommitLogger>,
                              events: &mut Vec<KVDBEvent<Guid>>| {
@@ -68,7 +68,7 @@ pub fn db_test(db: String) -> Result<(), String> {
                 && tr_mgr.transaction_len() == 0
                 && count == tr_mgr.consumed_transaction_total()
             {
-                s.send(Ok(()));
+                let _ = s.send(Ok(()));
             }
         };
 
@@ -79,7 +79,7 @@ pub fn db_test(db: String) -> Result<(), String> {
                 }
             }
             Err(e) => {
-                s_copy.send(Err(e));
+                let _ = s_copy.send(Err(e));
             }
         };
     });
@@ -90,9 +90,9 @@ pub fn conversion(src: String, out: String, batch_count: usize) -> Result<(), St
     let builder = MultiTaskRuntimeBuilder::default();
     let rt = builder.build();
     let (s, r) = bounded(1);
-    rt.spawn(async move {
+    let _ = rt.spawn(async move {
         let r = handle(src, out, batch_count).await;
-        s.send(r);
+        let _ = s.send(r);
     });
     r.recv().or_else(|e| Err(e.to_string()))?
 }
@@ -178,7 +178,7 @@ where
 
         let mut builder = KVDBManagerBuilder::new(rt_copy.clone(), tr_mgr, path);
         let now = Instant::now();
-        match builder.startup_with_listener(listener).await {
+        match builder.startup_with_listener(true, listener).await {
             Err(e) => {
                 panic!("{:?}", e);
                 value.set(Err(e.to_string()));
@@ -227,7 +227,7 @@ async fn create_table(
                 meta.key_type().clone(),
                 meta.value_type().clone(),
             );
-            tr.create_table(Atom::from(tab_name.clone()), btree_meta)
+            tr.create_table(Atom::from(tab_name.clone()), btree_meta, true)
                 .await
                 .or_else(|e| Err(e.to_string()))?;
         }
