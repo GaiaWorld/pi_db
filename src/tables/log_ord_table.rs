@@ -173,6 +173,30 @@ impl<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>,
 > LogOrderedTable<C, Log> {
+    /// 仅供 quick repair 使用的一次性 flush。
+    /// 这里不会改变正常写入路径的默认整理周期，只在 repair 完成后主动刷出等待区。
+    pub(crate) async fn quick_flush_waits(&self) -> Result<(), KVTableTrError> {
+        self.0.waits_size.store(0, Ordering::Relaxed);
+
+        match collect_waits(self, None).await {
+            Err((collect_time, statistics)) => {
+                Err(KVTableTrError::new_transaction_error(ErrorLevel::Normal,
+                                                          format!("Quick flush log ordered table failed, table: {:?}, time: {:?}, statistics: {:?}",
+                                                                  self.name().as_str(),
+                                                                  collect_time,
+                                                                  statistics)))
+            },
+            Ok(_) => {
+                Ok(())
+            },
+        }
+    }
+}
+
+impl<
+    C: Clone + Send + 'static,
+    Log: AsyncCommitLog<C = C, Cid = Guid>,
+> LogOrderedTable<C, Log> {
     /// 构建一个有序日志表
     pub async fn new<P: AsRef<Path>>(rt: MultiTaskRuntime<()>,
                                      path: P,
@@ -1010,6 +1034,16 @@ impl<
         };
 
         LogOrdTabTr(Arc::new(inner))
+    }
+
+    /// 快速装载有序日志表的 repair 动作。
+    /// 这些动作先挂到事务本地 `actions`，后续仍要通过 `prepare_repair` 和 `commit_repair` 完成恢复。
+    pub(crate) fn quick_repair_writes(&self,
+                                      writes: Vec<(Binary, Option<Binary>)>) {
+        let mut actions = self.0.actions.lock();
+        for (key, value) in writes {
+            let _ = actions.insert(key, KVActionLog::DirtyWrite(value));
+        }
     }
 
     // 检查有序日志表的预提交表的读写冲突

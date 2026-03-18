@@ -165,6 +165,30 @@ impl<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>,
 > LogWriteTable<C, Log> {
+    /// 仅供 quick repair 使用的一次性 flush。
+    /// 只在修复完成后主动触发，不会影响正常事务的后台整理节奏。
+    pub(crate) async fn quick_flush_waits(&self) -> Result<(), KVTableTrError> {
+        self.0.waits_size.store(0, Ordering::Relaxed);
+
+        match collect_waits(self, None).await {
+            Err((collect_time, statistics)) => {
+                Err(KVTableTrError::new_transaction_error(ErrorLevel::Normal,
+                                                          format!("Quick flush only writable table failed, table: {:?}, time: {:?}, statistics: {:?}",
+                                                                  self.name().as_str(),
+                                                                  collect_time,
+                                                                  statistics)))
+            },
+            Ok(_) => {
+                Ok(())
+            },
+        }
+    }
+}
+
+impl<
+    C: Clone + Send + 'static,
+    Log: AsyncCommitLog<C = C, Cid = Guid>,
+> LogWriteTable<C, Log> {
     /// 构建一个只写日志表
     pub async fn new<P: AsRef<Path>>(rt: MultiTaskRuntime<()>,
                                      path: P,
@@ -873,6 +897,18 @@ impl<
         };
 
         LogWTabTr(Arc::new(inner))
+    }
+
+    /// 快速装载只写日志表的 repair 动作。
+    /// 只写日志表本身不支持删除语义，因此这里仅保留带值的写入，和旧 repair 路径保持一致。
+    pub(crate) fn quick_repair_writes(&self,
+                                      writes: Vec<(Binary, Option<Binary>)>) {
+        let mut actions = self.0.actions.lock();
+        for (key, value) in writes {
+            if value.is_some() {
+                let _ = actions.insert(key, KVActionLog::DirtyWrite(value));
+            }
+        }
     }
 
     // 检查只写日志表的预提交表的读写冲突

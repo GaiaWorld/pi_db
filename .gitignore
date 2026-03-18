@@ -1,6 +1,5 @@
 
 **/target
-**/*.rs.bk
 **/Cargo.lock
 testlogfile
 **/.idea
@@ -9,3 +8,7 @@ testlogfile
 **/db
 **/specific_db
 tests/table.dat
+AGENTS.md
+/docs
+/tmp_quick_repair
+**/*.rs.bk

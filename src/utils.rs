@@ -20,9 +20,9 @@ pub enum CreateTableOptions {
 ///
 #[derive(Debug, Clone)]
 pub enum KVDBEvent<Cid: Debug + Clone + Send + PartialEq + Eq + 'static> {
-    ReportTrInfo,                                           //报告事务信息
-    CommitFailed(Atom, Atom, KVDBTableType, Cid, Cid),      //提交已失败
-    ConfirmCommited(Atom, Atom, KVDBTableType, Cid, Cid),   //确认已提交
+    ReportTrInfo,                                         //报告事务信息
+    CommitFailed(Atom, Atom, KVDBTableType, Cid, Cid),    //提交已失败
+    ConfirmCommited(Atom, Atom, KVDBTableType, Cid, Cid), //确认已提交
 }
 
 impl<Cid: Debug + Clone + Send + PartialEq + Eq + 'static> KVDBEvent<Cid> {

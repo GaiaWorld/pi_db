@@ -132,6 +132,15 @@ pub struct KVDBManagerBuilder<
     tables_path:        PathBuf,                            //数据库表文件所在目录
 }
 
+///
+/// 数据库启动时的修复模式
+///
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DBStartupRepairMode {
+    TryRepair,      //兼容旧修复流程，逐条走普通 upsert/delete，再 prepare/commit repair
+    TryQuickRepair, //快速修复流程，只装载持久化表动作，并在 replay 后立即 flush 受影响的持久化表
+}
+
 /*
 * 键值对数据库管理器构建器同步方法
 */
@@ -165,16 +174,48 @@ impl<
     Log: AsyncCommitLog<C = C, Cid = Guid>,
 > KVDBManagerBuilder<C, Log> {
     /// 异步启动键值对数据库，并返回键值对数据库的管理器
+    /// 默认使用 `TryQuickRepair`，启动时如果发现未确认的提交日志，会优先走快速修复路径。
     pub async fn startup(self, enable_accelerated_repair: bool) -> IOResult<KVDBManager<C, Log>> {
         self
-            .startup_with_listener::<fn(&KVDBManager<C, Log>, &Transaction2PcManager<C, Log>, &mut Vec<KVDBEvent<Guid>>)>(enable_accelerated_repair, None)
+            .startup_by_repair(enable_accelerated_repair,
+                               DBStartupRepairMode::TryQuickRepair)
+            .await
+    }
+
+    /// 异步按指定修复模式启动键值对数据库，并返回键值对数据库的管理器
+    /// 适合在启动修复行为需要与旧流程做结果对比、压测或灰度切换时显式指定。
+    pub async fn startup_by_repair(self,
+                                   enable_accelerated_repair: bool,
+                                   repair_mode: DBStartupRepairMode) -> IOResult<KVDBManager<C, Log>> {
+        self
+            .startup_with_listener_by_repair::<fn(&KVDBManager<C, Log>, &Transaction2PcManager<C, Log>, &mut Vec<KVDBEvent<Guid>>)>(enable_accelerated_repair,
+                                                                                                                                      repair_mode,
+                                                                                                                                      None)
             .await
     }
 
     /// 异步启动指定监听器的键值对数据库，并返回键值对数据库的管理器
+    /// 默认使用 `TryQuickRepair`，同时保留数据库事件监听能力。
     pub async fn startup_with_listener<F>(
         self,
         enable_accelerated_repair: bool,
+        db_event_listener: Option<F>
+    ) -> IOResult<KVDBManager<C, Log>>
+    where F: FnMut(&KVDBManager<C, Log>, &Transaction2PcManager<C, Log>, &mut Vec<KVDBEvent<Guid>>) + Send + Sync + 'static
+    {
+        self
+            .startup_with_listener_by_repair(enable_accelerated_repair,
+                                             DBStartupRepairMode::TryQuickRepair,
+                                             db_event_listener)
+            .await
+    }
+
+    /// 异步按指定修复模式启动指定监听器的键值对数据库，并返回键值对数据库的管理器
+    /// 这是最完整的启动入口，可同时控制修复模式与监听器接入。
+    pub async fn startup_with_listener_by_repair<F>(
+        self,
+        enable_accelerated_repair: bool,
+        repair_mode: DBStartupRepairMode,
         db_event_listener: Option<F>
     ) -> IOResult<KVDBManager<C, Log>>
     where F: FnMut(&KVDBManager<C, Log>, &Transaction2PcManager<C, Log>, &mut Vec<KVDBEvent<Guid>>) + Send + Sync + 'static
@@ -323,7 +364,15 @@ impl<
 
         //如果有未确认的提交日志，则尝试修复数据库表数据
         let now = Instant::now();
-        match db_mgr.try_repair(enable_accelerated_repair).await {
+        let repair_result = match repair_mode {
+            DBStartupRepairMode::TryRepair => {
+                db_mgr.try_repair(enable_accelerated_repair).await
+            },
+            DBStartupRepairMode::TryQuickRepair => {
+                db_mgr.try_quick_repair(enable_accelerated_repair).await
+            },
+        };
+        match repair_result {
             Err(e) => {
                 //有未确认的提交日志，且尝试修复数据库表数据失败，则立即返回错误原因
                 return Err(e);
@@ -854,8 +903,15 @@ impl<
                                         return;
                                     }
                                 } else {
-                                    //无值，则删除表
-                                    let table_name = Atom::from(write.key.as_ref());
+                                    //无值，则删除表。元信息表里的 key 是序列化后的表名，必须先反序列化。
+                                    let table_name = match binary_to_table(&write.key) {
+                                        Err(e) => {
+                                            panic!("From binary to table name failed, reason: {:?}", e);
+                                        },
+                                        Ok(table_name) => {
+                                            table_name
+                                        }
+                                    };
 
                                     if let Err(e) = tr.repair_remove_table(table_name.clone()).await {
                                         //重播的移除表失败，则立即返回错误原因
@@ -954,6 +1010,231 @@ impl<
         // }
 
         return Ok(replay_result);
+    }
+
+    /// 尝试按顺序重播未确认的提交日志，并使用快速装载路径修复持久化表。
+    ///
+    /// 关键约束：
+    /// 1. 仍然严格按提交日志顺序逐事务重放，不能跨事务乱序。
+    /// 2. 元信息表仍走 repair create/remove table，保证表结构恢复语义不变。
+    /// 3. 用户表只快速装载持久化表的 `DirtyWrite` 动作，内存表不参与 quick repair。
+    /// 4. 预提交阶段仍沿用各表既有的 `prepare_repair`，提交阶段仍沿用 `commit_repair`。
+    /// 5. replay 结束后只对本次修复中触达过的持久化表做一次立即 flush，不给正常事务路径留下额外模式。
+    ///
+    /// 粒度说明：
+    /// 1. `replay_commit_log` 每次回调对应一条未确认 commit log 记录，也就是一个已写入提交日志的根事务。
+    /// 2. 一条 commit log 记录内部可能包含多个表块；这些表块会先全部装载、prepare、commit 完成后，再继续下一条事务。
+    /// 3. quick repair 自己的显式 flush 不在“每条事务”或“每个表块”后执行，而是在整轮 replay 结束后按表统一执行。
+    pub(crate) async fn try_quick_repair(&self, enable_accelerated_repair: bool) -> IOResult<(usize, usize)> {
+        let db_mgr = self.clone();
+        let tables = Arc::new(Mutex::new(BTreeMap::new()));
+        let tables_copy = tables.clone();
+        let replay_callback = move |commit_uid: Guid, prepare_output: Vec<u8>| -> IOResult<()> {
+            let db_mgr_copy = db_mgr.clone();
+            let commit_uid_copy = commit_uid.clone();
+            let meta_table_name = Atom::from(DEFAULT_DB_TABLES_META_DIR);
+            let (sender, receiver) = bounded(1);
+
+            let tables_clone = tables_copy.clone();
+            let boxed = async move {
+                let bytes_len = prepare_output.len(); //获取日志缓冲区长度
+                let mut offset = 0; //日志缓冲区偏移
+                let bytes = prepare_output.as_slice();
+                let uid = u128::from_le_bytes(bytes[0..16].try_into().unwrap()); //获取事务唯一id
+                let transaciton_uid = Guid(uid);
+                offset += 16; //移动缓冲区指针
+
+                if let Some(tr) = db_mgr_copy.transaction(Atom::from(REPAIR_DB_SOURCE),
+                                                          true,
+                                                          5000,
+                                                          5000)
+                {
+                    //顺序解析本次提交日志的 prepare_output，并按表恢复动作
+                    while offset < bytes_len {
+                        //获取表名、操作的键值对数量和新的日志缓冲区偏移
+                        let (table, kvs_len, new_offset) =
+                            <MetaTable<C, Log> as KVTable>::get_init_table_prepare_output(&prepare_output, offset);
+                        //获取操作的表键值列表和新的日志缓冲区偏移
+                        let (writes, new_offset)
+                            = <MetaTable<C, Log> as KVTable>::get_all_key_value_from_table_prepare_output(&prepare_output,
+                                                                                                           &table,
+                                                                                                           kvs_len,
+                                                                                                           new_offset);
+
+                        if table == meta_table_name {
+                            //元信息表仍然按旧 repair 语义创建或删除表，避免破坏表生命周期恢复逻辑
+                            tables_clone
+                                .lock()
+                                .await
+                                .insert(meta_table_name.clone(), ());
+                            for write in writes {
+                                if let Some(value) = write.value {
+                                    let table_name = match binary_to_table(&write.key) {
+                                        Err(e) => {
+                                            panic!("From binary to table name failed, reason: {:?}", e);
+                                        },
+                                        Ok(table_name) => {
+                                            table_name
+                                        }
+                                    };
+                                    let table_meta = KVTableMeta::from(value);
+
+                                    if let Err(e) = tr.repair_create_table(table_name.clone(),
+                                                                          table_meta.clone(),
+                                                                          enable_accelerated_repair).await {
+                                        let _ = sender.send(Err(Error::new(ErrorKind::Other, format!("Quick repair tables meta failed, transaction_uid: {:?}, commit_uid: {:?}, table_name: {:?}, table_meta: {:?}, reason: {:?}", transaciton_uid, commit_uid_copy, table_name, table_meta, e))));
+                                        return;
+                                    }
+                                } else {
+                                    //元信息表里的 key 是序列化后的表名，删除表时要先解码，避免把原始字节当成表名。
+                                    let table_name = match binary_to_table(&write.key) {
+                                        Err(e) => {
+                                            panic!("From binary to table name failed, reason: {:?}", e);
+                                        },
+                                        Ok(table_name) => {
+                                            table_name
+                                        }
+                                    };
+
+                                    if let Err(e) = tr.repair_remove_table(table_name.clone()).await {
+                                        let _ = sender.send(Err(Error::new(ErrorKind::Other, format!("Quick repair tables meta failed, transaction_uid: {:?}, commit_uid: {:?}, table_name: {:?}, reason: {:?}", transaciton_uid, commit_uid_copy, table_name, e))));
+                                        return;
+                                    }
+                                }
+                            }
+                        } else {
+                            //用户表不再逐 key 走普通 upsert/delete，而是聚合为快速修复写集合
+                            let mut quick_repair_writes = Vec::with_capacity(writes.len());
+                            for write in writes {
+                                quick_repair_writes.push((write.key, write.value));
+                            }
+
+                            if !quick_repair_writes.is_empty() {
+                                tables_clone
+                                    .lock()
+                                    .await
+                                    .insert(table.clone(), ());
+                                if let Err(e) = tr.quick_repair_writes(table.clone(),
+                                                                       quick_repair_writes).await {
+                                    let _ = sender.send(Err(Error::new(ErrorKind::Other, format!("Quick repair db failed, transaction_uid: {:?}, commit_uid: {:?}, table_name: {:?}, reason: {:?}", transaciton_uid, commit_uid_copy, table, e))));
+                                    return;
+                                }
+                            }
+                        }
+
+                        //更新日志缓冲区偏移
+                        offset = new_offset;
+                    }
+
+                    //快速装载动作后仍然要执行 prepare_repair，只是跳过内存表
+                    if let Err(e) = tr.prepare_quick_repair(transaciton_uid.clone()).await {
+                        let _ = sender.send(Err(Error::new(ErrorKind::Other,
+                                                           format!("Quick repair db failed, transaction_uid: {:?}, commit_uid: {:?}, reason: {:?}",
+                                                                   transaciton_uid,
+                                                                   commit_uid_copy,
+                                                                   e))));
+                        return;
+                    }
+
+                    //提交阶段仍沿用旧 repair commit 逻辑，保证提交确认、.bak 改名等行为保持一致
+                    if let Err(e) = tr
+                        .commit_repair(transaciton_uid.clone(),
+                                       commit_uid_copy.clone(),
+                                       prepare_output).await {
+                        let _ = sender.send(Err(Error::new(ErrorKind::Other,
+                                                           format!("Quick repair db failed, transaction_uid: {:?}, commit_uid: {:?}, reason: {:?}",
+                                                                   transaciton_uid,
+                                                                   commit_uid_copy,
+                                                                   e))));
+                        return;
+                    }
+
+                    let _ = sender.send(Ok(()));
+                } else {
+                    let _ = sender.send(Err(Error::new(ErrorKind::Other, format!("Quick repair db failed, transaction_uid: {:?}, commit_uid: {:?}, reason: get db transaction error", transaciton_uid, commit_uid_copy))));
+                }
+            }.boxed();
+            let _ = db_mgr.0.rt.spawn(boxed);
+
+            match receiver.recv() {
+                Err(e) => {
+                    Err(Error::new(ErrorKind::Other, format!("Quick repair db failed, commit_uid: {:?}, reason: {:?}", commit_uid, e)))
+                },
+                Ok(result) => {
+                    result
+                },
+            }
+        };
+
+        //重播所有未确认的提交日志
+        let replay_result = self.0.tr_mgr.replay_commit_log(replay_callback).await?;
+
+        //重播完成后，立即刷出本次修复涉及的持久化表，避免继续等待后台整理周期。
+        // 这里的“本次修复”是指当前启动过程中扫描到的全部未确认 commit log，
+        // 因此 flush 粒度是“整轮 replay 结束后按表统一 flush”，而不是逐事务 flush。
+        self.quick_collect_repaired_tables(tables).await?;
+
+        //通知事务管理器重播阶段已结束
+        let _ = self.0.tr_mgr.finish_replay().await?;
+
+        Ok(replay_result)
+    }
+
+    /// 对 quick repair 期间触达过的持久化表执行一次立即 flush。
+    /// 这里不会设置额外的全局 repair 模式，只是一次性复用表自身的 collect_waits 能力。
+    ///
+    /// 注意：
+    /// 1. 这个方法处理的是当前启动修复这一轮 replay 中累计触达的所有持久化表。
+    /// 2. 单个表的一次 `quick_flush_waits` 会尝试排空该表当前等待队列里累计的已提交修复事务。
+    /// 3. 如果某个表在 replay 过程中因 `waits_limit` 达阈值而提前触发过整理，这是原有表实现的行为；
+    ///    本方法只负责在 replay 结束后做最后一次兜底 flush。
+    async fn quick_collect_repaired_tables(&self,
+                                           tables: Arc<Mutex<BTreeMap<Atom, ()>>>) -> IOResult<()> {
+        let table_names = {
+            let locked = tables.lock().await;
+            locked.keys().cloned().collect::<Vec<_>>()
+        };
+
+        for table_name in table_names {
+            match self.get_table(&table_name).await {
+                Some(KVDBTable::MetaTab(table)) => {
+                    if let Err(e) = table.quick_flush_waits().await {
+                        return Err(Error::new(ErrorKind::Other,
+                                              format!("Quick flush repaired meta table failed, table: {:?}, reason: {:?}",
+                                                      table_name,
+                                                      e)));
+                    }
+                },
+                Some(KVDBTable::MemOrdTab(_)) => (),
+                Some(KVDBTable::LogOrdTab(table)) => {
+                    if let Err(e) = table.quick_flush_waits().await {
+                        return Err(Error::new(ErrorKind::Other,
+                                              format!("Quick flush repaired log ordered table failed, table: {:?}, reason: {:?}",
+                                                      table_name,
+                                                      e)));
+                    }
+                },
+                Some(KVDBTable::LogWTab(table)) => {
+                    if let Err(e) = table.quick_flush_waits().await {
+                        return Err(Error::new(ErrorKind::Other,
+                                              format!("Quick flush repaired only writable table failed, table: {:?}, reason: {:?}",
+                                                      table_name,
+                                                      e)));
+                    }
+                },
+                Some(KVDBTable::BtreeOrdTab(table)) => {
+                    if let Err(e) = table.quick_flush_waits().await {
+                        return Err(Error::new(ErrorKind::Other,
+                                              format!("Quick flush repaired b-tree ordered table failed, table: {:?}, reason: {:?}",
+                                                      table_name,
+                                                      e)));
+                    }
+                },
+                None => (),
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -1815,6 +2096,19 @@ impl<
         }
     }
 
+    /// 在键值对数据库事务的根事务内，快速装载指定表的修复写操作。
+    /// 这个入口只用于 `try_quick_repair`，不会走普通事务的读写路径。
+    async fn quick_repair_writes(&self,
+                                 table: Atom,
+                                 writes: Vec<(Binary, Option<Binary>)>) -> Result<(), KVTableTrError> {
+        match self {
+            KVDBTransaction::RootTr(tr) => {
+                tr.quick_repair_writes(table, writes).await
+            },
+            _ => panic!("Quick repair db failed, reason: invalid root transaction"),
+        }
+    }
+
     /// 在键值对数据库事务的根事务内，异步查询多个表和键的值的结果集，可能会查询到旧值
     pub async fn dirty_query(&self,
                              table_kv_list: Vec<TableKV>) -> Vec<Option<Binary>> {
@@ -1988,6 +2282,19 @@ impl<
                 tr.prepare_repair(transaction_uid).await
             },
             _ => panic!("Repair prepare modified db failed, reason: invalid root transaction"),
+        }
+    }
+
+    /// 在键值对数据库事务的根事务内，异步预提交本次快速修复修改，不返回预提交的输出。
+    /// 与旧 repair 的差异是这里会显式跳过内存表，只让持久化表进入 prepare repair。
+    async fn prepare_quick_repair(&self,
+                                  transaction_uid: Guid)
+                                  -> Result<(), KVTableTrError> {
+        match self {
+            KVDBTransaction::RootTr(tr) => {
+                tr.prepare_quick_repair(transaction_uid).await
+            },
+            _ => panic!("Quick repair prepare modified db failed, reason: invalid root transaction"),
         }
     }
 
@@ -3041,6 +3348,58 @@ impl<
         self.remove_table(table).await
     }
 
+    /// 快速装载指定表的修复写操作，只记录持久化表的动作，不参与正常事务路径。
+    /// 这里不对内存表建动作，也不提前做 prepare/commit，只把后续 repair 所需的动作挂到对应子事务。
+    async fn quick_repair_writes(&self,
+                                 table_name: Atom,
+                                 writes: Vec<(Binary, Option<Binary>)>) -> Result<(), KVTableTrError> {
+        if writes.is_empty() {
+            return Ok(());
+        }
+
+        if let Some(table) = self.0.db_mgr.0.tables.read().await.get(&table_name) {
+            if !table.is_persistent() {
+                //内存表不参与快速修复，因为重启后数据本来就不会保留
+                return Ok(());
+            }
+
+            let mut childes_map = self.0.childs_map.lock();
+            let table_tr = if let Some(table_tr) = childes_map.get(&table_name) {
+                table_tr.require_persistence();
+                table_tr.clone()
+            } else {
+                self.table_transaction(table_name.clone(), table, true, &mut *childes_map)
+            };
+
+            if table_tr.is_require_persistence() {
+                self.0.persistence.store(true, Ordering::Relaxed);
+            }
+
+            match &table_tr {
+                KVDBTransaction::RootTr(_) => (),
+                KVDBTransaction::MetaTabTr(tr) => {
+                    tr.quick_repair_writes(writes);
+                },
+                KVDBTransaction::MemOrdTabTr(_) => (),
+                KVDBTransaction::LogOrdTabTr(tr) => {
+                    tr.quick_repair_writes(writes);
+                },
+                KVDBTransaction::LogWTabTr(tr) => {
+                    tr.quick_repair_writes(writes);
+                },
+                KVDBTransaction::BtreeOrdTabTr(tr) => {
+                    tr.quick_repair_writes(writes);
+                },
+            }
+        } else {
+            return Err(KVTableTrError::new_transaction_error(ErrorLevel::Fatal,
+                                                             format!("Quick repair db failed, table: {:?}, reason: table not exist",
+                                                                     table_name.as_str())));
+        }
+
+        Ok(())
+    }
+
     /// 异步查询多个表和键的值的结果集，可能会查询到旧值
     #[inline]
     async fn dirty_query(&self,
@@ -3977,6 +4336,38 @@ impl<
                 },
                 KVDBTransaction::RootTr(_) => {
                     //忽略根事务，并继续执行下一个子事务的预提交修复
+                    continue;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// 异步预提交本次快速修复修改，不返回预提交的输出。
+    /// quick repair 只需要持久化表参与预提交，内存表必须跳过，避免恢复出不存在于重启后语义中的状态。
+    async fn prepare_quick_repair(&self,
+                                  transaction_uid: Guid)
+                                  -> Result<(), KVTableTrError> {
+        let mut childs = self.to_children();
+        while let Some(child) = childs.next() {
+            match &child {
+                KVDBTransaction::MetaTabTr(tr) => {
+                    tr.prepare_repair(transaction_uid.clone());
+                },
+                KVDBTransaction::MemOrdTabTr(_) => {
+                    continue;
+                },
+                KVDBTransaction::LogOrdTabTr(tr) => {
+                    tr.prepare_repair(transaction_uid.clone());
+                },
+                KVDBTransaction::LogWTabTr(tr) => {
+                    tr.prepare_repair(transaction_uid.clone());
+                },
+                KVDBTransaction::BtreeOrdTabTr(tr) => {
+                    tr.prepare_repair(transaction_uid.clone());
+                },
+                KVDBTransaction::RootTr(_) => {
                     continue;
                 }
             }

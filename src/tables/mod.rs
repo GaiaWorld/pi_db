@@ -1,23 +1,20 @@
 use std::fmt::Debug;
 use std::path::Path;
 
-use futures::future::BoxFuture;
 use bytes::{Buf, BufMut};
+use futures::future::BoxFuture;
 
+use pi_async_transaction::{
+    AsyncTransaction, SequenceTransaction, Transaction2Pc, TransactionTree, UnitTransaction,
+};
 use pi_atom::Atom;
-use pi_async_transaction::{AsyncTransaction,
-                           Transaction2Pc,
-                           UnitTransaction,
-                           SequenceTransaction,
-                           TransactionTree};
 
-use crate::{Binary,
-            KVAction};
+use crate::{Binary, KVAction};
 
-pub mod meta_table;
-pub mod mem_ord_table;
 pub mod log_ord_table;
 pub mod log_write_table;
+pub mod mem_ord_table;
+pub mod meta_table;
 // pub mod b_tree_ord_table_old;
 pub mod b_tree_ord_table;
 
@@ -31,7 +28,12 @@ const DEFAULT_DB_TABLE_NAME_MAX_LEN: usize = 0xffff;
 ///
 pub trait KVTable: Send + Sync + 'static {
     type Name: AsRef<str> + Debug + Clone + Send + 'static;
-    type Tr: KVAction + TransactionTree + SequenceTransaction + UnitTransaction + Transaction2Pc + AsyncTransaction;
+    type Tr: KVAction
+        + TransactionTree
+        + SequenceTransaction
+        + UnitTransaction
+        + Transaction2Pc
+        + AsyncTransaction;
     type Error: Debug + Send + 'static;
 
     /// 获取表名，表名最长为64KB
@@ -53,13 +55,14 @@ pub trait KVTable: Send + Sync + 'static {
     fn size(&self) -> u64;
 
     /// 获取表事务
-    fn transaction(&self,
-                   source: Atom,
-                   is_writable: bool,
-                   is_persistent: bool,
-                   prepare_timeout: u64,
-                   commit_timeout: u64)
-                   -> Self::Tr;
+    fn transaction(
+        &self,
+        source: Atom,
+        is_writable: bool,
+        is_persistent: bool,
+        prepare_timeout: u64,
+        commit_timeout: u64,
+    ) -> Self::Tr;
 
     /// 准备表整理，返回成功则可以开始表整理
     fn ready_collect(&self) -> BoxFuture<Result<(), Self::Error>>;
@@ -68,9 +71,11 @@ pub trait KVTable: Send + Sync + 'static {
     fn collect(&self) -> BoxFuture<Result<(), Self::Error>>;
 
     /// 初始化指定的预提交输出缓冲区，并将本次表事务的预提交操作的键值对数量写入预提交输出缓冲区中
-    fn init_table_prepare_output(&self,
-                                 prepare_output: &mut <<Self as KVTable>::Tr as Transaction2Pc>::PrepareOutput,
-                                 writed_len: u64) {
+    fn init_table_prepare_output(
+        &self,
+        prepare_output: &mut <<Self as KVTable>::Tr as Transaction2Pc>::PrepareOutput,
+        writed_len: u64,
+    ) {
         let table_name = self.name().as_ref().to_string();
         let bytes = table_name.as_bytes();
         let bytes_len = bytes.len();
@@ -85,10 +90,12 @@ pub trait KVTable: Send + Sync + 'static {
     }
 
     /// 追加预提交成功的键值对，到指定的预提交输出缓冲区中
-    fn append_key_value_to_table_prepare_output(&self,
-                                                prepare_output: &mut <<Self as KVTable>::Tr as Transaction2Pc>::PrepareOutput,
-                                                key: &<<Self as KVTable>::Tr as KVAction>::Key,
-                                                value: Option<&<<Self as KVTable>::Tr as KVAction>::Value>) {
+    fn append_key_value_to_table_prepare_output(
+        &self,
+        prepare_output: &mut <<Self as KVTable>::Tr as Transaction2Pc>::PrepareOutput,
+        key: &<<Self as KVTable>::Tr as KVAction>::Key,
+        value: Option<&<<Self as KVTable>::Tr as KVAction>::Value>,
+    ) {
         let bytes: &[u8] = key.as_ref();
         prepare_output.put_u16_le(bytes.len() as u16); //写入关键字长度
         prepare_output.put_slice(bytes); //写入关键字
@@ -105,9 +112,10 @@ pub trait KVTable: Send + Sync + 'static {
     }
 
     /// 获取预提交输出缓冲区的表初始化内容，包括表名和预提交操作的键值对数量，并返回读取后的偏移
-    fn get_init_table_prepare_output(prepare_output: &<<Self as KVTable>::Tr as Transaction2Pc>::PrepareOutput,
-                                     mut offset: usize)
-        -> (Atom, u64, usize) {
+    fn get_init_table_prepare_output(
+        prepare_output: &<<Self as KVTable>::Tr as Transaction2Pc>::PrepareOutput,
+        mut offset: usize,
+    ) -> (Atom, u64, usize) {
         //获取需要读取的缓冲区
         let mut bytes: &[u8] = prepare_output.as_ref();
         bytes.advance(offset); //移动缓冲区指针
@@ -126,11 +134,12 @@ pub trait KVTable: Send + Sync + 'static {
     }
 
     /// 获取预提交输出缓冲区中指定数量的表键值列表，并返回读取后的偏移
-    fn get_all_key_value_from_table_prepare_output(prepare_output: &<<Self as KVTable>::Tr as Transaction2Pc>::PrepareOutput,
-                                                   table: &Atom,
-                                                   kvs_len: u64,
-                                                   mut offset: usize)
-        -> (Vec<TableKV>, usize) {
+    fn get_all_key_value_from_table_prepare_output(
+        prepare_output: &<<Self as KVTable>::Tr as Transaction2Pc>::PrepareOutput,
+        table: &Atom,
+        kvs_len: u64,
+        mut offset: usize,
+    ) -> (Vec<TableKV>, usize) {
         //获取需要读取的缓冲区
         let mut bytes: &[u8] = prepare_output.as_ref();
         bytes.advance(offset); //移动缓冲区指针
@@ -168,9 +177,9 @@ pub trait KVTable: Send + Sync + 'static {
 ///
 #[derive(Debug, Clone)]
 pub struct TableKV {
-    pub table:  Atom,           //表名
-    pub key:    Binary,         //关键字
-    pub value:  Option<Binary>, //值
+    pub table: Atom,           //表名
+    pub key: Binary,           //关键字
+    pub value: Option<Binary>, //值
 }
 
 unsafe impl Send for TableKV {}
@@ -178,14 +187,8 @@ unsafe impl Sync for TableKV {}
 
 impl TableKV {
     /// 构建一个表键值
-    pub fn new(table: Atom,
-               key: Binary,
-               value: Option<Binary>) -> Self {
-        TableKV {
-            table,
-            key,
-            value,
-        }
+    pub fn new(table: Atom, key: Binary, value: Option<Binary>) -> Self {
+        TableKV { table, key, value }
     }
 
     /// 判断是否有值
@@ -193,4 +196,3 @@ impl TableKV {
         self.value.is_some()
     }
 }
-

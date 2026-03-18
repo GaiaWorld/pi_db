@@ -172,6 +172,30 @@ impl<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>,
 > MetaTable<C, Log> {
+    /// 仅供 quick repair 使用的一次性 flush。
+    /// 这里直接复用现有 `collect_waits`，但不会切换表的长期运行模式。
+    pub(crate) async fn quick_flush_waits(&self) -> Result<(), KVTableTrError> {
+        self.0.waits_size.store(0, Ordering::Relaxed);
+
+        match collect_waits(self, None).await {
+            Err((collect_time, statistics)) => {
+                Err(KVTableTrError::new_transaction_error(ErrorLevel::Normal,
+                                                          format!("Quick flush meta table failed, table: {:?}, time: {:?}, statistics: {:?}",
+                                                                  self.name().as_str(),
+                                                                  collect_time,
+                                                                  statistics)))
+            },
+            Ok(_) => {
+                Ok(())
+            },
+        }
+    }
+}
+
+impl<
+    C: Clone + Send + 'static,
+    Log: AsyncCommitLog<C = C, Cid = Guid>,
+> MetaTable<C, Log> {
     /// 构建一个元信息表
     pub async fn new<P: AsRef<Path>>(rt: MultiTaskRuntime<()>,
                                      path: P,
@@ -960,6 +984,16 @@ impl<
         };
 
         MetaTabTr(Arc::new(inner))
+    }
+
+    /// 快速装载元信息表的 repair 动作。
+    /// quick repair 阶段只写入 `DirtyWrite` 记录，真正生效仍依赖后续 `prepare_repair`。
+    pub(crate) fn quick_repair_writes(&self,
+                                      writes: Vec<(Binary, Option<Binary>)>) {
+        let mut actions = self.0.actions.lock();
+        for (key, value) in writes {
+            let _ = actions.insert(key, KVActionLog::DirtyWrite(value));
+        }
     }
 
     // 检查元信息表的预提交表的读写冲突
