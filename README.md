@@ -39,7 +39,7 @@
 - `TryRepair`
   旧修复流程。启动时顺序解析未确认提交日志，对每条写操作逐个走普通 `upsert/delete`，再执行 `prepare_repair` 和 `commit_repair`。
 - `TryQuickRepair`
-  新修复流程。启动时顺序解析未确认提交日志，只对持久化表快速装载 repair 动作，之后仍调用 `prepare_repair` 和 `commit_repair`，最后在整轮 replay 结束后立即 flush 本次修复涉及的持久化表。
+  新修复流程。启动时顺序解析未确认提交日志，只对持久化表快速装载 repair 动作，之后仍调用 `prepare_repair` 和 `commit_repair`，并在每个 `commit log` 文件批次 replay 完成后立即 flush 当前文件触达的持久化表。
 
 ## 表类型概览
 
@@ -122,7 +122,7 @@ pi_sinfo = "~0.5"
   旧修复流程，兼容多年线上逻辑，适合作为基线校验。
 - `TryQuickRepair`
   新修复流程，默认启用；只快速恢复持久化表，不参与内存表恢复，并在 replay 结束后立即 flush 持久化表。
-  返回值中的第一个 `usize` 表示本轮实际重放的未确认 `commit log` 条数，也就是本轮修复的事务数；第二个 `usize` 表示本轮重放的提交日志总字节数。
+  返回值中的第一个 `usize` 表示本次启动修复批次实际重放的未确认 `commit log` 条数，也就是这次批次修复的事务数；第二个 `usize` 表示这次批次重放的提交日志总字节数。
 
 ### 数据库管理器
 
@@ -310,8 +310,10 @@ where
 6. 如果需要对大表做主动整理，应先调用 `ready_collect_table`，再调用 `collect_table`。
 7. quick repair 集成测试的临时目录现在统一放在 `./tmp_quick_repair/` 下；如需清理，可执行 `bash tools/cleanup_quick_repair_dirs.sh current`，如需连历史散落目录一起清理，可执行 `bash tools/cleanup_quick_repair_dirs.sh all`。
 8. 示例代码为了聚焦接口，省略了业务错误包装、目录清理和更多并发控制逻辑；实际项目中建议为数据库目录和 `.commit_log` 目录分别做生命周期管理。
-9. quick repair 的显式 flush 粒度不是“每条事务一次”，也不是“每个表块一次”；它是在整轮启动修复 replay 结束后，对本轮触达的每个持久化表各执行一次兜底 flush。
-10. 如果某张表在 replay 过程中因为等待队列累计大小达到 `waits_limit` 而提前触发了整理，这属于表自身原有的阈值行为，不表示 quick repair 改成了逐事务 flush。
+9. quick repair 的显式 flush 粒度不是“每条事务一次”，也不是“每个表块一次”；它是在每个 `commit log` 文件批次 replay 结束后，对该文件触达的持久化表各执行一次 flush。
+10. 文件级 flush 不等于文件级 confirm；quick repair 仍沿用原有 `confirm_replay -> finish_replay` 的统一确认流程，因此在“部分文件已 flush、整体尚未 `finish_replay`”时再次启动，恢复流程仍必须保持幂等。
+11. 如果某张表在 replay 过程中因为等待队列累计大小达到 `waits_limit` 而提前触发了整理，这属于表自身原有的阈值行为，不表示 quick repair 改成了逐事务 flush。
+12. 修复时会自动忽略所有带 `.bak` 的 `commit log` 文件；如果需要让既有样本参与修复，只能对“连续后缀”那一段物理日志文件去掉 `.bak`，不能跳着激活中间文件。
 
 ## 相关模块
 
@@ -330,4 +332,7 @@ where
 - `TryRepair` 仍完整保留，可用于可靠性基线对比。
 - quick repair 会跳过内存表，只修复持久化表。
 - quick repair replay 完成后会对本次触达的持久化表执行一次立即 flush，避免继续等待默认后台整理周期。
-- 一轮 quick repair 处理多少事务，取决于本次启动时扫描到多少条未确认 `commit log`；不是固定数量。
+- 一次 quick repair 启动修复批次处理多少事务，取决于本次启动时扫描到多少条未确认 `commit log`；不是固定数量。
+- 当前文件级 flush barrier 已固定为“按当前 DB 视图逐张串行 `quick_flush_waits`”，不再采用试验性的分表并发 flush。
+- 当前本地正式对比基准已确认：在 `MetaTab + Btree` 主导、`3` 个约 `32MB` 物理日志文件的近生产样本上，`try_quick_repair(depth=2)` 相对 `try_repair` 的端到端启动修复总时长约快 `3.674x`，且两者修复后的逻辑结果与最终磁盘状态完全一致。
+- 当前剩余主热点仍集中在 `BtreeOrdTab collect_waits(...)` 的 `apply + redb_commit`；在不改变 `try_repair`、不改变正常事务语义、并把改动限制在 `pi_db/pi_store` 内的前提下，内部可控优化空间已经明显收窄。

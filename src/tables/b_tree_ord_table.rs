@@ -37,7 +37,7 @@ use pi_ordmap::asbtree::{Tree, IterTree};
 use pi_ordmap::ordmap::{Entry, ImOrdMap, OrdMap};
 use pi_store::log_store::log_file::LogMethod;
 
-use crate::{Binary, KVAction, KVActionLog, KVDBCommitConfirm, KVTableTrError, TableTrQos, TransactionDebugEvent, transaction_debug_logger, db::{KVDBChildTrList, KVDBTransaction}, tables::{KVTable,
+use crate::{Binary, KVAction, KVActionLog, KVDBCommitConfirm, KVTableTrError, TableTrQos, TransactionDebugEvent, transaction_debug_logger, db::{KVDBChildTrList, KVDBTransaction, QUICK_REPAIR_DB_SOURCE}, tables::{KVTable,
                                                                                                                                                                                             log_ord_table::{LogOrderedTable, LogOrdTabTr}}, utils::KVDBEvent, KVDBTableType};
 
 // 默认的表文件名
@@ -51,6 +51,27 @@ const MIN_CACHE_SIZE: usize = 32 * 1024;
 
 // 默认缓存大小
 pub(crate) const DEFAULT_CACHE_SIZE: usize = 2 * 1024 * 1024;
+
+// quick repair 统计型日志环境变量。
+const QUICK_REPAIR_PROFILE_LOG_ENV: &str = "PI_DB_QUICK_REPAIR_PROFILE_LOG";
+
+#[inline(always)]
+fn quick_repair_profile_log_enabled() -> bool {
+    match std::env::var(QUICK_REPAIR_PROFILE_LOG_ENV) {
+        Ok(value) => {
+            let value = value.trim();
+            !value.is_empty() && value != "0" && value.to_ascii_lowercase() != "false"
+        },
+        Err(_) => false,
+    }
+}
+
+#[inline(always)]
+fn quick_repair_profile_log<S: AsRef<str>>(message: S) {
+    if quick_repair_profile_log_enabled() {
+        println!("[quick_repair_profile][b_tree_collect] {}", message.as_ref());
+    }
+}
 
 impl Value for Binary {
     type SelfType<'a>
@@ -271,22 +292,51 @@ impl<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>,
 > BtreeOrderedTable<C, Log> {
+    /// 仅供 quick repair 使用：
+    /// 暂时挂起原有后台 `wait_timeout` 周期整理，避免它与文件级 quick flush 并发竞争。
+    /// 这不会影响 waits_limit 触发的即时整理，也不会改变正常事务或 try_repair 的行为。
+    pub(crate) fn set_timeout_collect_suspended(&self, suspended: bool) {
+        self.0.timeout_collect_suspended.store(suspended, Ordering::Release);
+    }
+
     /// 仅供 quick repair 使用的一次性 flush。
     /// quick repair 结束后立即把等待区刷到 BTree 文件，避免继续依赖后台定时周期。
+    /// 这里同样要作为 quick repair 的文件级 barrier 使用：
+    /// 如果当前表已经有后台 collect 在执行，就等待它结束并确认 waits 已经清空，
+    /// 然后才允许 quick repair 进入下一个 commit log 文件批次。
     pub(crate) async fn quick_flush_waits(&self) -> Result<(), KVTableTrError> {
         self.0.waits_size.store(0, Ordering::Relaxed);
 
-        match collect_waits(self, None).await {
-            Err((collect_time, statistics)) => {
-                Err(KVTableTrError::new_transaction_error(ErrorLevel::Normal,
-                                                          format!("Quick flush b-tree ordered table failed, table: {:?}, time: {:?}, statistics: {:?}",
-                                                                  self.name().as_str(),
-                                                                  collect_time,
-                                                                  statistics)))
-            },
-            Ok(_) => {
-                Ok(())
-            },
+        loop {
+            if self.0.collecting.load(Ordering::Acquire) {
+                self.0.rt.timeout(0).await;
+                continue;
+            }
+
+            let has_waits = {
+                let waits = self.0.waits.lock().await;
+                !waits.is_empty()
+            };
+
+            if !has_waits {
+                if !self.0.collecting.load(Ordering::Acquire) {
+                    return Ok(());
+                }
+
+                self.0.rt.timeout(0).await;
+                continue;
+            }
+
+            match collect_waits(self, None, "quick_flush").await {
+                Err((collect_time, statistics)) => {
+                    return Err(KVTableTrError::new_transaction_error(ErrorLevel::Normal,
+                                                                     format!("Quick flush b-tree ordered table failed, table: {:?}, time: {:?}, statistics: {:?}",
+                                                                             self.name().as_str(),
+                                                                             collect_time,
+                                                                             statistics)));
+                },
+                Ok(_) => (),
+            }
         }
     }
 }
@@ -415,6 +465,7 @@ impl<
                     waits_limit,
                     wait_timeout,
                     collecting,
+                    timeout_collect_suspended: AtomicBool::new(false),
                     notifier,
                     enable_accelerated_repair,
                 };
@@ -431,8 +482,14 @@ impl<
                 let _ = table.0.rt.spawn(async move {
                     let table_ref = &table_copy;
                     loop {
+                        if table_copy.0.timeout_collect_suspended.load(Ordering::Acquire) {
+                            table_copy.0.rt.timeout(1).await;
+                            continue;
+                        }
+
                         match collect_waits(table_ref,
-                                            Some(table_copy.0.wait_timeout))
+                                            Some(table_copy.0.wait_timeout),
+                                            "timeout")
                             .await
                         {
                             Err((collect_time, statistics)) => {
@@ -488,6 +545,8 @@ struct InnerBtreeOrderedTable<
     wait_timeout:               usize,
     //是否正在整理等待写入B树文件的已提交的待确认事务列表
     collecting:                 AtomicBool,
+    //是否暂时挂起后台 wait_timeout 周期整理，仅供 quick repair 使用
+    timeout_collect_suspended:  AtomicBool,
     //表事件通知器
     notifier:                   Option<Sender<KVDBEvent<Guid>>>,
     //是否加速有序B树表的修复过程，注意加速修复过程会降低有序B树表的内部事务的提交速度
@@ -791,20 +850,23 @@ impl<
         async move {
             //移除事务在有序B树表的预提交表中的操作记录
             let transaction_uid = tr.get_transaction_uid().unwrap();
+            let is_quick_repair_commit = tr.get_source().as_str() == QUICK_REPAIR_DB_SOURCE;
 
             //从有序B树表的预提交表中移除当前事务的操作记录
             let actions = {
-                let mut table_prepare = tr
-                    .0
-                    .table
-                    .0
-                    .prepare
-                    .lock();
-                let actions = table_prepare.get(&transaction_uid); //获取有序B树表，本次事务预提交成功的相关操作记录
+                if is_quick_repair_commit {
+                    tr.0.quick_prepared_actions.lock().take().unwrap_or_default()
+                } else {
+                    let mut table_prepare = tr
+                        .0
+                        .table
+                        .0
+                        .prepare
+                        .lock();
+                    let actions = table_prepare.get(&transaction_uid); //获取有序B树表，本次事务预提交成功的相关操作记录
 
-                //更新有序B树表的临时缓存的根节点
-                if let Some(actions) = actions {
-                    {
+                    //更新有序B树表的临时缓存的根节点
+                    if let Some(actions) = actions {
                         let mut cache_flags = tr
                             .0
                             .table
@@ -842,7 +904,7 @@ impl<
                                         //删除指定关键字，则标记最新删除的关键字
                                         cache_flags.insert(key.clone(), transaction_uid.clone());
                                     },
-                                    KVActionLog::Write(Some(value)) | KVActionLog::DirtyWrite(Some(value)) => {
+                                    KVActionLog::Write(Some(_value)) | KVActionLog::DirtyWrite(Some(_value)) => {
                                         //标记最新插入或更新的关键字
                                         cache_flags.insert(key.clone(), transaction_uid.clone());
                                     },
@@ -851,19 +913,19 @@ impl<
                             }
                             *locked = tr.0.cache_mut.lock().clone();
                         }
-                    }
 
-                    //有序B树表提交完成后，从有序B树表的预提交表中移除当前事务的操作记录
-                    table_prepare.remove(&transaction_uid).unwrap()
-                } else {
-                    XHashMap::default()
+                        //有序B树表提交完成后，从有序B树表的预提交表中移除当前事务的操作记录
+                        table_prepare.remove(&transaction_uid).unwrap()
+                    } else {
+                        XHashMap::default()
+                    }
                 }
             };
 
             if tr.is_require_persistence() {
                 //持久化的有序B树表事务，则异步将表的修改写入B树文件后，再确认提交成功
                 let table_copy = tr.0.table.clone();
-                let _ = self.0.table.0.rt.spawn(async move {
+                let commit_future = async move {
                     let mut size = 0;
                     for (key, action) in &actions {
                         match action {
@@ -886,7 +948,7 @@ impl<
                         .push_back((tr, actions, confirm));
 
                     let last_waits_size = table_copy.0.waits_size.fetch_add(size, Ordering::SeqCst); //更新待确认的已提交事务的大小计数
-                    if last_waits_size + size >= table_copy.0.waits_limit {
+                    if !is_quick_repair_commit && last_waits_size + size >= table_copy.0.waits_limit {
                         //如果当前已注册的待确认的已提交事务大小已达限制，则立即整理
                         table_copy
                             .0
@@ -894,7 +956,8 @@ impl<
                             .store(0, Ordering::Relaxed); //重置待确认的已提交事务的大小计数
 
                         match collect_waits(&table_copy,
-                                            None).await {
+                                            None,
+                                            "waits_limit").await {
                             Err((collect_time, statistics)) => {
                                 error!("Collect b-tree ordered table failed, table: {:?}, time: {:?}, statistics: {:?}, reason: out of size",
                                     table_copy.name().as_str(),
@@ -909,7 +972,13 @@ impl<
                             },
                         }
                     }
-                });
+                };
+
+                if is_quick_repair_commit {
+                    commit_future.await;
+                } else {
+                    let _ = self.0.table.0.rt.spawn(commit_future);
+                }
             }
 
             Ok(())
@@ -1468,6 +1537,7 @@ impl<
             cache_ref,
             table,
             actions: SpinLock::new(XHashMap::default()),
+            quick_prepared_actions: SpinLock::new(None),
             enable_accelerated_repair,
         };
 
@@ -1480,7 +1550,8 @@ impl<
                                       writes: Vec<(Binary, Option<Binary>)>) {
         let mut actions = self.0.actions.lock();
         for (key, value) in writes {
-            let _ = actions.insert(key, KVActionLog::DirtyWrite(value));
+            let action = KVActionLog::DirtyWrite(value);
+            let _ = actions.insert(key, action);
         }
     }
 
@@ -1882,6 +1953,17 @@ impl<
         self.0.table.0.prepare.lock().insert(transaction_uid, actions);
     }
 
+    // 预提交所有快速修复修改
+    // quick repair 下不再逐事务把动作写入全局缓存：
+    // 1. replay 过程中没有读依赖；
+    // 2. 当前文件批次的动作最终都会通过 waits -> quick_flush 顺序落盘；
+    // 3. quick_flush 成功后，BTree 临时缓存本来就会被整体清空。
+    // 因此这里仅保留动作，供 commit_repair 继续登记 waits，避免高频事务对全局缓存做无效往返。
+    pub(crate) fn prepare_quick_repair(&self, _transaction_uid: Guid) {
+        let actions = mem::replace(&mut *self.0.actions.lock(), XHashMap::default());
+        *self.0.quick_prepared_actions.lock() = Some(actions);
+    }
+
     // 立即删除缓存中指定关键字的值，只允许在指定关键字的值被持久化后调用
     pub(crate) fn delete_cache(&self, keys: Vec<(<Self as KVAction>::Key, Option<Guid>)>) {
         //记录需要删除的缓存中的关键字，只用于有序B树表的临时缓存的根节点在当前事务执行过程中已改变
@@ -1954,6 +2036,8 @@ struct InnerBtreeOrdTabTr<
     table:                      BtreeOrderedTable<C, Log>,
     //事务内操作记录
     actions:                    SpinLock<XHashMap<Binary, KVActionLog>>,
+    //仅供 quick repair 复用的已预提交操作
+    quick_prepared_actions:     SpinLock<Option<XHashMap<Binary, KVActionLog>>>,
     //是否加速有序B树表的修复过程，注意加速修复过程会降低有序B树表的内部事务的提交速度
     enable_accelerated_repair:  bool,
 }
@@ -2421,12 +2505,19 @@ impl InnerTransaction {
 async fn collect_waits<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>,
->(table: &BtreeOrderedTable<C, Log>, timeout: Option<usize>)
+>(table: &BtreeOrderedTable<C, Log>, timeout: Option<usize>, reason: &'static str)
     -> Result<(Duration, (usize, usize, usize)), (Duration, (usize, usize, usize))>
 {
+    let profile_enabled = quick_repair_profile_log_enabled();
+    let is_quick_flush = reason == "quick_flush";
+    let total_begin = Instant::now();
     if let Some(timeout) = timeout {
         //需要等待指定时间后，再开始整理
         table.0.rt.timeout(timeout).await;
+
+        if table.0.timeout_collect_suspended.load(Ordering::Acquire) {
+            return Ok((Instant::now().elapsed(), (0, 0, 0)));
+        }
     }
 
     //检查是否正在异步整理，如果并未开始异步整理，则设置为正在异步整理，并继续异步整理
@@ -2435,6 +2526,12 @@ async fn collect_waits<
                                                         Ordering::Acquire,
                                                         Ordering::Relaxed) {
         //正在异步整理，则忽略本次异步整理
+        if profile_enabled && reason == "quick_flush" {
+            quick_repair_profile_log(format!("skip collect: table={:?}, reason={}, elapsed_ms={}",
+                                             table.name().as_str(),
+                                             reason,
+                                             total_begin.elapsed().as_millis()));
+        }
         return Ok((Instant::now().elapsed(), (0, 0, 0)));
     }
 
@@ -2444,16 +2541,22 @@ async fn collect_waits<
     let mut trs_len = 0;
     let mut keys_len = 0;
     let mut bytes_len = 0;
+    let mut begin_write_elapsed_ms = 0u128;
+    let mut apply_elapsed_ms = 0u128;
+    let mut redb_commit_elapsed_ms = 0u128;
 
     let now = Instant::now();
     {
         //在锁保护下迭代当前有序B树表的等待异步写B树文件的已提交的有序B树文件事务列表
+        let waits_lock_begin = Instant::now();
         let mut locked = table
             .0
             .waits
             .lock()
             .await;
+        let waits_lock_elapsed_ms = waits_lock_begin.elapsed().as_millis();
 
+        let begin_write_begin = Instant::now();
         match table.0.inner.read().begin_write() {
             Err(e) => {
                 //创建redb的写事务失败
@@ -2467,11 +2570,21 @@ async fn collect_waits<
                             keys_len,
                             bytes_len,
                             e);
+                if profile_enabled {
+                    quick_repair_profile_log(format!("collect failed before redb write: table={:?}, reason={}, waits_lock_ms={}, begin_write_ms={}, total_elapsed_ms={}, error={:?}",
+                                                     table.name().as_str(),
+                                                     reason,
+                                                     waits_lock_elapsed_ms,
+                                                     begin_write_begin.elapsed().as_millis(),
+                                                     total_begin.elapsed().as_millis(),
+                                                     e));
+                }
 
                 return Err((now.elapsed(), (trs_len, keys_len, bytes_len)));
             },
             Ok(mut transaction) => {
                 //创建redb的写事务成功
+                begin_write_elapsed_ms = begin_write_begin.elapsed().as_millis();
                 transaction.set_quick_repair(table.0.enable_accelerated_repair); //设置redb写事务是否打开快速修复
                 let mut inner_table = match transaction.open_table(DEFAULT_TABLE_NAME) {
                     Err(e) => {
@@ -2485,6 +2598,15 @@ async fn collect_waits<
                             keys_len,
                             bytes_len,
                             e);
+                        if profile_enabled {
+                            quick_repair_profile_log(format!("collect failed opening redb table: table={:?}, reason={}, waits_lock_ms={}, begin_write_ms={}, total_elapsed_ms={}, error={:?}",
+                                                             table.name().as_str(),
+                                                             reason,
+                                                             waits_lock_elapsed_ms,
+                                                             begin_write_elapsed_ms,
+                                                             total_begin.elapsed().as_millis(),
+                                                             e));
+                        }
 
                         return Err((now.elapsed(), (trs_len, keys_len, bytes_len)));
                     },
@@ -2493,11 +2615,12 @@ async fn collect_waits<
                     },
                 };
 
+                let apply_begin = Instant::now();
                 while let Some((wait_tr, actions, confirm)) = locked.pop_front()
                 {
                     let transaction_uid = wait_tr.get_transaction_uid();
-                    for (key, actions) in actions.iter() {
-                        match actions {
+                    let mut apply_action = |key: &Binary, action: &KVActionLog| {
+                        match action {
                             KVActionLog::Write(None) | KVActionLog::DirtyWrite(None) => {
                                 //统计删除了有序B树表中指定关键字的值
                                 if let Err(e) = inner_table.remove(key) {
@@ -2506,7 +2629,7 @@ async fn collect_waits<
                                                 table.name().as_str(),
                                                 key,
                                                 e);
-                                    continue;
+                                    return;
                                 }
 
                                 keys_len += 1;
@@ -2520,7 +2643,7 @@ async fn collect_waits<
                                                 table.name().as_str(),
                                                 key,
                                                 e);
-                                    continue;
+                                    return;
                                 }
 
                                 keys_len += 1;
@@ -2529,17 +2652,26 @@ async fn collect_waits<
                             KVActionLog::Read => (), //忽略读操作
                         }
 
-                        //记录需要在持久化提交成功后，可能从缓存中清理的关键字
-                        cache_keys
-                            .insert(key.clone(),
-                                    transaction_uid.clone());
+                        if !is_quick_flush {
+                            //普通路径仍保持逐 key 清理缓存的既有语义；
+                            // quick repair 的文件级 barrier 则在本次 flush 成功后直接整体清空临时缓存。
+                            cache_keys
+                                .insert(key.clone(),
+                                        transaction_uid.clone());
+                        }
+                    };
+
+                    for (key, action) in actions.iter() {
+                        apply_action(key, action);
                     }
 
                     trs_len += 1;
                     waits.push_back((wait_tr, confirm));
                 }
+                apply_elapsed_ms = apply_begin.elapsed().as_millis();
                 drop(inner_table); //在持久化提交前必须关闭redb表
 
+                let redb_commit_begin = Instant::now();
                 if let Err(e) = transaction.commit() {
                     //持久化提交redb失败，则立即中止本次整理
                     table
@@ -2552,14 +2684,42 @@ async fn collect_waits<
                                 keys_len,
                                 bytes_len,
                                 e);
+                    if profile_enabled {
+                        quick_repair_profile_log(format!("collect failed on redb commit: table={:?}, reason={}, waits_lock_ms={}, begin_write_ms={}, apply_ms={}, commit_ms={}, transactions={}, keys={}, bytes={}, total_elapsed_ms={}, error={:?}",
+                                                         table.name().as_str(),
+                                                         reason,
+                                                         waits_lock_elapsed_ms,
+                                                         begin_write_elapsed_ms,
+                                                         apply_elapsed_ms,
+                                                         redb_commit_begin.elapsed().as_millis(),
+                                                         trs_len,
+                                                         keys_len,
+                                                         bytes_len,
+                                                         total_begin.elapsed().as_millis(),
+                                                         e));
+                    }
 
                     return Err((now.elapsed(), (trs_len, keys_len, bytes_len)));
+                }
+                redb_commit_elapsed_ms = redb_commit_begin.elapsed().as_millis();
+                if profile_enabled {
+                    quick_repair_profile_log(format!("redb commit ready: table={:?}, reason={}, waits_lock_ms={}, begin_write_ms={}, apply_ms={}, commit_ms={}, transactions={}, keys={}, bytes={}",
+                                                     table.name().as_str(),
+                                                     reason,
+                                                     waits_lock_elapsed_ms,
+                                                     begin_write_elapsed_ms,
+                                                     apply_elapsed_ms,
+                                                     redb_commit_elapsed_ms,
+                                                     trs_len,
+                                                     keys_len,
+                                                     bytes_len));
                 }
             },
         }
     }
 
     //写入redb成功，则调用指定事务的确认提交回调，并继续写入下一个事务
+    let confirm_begin = Instant::now();
     if let Some(notifier) = table.0.notifier.as_ref() {
         //指定了监听器
         for (wait_tr, confirm) in waits {
@@ -2602,16 +2762,42 @@ async fn collect_waits<
             }
         }
     }
+    let confirm_elapsed_ms = confirm_begin.elapsed().as_millis();
     table.0.collecting.store(false, Ordering::Release); //设置为已整理结束
 
     //清理已经持久化提交后的关键字在缓存中的值
-    let clean_cache_transaction = table.transaction(Atom::from("Collect_waits_cache"),
-                      false,
-                      false,
-                      5000,
-                      5000);
-    clean_cache_transaction
-        .delete_cache(cache_keys.into_iter().collect());
+    let clean_cache_begin = Instant::now();
+    if is_quick_flush {
+        // quick repair 的文件级 barrier 成功后，当前文件批次的 BTree 修改已经全部落盘，
+        // 且下一文件批次 replay 尚未开始，因此可以直接整体清空临时缓存与标记，
+        // 避免逐 key delete_cache 的额外开销。
+        *table.0.cache.lock() = OrdMap::new(None);
+        table.0.cache_flags.lock().clear();
+    } else {
+        let clean_cache_transaction = table.transaction(Atom::from("Collect_waits_cache"),
+                          false,
+                          false,
+                          5000,
+                          5000);
+        clean_cache_transaction
+            .delete_cache(cache_keys.into_iter().collect());
+    }
+    let clean_cache_elapsed_ms = clean_cache_begin.elapsed().as_millis();
+
+    if profile_enabled {
+        quick_repair_profile_log(format!("collect succeeded: table={:?}, reason={}, begin_write_ms={}, apply_ms={}, redb_commit_ms={}, confirm_ms={}, clean_cache_ms={}, total_elapsed_ms={}, transactions={}, keys={}, bytes={}",
+                                         table.name().as_str(),
+                                         reason,
+                                         begin_write_elapsed_ms,
+                                         apply_elapsed_ms,
+                                         redb_commit_elapsed_ms,
+                                         confirm_elapsed_ms,
+                                         clean_cache_elapsed_ms,
+                                         total_begin.elapsed().as_millis(),
+                                         trs_len,
+                                         keys_len,
+                                         bytes_len));
+    }
 
     Ok((now.elapsed(), (trs_len, keys_len, bytes_len)))
 }

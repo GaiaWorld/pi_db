@@ -7463,7 +7463,10 @@ const QUICK_REPAIR_LOG_WRITE_TABLE: &str = "repair_log_write";
 const QUICK_REPAIR_BTREE_TABLE: &str = "repair_btree";
 const QUICK_REPAIR_MEM_TABLE: &str = "repair_mem";
 const QUICK_REPAIR_RECREATE_TABLE: &str = "repair_recreate";
+const QUICK_REPAIR_PAYLOAD_TABLE: &str = "repair_payload";
+const QUICK_REPAIR_LOG_ORD_PAYLOAD_TABLE: &str = "repair_log_ord_payload";
 const QUICK_REPAIR_TMP_ROOT: &str = "./tmp_quick_repair";
+const QUICK_REPAIR_TEST_ABORT_AFTER_FILE_FLUSHES_ENV: &str = "PI_DB_QUICK_REPAIR_TEST_ABORT_AFTER_FILE_FLUSHES";
 const QUICK_REPAIR_BTREE_DEF: TableDefinition<Binary, Binary> = TableDefinition::new("$default");
 
 #[derive(Debug, PartialEq, Eq)]
@@ -7493,6 +7496,18 @@ struct RecreateTableSnapshot {
 struct RecreateTableDiskState {
     meta_tables: Vec<String>,
     recreate:    BTreeMap<usize, usize>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct LargeLogOrdPayloadSnapshot {
+    tables:          Vec<String>,
+    log_ord_payload: BTreeMap<usize, Vec<u8>>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct LargeLogOrdPayloadDiskState {
+    meta_tables:     Vec<String>,
+    log_ord_payload: BTreeMap<usize, Vec<u8>>,
 }
 
 struct LatestLogTableLoader {
@@ -7587,6 +7602,256 @@ fn test_try_repair_and_try_quick_repair_are_consistent() {
     assert_eq!(try_quick_repair_snapshot, expected_quick_repair_snapshot());
 }
 
+// 对同一份 crash fixture 分别执行默认深度 `2` 和显式深度 `3` 的 quick repair：
+// 1. 两种文件流水线深度不得改变最终逻辑视图；
+// 2. 快速 flush 的磁盘结果也必须保持一致；
+// 3. 该用例用于固定“流水线深度只影响并发窗口，不影响恢复语义”。
+#[test]
+fn test_try_quick_repair_pipeline_depth_three_is_consistent() {
+    let _guard = quick_repair_test_guard();
+
+    if let Some(root) = quick_repair_child_root("quick_pipeline_depth_fixture") {
+        generate_quick_repair_fixture(&root);
+        return;
+    }
+
+    let base_root = quick_repair_tmp_dir("pipeline_depth/source");
+    let default_root = quick_repair_tmp_dir("pipeline_depth/default");
+    let depth_three_root = quick_repair_tmp_dir("pipeline_depth/depth_three");
+
+    spawn_quick_repair_fixture("test_try_quick_repair_pipeline_depth_three_is_consistent",
+                               "quick_pipeline_depth_fixture",
+                               &base_root);
+    copy_dir_all(&base_root, &default_root);
+    copy_dir_all(&base_root, &depth_three_root);
+
+    let default_state = startup_db_and_collect_quick_repair_state_with_pipeline_depth(&default_root,
+                                                                                       DBStartupRepairMode::TryQuickRepair,
+                                                                                       None);
+    let depth_three_state = startup_db_and_collect_quick_repair_state_with_pipeline_depth(&depth_three_root,
+                                                                                           DBStartupRepairMode::TryQuickRepair,
+                                                                                           Some(3));
+
+    assert_eq!(default_state, depth_three_state);
+    assert_eq!(depth_three_state.0, expected_quick_repair_snapshot());
+    assert_eq!(depth_three_state.1, expected_quick_repair_disk_state());
+}
+
+// 验证 quick repair 在多个物理 commit log 文件边界上的真实恢复：
+// 1. fixture 必须确实生成多个未确认 commit log 文件；
+// 2. quick repair 必须跨文件顺序恢复出一致的逻辑视图和磁盘视图；
+// 3. 该用例用于固定“每文件一次 flush”在真实多文件场景下的恢复语义。
+#[test]
+fn test_quick_repair_multi_file_commit_logs_real_unconfirmed_commit_log() {
+    let _guard = quick_repair_test_guard();
+
+    if let Some(root) = quick_repair_child_root("quick_multi_file_fixture") {
+        generate_quick_repair_multi_file_fixture(&root);
+        return;
+    }
+
+    let root = quick_repair_tmp_dir("multi_file_recovery");
+    spawn_quick_repair_fixture("test_quick_repair_multi_file_commit_logs_real_unconfirmed_commit_log",
+                               "quick_multi_file_fixture",
+                               &root);
+
+    assert!(count_active_commit_log_files(&root) > 1,
+            "multi-file quick repair fixture should contain more than one active commit log file, root: {:?}",
+            root);
+
+    let (snapshot, disk_state) = startup_db_and_collect_quick_repair_state(&root,
+                                                                            DBStartupRepairMode::TryQuickRepair);
+
+    assert_eq!(snapshot, expected_quick_repair_multi_file_snapshot());
+    assert_eq!(disk_state, expected_quick_repair_multi_file_disk_state());
+}
+
+// 用多物理 commit log 文件的真实 crash fixture 对照旧 repair 和 quick repair：
+// 1. 两条修复路径在跨文件 replay 时必须恢复出完全一致的逻辑结果；
+// 2. 该用例用于固定“文件边界中间 flush 不改变最终恢复语义”。
+#[test]
+fn test_try_repair_and_try_quick_repair_multi_file_fixture_are_consistent() {
+    let _guard = quick_repair_test_guard();
+
+    if let Some(root) = quick_repair_child_root("quick_multi_file_compare_fixture") {
+        generate_quick_repair_multi_file_fixture(&root);
+        return;
+    }
+
+    let base_root = quick_repair_tmp_dir("multi_file_compare/source");
+    let try_repair_root = quick_repair_tmp_dir("multi_file_compare/try_repair");
+    let try_quick_repair_root = quick_repair_tmp_dir("multi_file_compare/try_quick_repair");
+
+    spawn_quick_repair_fixture("test_try_repair_and_try_quick_repair_multi_file_fixture_are_consistent",
+                               "quick_multi_file_compare_fixture",
+                               &base_root);
+
+    assert!(count_active_commit_log_files(&base_root) > 1,
+            "multi-file compare fixture should contain more than one active commit log file, root: {:?}",
+            base_root);
+
+    let (try_repair_snapshot, try_quick_repair_snapshot) = compare_repair_snapshots_on_fixture(&base_root,
+                                                                                                &try_repair_root,
+                                                                                                &try_quick_repair_root);
+
+    assert_eq!(try_repair_snapshot, try_quick_repair_snapshot);
+    assert_eq!(try_quick_repair_snapshot, expected_quick_repair_multi_file_snapshot());
+}
+
+// 验证 quick repair 在“部分文件已 flush，但整体尚未 finish_replay”后再次启动时仍保持幂等：
+// 1. 先生成多物理 commit log 文件的真实 crash fixture；
+// 2. 子进程首次 quick repair 在成功 flush 指定数量的文件后直接退出，不执行 finish_replay；
+// 3. 父进程再次启动并执行 quick repair，最终结果必须与正常恢复一致。
+#[test]
+fn test_try_quick_repair_remains_idempotent_after_flushed_files_before_finish_replay() {
+    let _guard = quick_repair_test_guard();
+
+    if let Some(root) = quick_repair_child_root("quick_multi_file_abort_fixture") {
+        generate_quick_repair_multi_file_fixture(&root);
+        return;
+    }
+
+    if let Some(root) = quick_repair_child_root("quick_multi_file_abort_run") {
+        let _ = startup_db_and_collect_quick_repair_state(&root,
+                                                          DBStartupRepairMode::TryQuickRepair);
+        panic!("expected quick repair abort hook to terminate process before finish_replay");
+    }
+
+    let base_root = quick_repair_tmp_dir("multi_file_abort/source");
+    let interrupted_root = quick_repair_tmp_dir("multi_file_abort/interrupted");
+
+    spawn_quick_repair_fixture("test_try_quick_repair_remains_idempotent_after_flushed_files_before_finish_replay",
+                               "quick_multi_file_abort_fixture",
+                               &base_root);
+
+    assert!(count_active_commit_log_files(&base_root) > 1,
+            "multi-file abort fixture should contain more than one active commit log file, root: {:?}",
+            base_root);
+
+    copy_dir_all(&base_root, &interrupted_root);
+    spawn_quick_repair_abort_run("test_try_quick_repair_remains_idempotent_after_flushed_files_before_finish_replay",
+                                 "quick_multi_file_abort_run",
+                                 &interrupted_root,
+                                 1);
+
+    assert!(count_active_commit_log_files(&interrupted_root) > 0,
+            "quick repair interrupted before finish_replay should keep active commit log files for next startup, root: {:?}",
+            interrupted_root);
+
+    let (snapshot, disk_state) = startup_db_and_collect_quick_repair_state(&interrupted_root,
+                                                                            DBStartupRepairMode::TryQuickRepair);
+
+    assert_eq!(snapshot, expected_quick_repair_multi_file_snapshot());
+    assert_eq!(disk_state, expected_quick_repair_multi_file_disk_state());
+}
+
+// 验证生产实际会使用的 LogOrdTab 在大 payload 未确认提交日志下的 quick repair：
+// 1. 每个物理 commit log 文件都包含约 1 MiB 量级的二进制值；
+// 2. quick repair 返回后，逻辑视图与磁盘日志状态都必须一致；
+// 3. 该用例用于覆盖日志型表 quick immediate commit 的大块写入快路径。
+#[test]
+fn test_quick_repair_log_ord_large_payload_real_unconfirmed_commit_log() {
+    let _guard = quick_repair_test_guard();
+
+    if let Some(root) = quick_repair_child_root("quick_log_ord_large_payload_fixture") {
+        generate_quick_repair_log_ord_large_payload_fixture(&root);
+        return;
+    }
+
+    let root = quick_repair_tmp_dir("log_ord_large_payload_recovery");
+    spawn_quick_repair_fixture("test_quick_repair_log_ord_large_payload_real_unconfirmed_commit_log",
+                               "quick_log_ord_large_payload_fixture",
+                               &root);
+
+    let source_disk_state = load_large_log_ord_payload_disk_state(&root);
+    assert!(source_disk_state.log_ord_payload.is_empty(),
+            "source fixture should not have persisted large LogOrdTab payload before repair, root: {:?}, source_disk_state: {:?}",
+            root,
+            source_disk_state);
+
+    let (snapshot, disk_state) = startup_db_and_collect_large_log_ord_payload_state(&root,
+                                                                                     DBStartupRepairMode::TryQuickRepair);
+
+    assert_eq!(snapshot, expected_large_log_ord_payload_snapshot());
+    assert_eq!(disk_state, expected_large_log_ord_payload_disk_state());
+}
+
+// 用同一份 LogOrdTab 大 payload crash fixture 对照旧 repair 和 quick repair：
+// 1. 两条修复路径恢复出的逻辑视图必须完全一致；
+// 2. 这里比较的是同源 fixture 的最终结果，比较过程不计入性能统计。
+#[test]
+fn test_try_repair_and_try_quick_repair_log_ord_large_payload_fixture_are_consistent() {
+    let _guard = quick_repair_test_guard();
+
+    if let Some(root) = quick_repair_child_root("quick_log_ord_large_payload_compare_fixture") {
+        generate_quick_repair_log_ord_large_payload_fixture(&root);
+        return;
+    }
+
+    let base_root = quick_repair_tmp_dir("log_ord_large_payload_compare/source");
+    let try_repair_root = quick_repair_tmp_dir("log_ord_large_payload_compare/try_repair");
+    let try_quick_repair_root = quick_repair_tmp_dir("log_ord_large_payload_compare/try_quick_repair");
+
+    spawn_quick_repair_fixture("test_try_repair_and_try_quick_repair_log_ord_large_payload_fixture_are_consistent",
+                               "quick_log_ord_large_payload_compare_fixture",
+                               &base_root);
+
+    let (try_repair_snapshot, try_quick_repair_snapshot) =
+        compare_large_log_ord_payload_snapshots_on_fixture(&base_root,
+                                                           &try_repair_root,
+                                                           &try_quick_repair_root);
+
+    assert_eq!(try_repair_snapshot, try_quick_repair_snapshot);
+    assert_eq!(try_quick_repair_snapshot, expected_large_log_ord_payload_snapshot());
+}
+
+// 验证 LogOrdTab 大 payload 场景下，quick repair 在“部分文件已 flush、尚未 finish_replay”后再次启动仍保持幂等：
+// 1. 子进程首次 quick repair 在成功 flush 指定数量的文件后直接退出；
+// 2. 父进程再次启动并执行 quick repair；
+// 3. 最终逻辑视图和磁盘状态都必须与正常恢复一致。
+#[test]
+fn test_try_quick_repair_log_ord_large_payload_remains_idempotent_after_flushed_files_before_finish_replay() {
+    let _guard = quick_repair_test_guard();
+
+    if let Some(root) = quick_repair_child_root("quick_log_ord_large_payload_abort_fixture") {
+        generate_quick_repair_log_ord_large_payload_fixture(&root);
+        return;
+    }
+
+    if let Some(root) = quick_repair_child_root("quick_log_ord_large_payload_abort_run") {
+        let _ = startup_db_and_collect_large_log_ord_payload_state(&root,
+                                                                   DBStartupRepairMode::TryQuickRepair);
+        panic!("expected quick repair abort hook to terminate process before finish_replay");
+    }
+
+    let base_root = quick_repair_tmp_dir("log_ord_large_payload_abort/source");
+    let interrupted_root = quick_repair_tmp_dir("log_ord_large_payload_abort/interrupted");
+
+    spawn_quick_repair_fixture("test_try_quick_repair_log_ord_large_payload_remains_idempotent_after_flushed_files_before_finish_replay",
+                               "quick_log_ord_large_payload_abort_fixture",
+                               &base_root);
+
+    assert!(count_active_commit_log_files(&base_root) > 1,
+            "log_ord large payload fixture should contain more than one active commit log file, root: {:?}",
+            base_root);
+
+    copy_dir_all(&base_root, &interrupted_root);
+    spawn_quick_repair_abort_run("test_try_quick_repair_log_ord_large_payload_remains_idempotent_after_flushed_files_before_finish_replay",
+                                 "quick_log_ord_large_payload_abort_run",
+                                 &interrupted_root,
+                                 1);
+
+    assert!(count_active_commit_log_files(&interrupted_root) > 0,
+            "quick repair interrupted before finish_replay should keep active commit log files for next startup, root: {:?}",
+            interrupted_root);
+
+    let (snapshot, disk_state) = startup_db_and_collect_large_log_ord_payload_state(&interrupted_root,
+                                                                                     DBStartupRepairMode::TryQuickRepair);
+
+    assert_eq!(snapshot, expected_large_log_ord_payload_snapshot());
+    assert_eq!(disk_state, expected_large_log_ord_payload_disk_state());
+}
+
 // 用元信息表 create/remove 的真实 crash fixture 对照旧 repair 和 quick repair：
 // 1. 两条修复路径必须恢复出完全一致的逻辑视图和磁盘视图；
 // 2. 该用例同时覆盖 repair 删除表时的元信息 key 解码路径。
@@ -7613,6 +7878,66 @@ fn test_try_repair_and_try_quick_repair_meta_fixture_are_consistent() {
 
     assert_eq!(try_repair_snapshot, try_quick_repair_snapshot);
     assert_eq!(try_quick_repair_snapshot, expected_quick_repair_meta_snapshot());
+}
+
+// 验证同一个 active commit log 文件内，MetaTab 建表/删表与后续普通表事务的严格顺序恢复：
+// 1. `create_table(repair_btree)` 与后续 `repair_btree` 写事务必须保持顺序；
+// 2. `repair_log_write` 的写事务与后续 `remove_table(repair_log_write)` 也必须保持顺序；
+// 3. 该用例只断言最终逻辑视图，删除表后的历史物理文件不作为 correctness 标准。
+#[test]
+fn test_quick_repair_same_file_meta_ordering_real_unconfirmed_commit_log() {
+    let _guard = quick_repair_test_guard();
+
+    if let Some(root) = quick_repair_child_root("quick_same_file_meta_fixture") {
+        generate_quick_repair_same_file_meta_fixture(&root);
+        return;
+    }
+
+    let root = quick_repair_tmp_dir("same_file_meta_recovery");
+    spawn_quick_repair_fixture("test_quick_repair_same_file_meta_ordering_real_unconfirmed_commit_log",
+                               "quick_same_file_meta_fixture",
+                               &root);
+
+    assert_eq!(count_active_commit_log_files(&root), 1,
+               "same-file meta fixture should contain exactly one active commit log file, root: {:?}",
+               root);
+
+    let snapshot = startup_db_and_snapshot(&root,
+                                           DBStartupRepairMode::TryQuickRepair);
+
+    assert_eq!(snapshot, expected_quick_repair_same_file_meta_snapshot());
+}
+
+// 对同一个 active commit log 文件内的 MetaTab 时序混合场景做旧新修复对照：
+// 1. `create_table -> 后续写表` 和 `写表 -> remove_table` 都必须在同一文件内恢复出一致结果；
+// 2. 该用例用于固定 quick repair 的文件级分表缓冲，不得打乱 Meta 与普通表事务的严格顺序。
+#[test]
+fn test_try_repair_and_try_quick_repair_same_file_meta_fixture_are_consistent() {
+    let _guard = quick_repair_test_guard();
+
+    if let Some(root) = quick_repair_child_root("quick_same_file_meta_compare_fixture") {
+        generate_quick_repair_same_file_meta_fixture(&root);
+        return;
+    }
+
+    let base_root = quick_repair_tmp_dir("same_file_meta_compare/source");
+    let try_repair_root = quick_repair_tmp_dir("same_file_meta_compare/try_repair");
+    let try_quick_repair_root = quick_repair_tmp_dir("same_file_meta_compare/try_quick_repair");
+
+    spawn_quick_repair_fixture("test_try_repair_and_try_quick_repair_same_file_meta_fixture_are_consistent",
+                               "quick_same_file_meta_compare_fixture",
+                               &base_root);
+
+    assert_eq!(count_active_commit_log_files(&base_root), 1,
+               "same-file meta compare fixture should contain exactly one active commit log file, root: {:?}",
+               base_root);
+
+    let (try_repair_snapshot, try_quick_repair_snapshot) = compare_repair_snapshots_on_fixture(&base_root,
+                                                                                                &try_repair_root,
+                                                                                                &try_quick_repair_root);
+
+    assert_eq!(try_repair_snapshot, try_quick_repair_snapshot);
+    assert_eq!(try_quick_repair_snapshot, expected_quick_repair_same_file_meta_snapshot());
 }
 
 // 验证 quick repair 对元信息表的真实崩溃恢复：
@@ -7797,6 +8122,59 @@ fn test_try_repair_and_try_quick_repair_btree_fixture_are_consistent() {
     assert_eq!(try_quick_repair_snapshot, expected_quick_repair_btree_snapshot());
 }
 
+// 验证 quick repair 在同一个 active commit log 文件内对 BTree 同 key 多事务覆盖的真实恢复：
+// 1. 多个未确认事务会对同一批 key 连续执行 upsert / delete / reinsert；
+// 2. quick repair 最终必须只体现“按事务顺序最后一次生效”的状态；
+// 3. 该场景用于约束 quick flush 在批次内按 key 折叠时不能改变最终语义。
+#[test]
+fn test_quick_repair_btree_same_key_overwrite_real_unconfirmed_commit_log() {
+    let _guard = quick_repair_test_guard();
+
+    if let Some(root) = quick_repair_child_root("quick_btree_same_key_fixture") {
+        generate_quick_repair_btree_same_key_fixture(&root);
+        return;
+    }
+
+    let root = quick_repair_tmp_dir("btree_same_key_recovery");
+    spawn_quick_repair_fixture("test_quick_repair_btree_same_key_overwrite_real_unconfirmed_commit_log",
+                               "quick_btree_same_key_fixture",
+                               &root);
+
+    let (snapshot, disk_state) = startup_db_and_collect_quick_repair_state(&root,
+                                                                            DBStartupRepairMode::TryQuickRepair);
+
+    assert_eq!(snapshot, expected_quick_repair_btree_same_key_snapshot());
+    assert_eq!(disk_state, expected_quick_repair_btree_same_key_disk_state());
+}
+
+// 用同一份“BTree 同 key 多事务覆盖”真实 crash fixture 对照旧 repair 和 quick repair：
+// 1. 两条修复路径对同一 key 的覆盖、删除与重建结果必须严格一致；
+// 2. 该测试直接约束 quick flush 的批次内按 key 折叠不能改变最终结果。
+#[test]
+fn test_try_repair_and_try_quick_repair_btree_same_key_fixture_are_consistent() {
+    let _guard = quick_repair_test_guard();
+
+    if let Some(root) = quick_repair_child_root("quick_btree_same_key_compare_fixture") {
+        generate_quick_repair_btree_same_key_fixture(&root);
+        return;
+    }
+
+    let base_root = quick_repair_tmp_dir("btree_same_key_compare/source");
+    let try_repair_root = quick_repair_tmp_dir("btree_same_key_compare/try_repair");
+    let try_quick_repair_root = quick_repair_tmp_dir("btree_same_key_compare/try_quick_repair");
+
+    spawn_quick_repair_fixture("test_try_repair_and_try_quick_repair_btree_same_key_fixture_are_consistent",
+                               "quick_btree_same_key_compare_fixture",
+                               &base_root);
+
+    let (try_repair_snapshot, try_quick_repair_snapshot) = compare_repair_snapshots_on_fixture(&base_root,
+                                                                                                &try_repair_root,
+                                                                                                &try_quick_repair_root);
+
+    assert_eq!(try_repair_snapshot, try_quick_repair_snapshot);
+    assert_eq!(try_quick_repair_snapshot, expected_quick_repair_btree_same_key_snapshot());
+}
+
 // 验证 quick repair 对“删除表后重建同名表”的真实恢复：
 // 1. 未确认事务中先删除旧表，再以同名新表继续写入；
 // 2. 修复后应只看到最终重建出来的新表数据；
@@ -7871,23 +8249,34 @@ fn quick_repair_tmp_dir(name: &str) -> PathBuf {
     PathBuf::from(QUICK_REPAIR_TMP_ROOT).join(name)
 }
 
+fn spawn_quick_repair_child_process(test_name: &str,
+                                    mode: &str,
+                                    root: &std::path::Path,
+                                    extra_envs: Vec<(&str, String)>) -> std::process::ExitStatus {
+    if let Some(parent) = root.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    command.arg("--exact")
+        .arg(test_name)
+        .arg("--nocapture")
+        .env("PI_DB_QUICK_REPAIR_CHILD_MODE", mode)
+        .env("PI_DB_QUICK_REPAIR_CHILD_ROOT", root.to_str().unwrap());
+
+    for (key, value) in extra_envs {
+        command.env(key, value);
+    }
+
+    command.status().unwrap()
+}
+
 // 拉起当前测试二进制的子进程，专门制造“提交日志已写但未确认”的真实 fixture。
 fn spawn_quick_repair_fixture(test_name: &str,
                               mode: &str,
                               root: &std::path::Path) {
     remove_dir_if_exists(root);
-    if let Some(parent) = root.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-
-    let status = std::process::Command::new(std::env::current_exe().unwrap())
-        .arg("--exact")
-        .arg(test_name)
-        .arg("--nocapture")
-        .env("PI_DB_QUICK_REPAIR_CHILD_MODE", mode)
-        .env("PI_DB_QUICK_REPAIR_CHILD_ROOT", root.to_str().unwrap())
-        .status()
-        .unwrap();
+    let status = spawn_quick_repair_child_process(test_name, mode, root, Vec::new());
 
     assert!(status.success(),
             "spawn quick repair fixture failed, test: {:?}, mode: {:?}, root: {:?}, status: {:?}",
@@ -7895,6 +8284,55 @@ fn spawn_quick_repair_fixture(test_name: &str,
             mode,
             root,
             status);
+}
+
+fn spawn_quick_repair_abort_run(test_name: &str,
+                                mode: &str,
+                                root: &std::path::Path,
+                                abort_after_file_flushes: usize) {
+    let status = spawn_quick_repair_child_process(test_name,
+                                                  mode,
+                                                  root,
+                                                  vec![(QUICK_REPAIR_TEST_ABORT_AFTER_FILE_FLUSHES_ENV,
+                                                        abort_after_file_flushes.to_string())]);
+
+    assert!(status.success(),
+            "spawn quick repair abort run failed, test: {:?}, mode: {:?}, root: {:?}, abort_after_file_flushes: {:?}, status: {:?}",
+            test_name,
+            mode,
+            root,
+            abort_after_file_flushes,
+            status);
+}
+
+fn count_active_commit_log_files(root: &std::path::Path) -> usize {
+    let commit_log_root = root.join(".commit_log");
+    if !commit_log_root.exists() {
+        return 0;
+    }
+
+    std::fs::read_dir(commit_log_root).unwrap()
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| {
+            if !path.is_file() {
+                return false;
+            }
+
+            let file_name = match path.file_name().and_then(|name| name.to_str()) {
+                Some(file_name) => file_name,
+                None => return false,
+            };
+            if file_name.ends_with(".bak") {
+                return false;
+            }
+
+            match path.metadata() {
+                Ok(meta) => meta.len() > 0,
+                Err(_) => false,
+            }
+        })
+        .count()
 }
 
 // 生成 quick repair 测试所需的真实数据库目录：
@@ -8066,6 +8504,171 @@ fn generate_quick_repair_meta_fixture(root: &std::path::Path) {
     receiver.recv_timeout(Duration::from_secs(60)).unwrap();
 }
 
+// 生成“同一个 active commit log 文件内混合 MetaTab 与普通表事务”的真实修复 fixture：
+// - 先持久化 `repair_log_ord` 和 `repair_log_write`；
+// - 再在同一个未确认物理文件内依次执行：创建 `repair_btree`、写 `repair_btree`、写 `repair_log_write`、删除 `repair_log_write`；
+// - 用于验证 quick repair 的文件级分表缓冲不会打乱 Meta 与后续普通表事务的严格顺序。
+fn generate_quick_repair_same_file_meta_fixture(root: &std::path::Path) {
+    remove_dir_if_exists(root);
+    std::fs::create_dir_all(root).unwrap();
+
+    let _handle = startup_global_time_loop(10);
+    let builder = MultiTaskRuntimeBuilder::default();
+    let rt = builder.build();
+    let rt_copy = rt.clone();
+    let root_copy = root.to_path_buf();
+    let (sender, receiver) = bounded(1);
+
+    let _ = rt.spawn(async move {
+        let db = startup_quick_repair_test_db_with_pipeline_depth_and_log_limit(rt_copy.clone(),
+                                                                                root_copy.clone(),
+                                                                                DBStartupRepairMode::TryQuickRepair,
+                                                                                None,
+                                                                                1024 * 1024).await;
+
+        let log_ord_table = Atom::from(QUICK_REPAIR_LOG_ORD_TABLE);
+        let log_write_table = Atom::from(QUICK_REPAIR_LOG_WRITE_TABLE);
+        let btree_table = Atom::from(QUICK_REPAIR_BTREE_TABLE);
+
+        let tr = db.transaction(Atom::from("quick repair same-file meta fixture create table"), true, 500, 500).unwrap();
+        tr.create_table(log_ord_table.clone(),
+                        KVTableMeta::new(KVDBTableType::LogOrdTab,
+                                         true,
+                                         EnumType::Usize,
+                                         EnumType::Usize),
+                        true).await.unwrap();
+        tr.create_table(log_write_table.clone(),
+                        KVTableMeta::new(KVDBTableType::LogWTab,
+                                         true,
+                                         EnumType::Usize,
+                                         EnumType::Usize),
+                        true).await.unwrap();
+        let output = tr.prepare_modified().await.unwrap();
+        tr.commit_modified(output).await.unwrap();
+
+        let tr = db.transaction(Atom::from("quick repair same-file meta fixture insert base data"), true, 500, 500).unwrap();
+        tr.upsert(vec![
+            TableKV::new(log_ord_table.clone(), usize_to_binary(1), Some(usize_to_binary(101))),
+            TableKV::new(log_write_table.clone(), usize_to_binary(5), Some(usize_to_binary(501))),
+        ]).await.unwrap();
+        let output = tr.prepare_modified().await.unwrap();
+        tr.commit_modified(output).await.unwrap();
+
+        let tr = db.transaction(Atom::from("quick repair same-file meta fixture create btree"), true, 500, 500).unwrap();
+        tr.create_table(btree_table.clone(),
+                        KVTableMeta::new(KVDBTableType::BtreeOrdTab,
+                                         true,
+                                         EnumType::Usize,
+                                         EnumType::Usize),
+                        true).await.unwrap();
+        let output = tr.prepare_modified().await.unwrap();
+        tr.commit_modified(output).await.unwrap();
+
+        let tr = db.transaction(Atom::from("quick repair same-file meta fixture write created table"), true, 500, 500).unwrap();
+        tr.upsert(vec![
+            TableKV::new(log_ord_table.clone(), usize_to_binary(2), Some(usize_to_binary(102))),
+            TableKV::new(btree_table.clone(), usize_to_binary(10), Some(usize_to_binary(2001))),
+            TableKV::new(btree_table.clone(), usize_to_binary(11), Some(usize_to_binary(2002))),
+        ]).await.unwrap();
+        let output = tr.prepare_modified().await.unwrap();
+        tr.commit_modified(output).await.unwrap();
+
+        let tr = db.transaction(Atom::from("quick repair same-file meta fixture write old table before remove"), true, 500, 500).unwrap();
+        tr.upsert(vec![
+            TableKV::new(log_write_table.clone(), usize_to_binary(6), Some(usize_to_binary(601))),
+        ]).await.unwrap();
+        let output = tr.prepare_modified().await.unwrap();
+        tr.commit_modified(output).await.unwrap();
+
+        let tr = db.transaction(Atom::from("quick repair same-file meta fixture remove old table"), true, 500, 500).unwrap();
+        tr.remove_table(log_write_table.clone()).await.unwrap();
+        let output = tr.prepare_modified().await.unwrap();
+        tr.commit_modified(output).await.unwrap();
+
+        let _ = sender.send(());
+    });
+
+    receiver.recv_timeout(Duration::from_secs(60)).unwrap();
+}
+
+// 生成只写日志表的真实修复 fixture：
+// - 先持久化旧值；
+// - 再在未确认事务中对同一 key 连续多次 upsert；
+// - 用于验证 quick repair 只保留该事务内的最终值，并确保数据立即落盘。
+fn generate_quick_repair_log_ord_large_payload_fixture(root: &std::path::Path) {
+    remove_dir_if_exists(root);
+    std::fs::create_dir_all(root).unwrap();
+
+    let _handle = startup_global_time_loop(10);
+    let builder = MultiTaskRuntimeBuilder::default();
+    let rt = builder.build();
+    let rt_copy = rt.clone();
+    let root_copy = root.to_path_buf();
+    let (sender, receiver) = bounded(1);
+
+    let _ = rt.spawn(async move {
+        let db = startup_quick_repair_test_db_with_pipeline_depth_and_log_limit(rt_copy.clone(),
+                                                                                root_copy.clone(),
+                                                                                DBStartupRepairMode::TryQuickRepair,
+                                                                                None,
+                                                                                2 * 1024 * 1024).await;
+
+        let log_ord_payload_table = Atom::from(QUICK_REPAIR_LOG_ORD_PAYLOAD_TABLE);
+
+        let tr = db.transaction(Atom::from("quick repair log ord large payload fixture create table"), true, 500, 500).unwrap();
+        tr.create_table(log_ord_payload_table.clone(),
+                        KVTableMeta::new(KVDBTableType::LogOrdTab,
+                                         true,
+                                         EnumType::Usize,
+                                         EnumType::Bin),
+                        true).await.unwrap();
+        let output = tr.prepare_modified().await.unwrap();
+        tr.commit_modified(output).await.unwrap();
+
+        let tr = db.transaction(Atom::from("quick repair log ord large payload fixture tx1"), true, 500, 500).unwrap();
+        tr.upsert(vec![
+            TableKV::new(log_ord_payload_table.clone(),
+                         usize_to_binary(1),
+                         Some(Binary::new(vec![1; 1024 * 1024]))),
+            TableKV::new(log_ord_payload_table.clone(),
+                         usize_to_binary(2),
+                         Some(Binary::new(vec![2; 1024 * 1024]))),
+        ]).await.unwrap();
+        let output = tr.prepare_modified().await.unwrap();
+        tr.commit_modified(output).await.unwrap();
+        db.append_new_commit_log().await.unwrap();
+
+        let tr = db.transaction(Atom::from("quick repair log ord large payload fixture tx2"), true, 500, 500).unwrap();
+        tr.upsert(vec![
+            TableKV::new(log_ord_payload_table.clone(),
+                         usize_to_binary(1),
+                         Some(Binary::new(vec![3; 1024 * 1024]))),
+            TableKV::new(log_ord_payload_table.clone(),
+                         usize_to_binary(3),
+                         Some(Binary::new(vec![4; 1024 * 1024]))),
+        ]).await.unwrap();
+        let output = tr.prepare_modified().await.unwrap();
+        tr.commit_modified(output).await.unwrap();
+        db.append_new_commit_log().await.unwrap();
+
+        let tr = db.transaction(Atom::from("quick repair log ord large payload fixture tx3"), true, 500, 500).unwrap();
+        tr.upsert(vec![
+            TableKV::new(log_ord_payload_table.clone(),
+                         usize_to_binary(3),
+                         Some(Binary::new(vec![5; 1024 * 1024]))),
+        ]).await.unwrap();
+        tr.delete(vec![
+            TableKV::new(log_ord_payload_table.clone(), usize_to_binary(2), None),
+        ]).await.unwrap();
+        let output = tr.prepare_modified().await.unwrap();
+        tr.commit_modified(output).await.unwrap();
+
+        let _ = sender.send(());
+    });
+
+    receiver.recv_timeout(Duration::from_secs(60)).unwrap();
+}
+
 // 生成只写日志表的真实修复 fixture：
 // - 先持久化旧值；
 // - 再在未确认事务中对同一 key 连续多次 upsert；
@@ -8179,6 +8782,82 @@ fn generate_quick_repair_btree_fixture(root: &std::path::Path) {
     receiver.recv_timeout(Duration::from_secs(60)).unwrap();
 }
 
+// 生成“同一个 active commit log 文件内 BTree 同 key 多事务覆盖”的真实修复 fixture：
+// - 先创建 `repair_btree`；
+// - 再在同一个未确认物理文件内连续提交多笔事务，对同一 key 反复 upsert / delete / reinsert；
+// - 用于验证 quick flush 即使按 key 折叠，也必须保持与顺序 replay 一致的最终结果。
+fn generate_quick_repair_btree_same_key_fixture(root: &std::path::Path) {
+    remove_dir_if_exists(root);
+    std::fs::create_dir_all(root).unwrap();
+
+    let _handle = startup_global_time_loop(10);
+    let builder = MultiTaskRuntimeBuilder::default();
+    let rt = builder.build();
+    let rt_copy = rt.clone();
+    let root_copy = root.to_path_buf();
+    let (sender, receiver) = bounded(1);
+
+    let _ = rt.spawn(async move {
+        let db = startup_quick_repair_test_db(rt_copy.clone(),
+                                              root_copy.clone(),
+                                              DBStartupRepairMode::TryQuickRepair).await;
+
+        let btree_table = Atom::from(QUICK_REPAIR_BTREE_TABLE);
+
+        let tr = db.transaction(Atom::from("quick repair btree same-key fixture create table"), true, 500, 500).unwrap();
+        tr.create_table(btree_table.clone(),
+                        KVTableMeta::new(KVDBTableType::BtreeOrdTab,
+                                         true,
+                                         EnumType::Usize,
+                                         EnumType::Usize),
+                        true).await.unwrap();
+        let output = tr.prepare_modified().await.unwrap();
+        tr.commit_modified(output).await.unwrap();
+
+        let tr = db.transaction(Atom::from("quick repair btree same-key fixture tx1"), true, 500, 500).unwrap();
+        tr.upsert(vec![
+            TableKV::new(btree_table.clone(), usize_to_binary(10), Some(usize_to_binary(1000))),
+            TableKV::new(btree_table.clone(), usize_to_binary(11), Some(usize_to_binary(1100))),
+            TableKV::new(btree_table.clone(), usize_to_binary(13), Some(usize_to_binary(1300))),
+        ]).await.unwrap();
+        let output = tr.prepare_modified().await.unwrap();
+        tr.commit_modified(output).await.unwrap();
+
+        let tr = db.transaction(Atom::from("quick repair btree same-key fixture tx2"), true, 500, 500).unwrap();
+        tr.upsert(vec![
+            TableKV::new(btree_table.clone(), usize_to_binary(10), Some(usize_to_binary(2000))),
+            TableKV::new(btree_table.clone(), usize_to_binary(12), Some(usize_to_binary(1200))),
+        ]).await.unwrap();
+        tr.delete(vec![
+            TableKV::new(btree_table.clone(), usize_to_binary(11), None),
+        ]).await.unwrap();
+        let output = tr.prepare_modified().await.unwrap();
+        tr.commit_modified(output).await.unwrap();
+
+        let tr = db.transaction(Atom::from("quick repair btree same-key fixture tx3"), true, 500, 500).unwrap();
+        tr.upsert(vec![
+            TableKV::new(btree_table.clone(), usize_to_binary(12), Some(usize_to_binary(1210))),
+        ]).await.unwrap();
+        tr.delete(vec![
+            TableKV::new(btree_table.clone(), usize_to_binary(10), None),
+        ]).await.unwrap();
+        let output = tr.prepare_modified().await.unwrap();
+        tr.commit_modified(output).await.unwrap();
+
+        let tr = db.transaction(Atom::from("quick repair btree same-key fixture tx4"), true, 500, 500).unwrap();
+        tr.upsert(vec![
+            TableKV::new(btree_table.clone(), usize_to_binary(10), Some(usize_to_binary(3000))),
+            TableKV::new(btree_table.clone(), usize_to_binary(12), Some(usize_to_binary(1220))),
+        ]).await.unwrap();
+        let output = tr.prepare_modified().await.unwrap();
+        tr.commit_modified(output).await.unwrap();
+
+        let _ = sender.send(());
+    });
+
+    receiver.recv_timeout(Duration::from_secs(60)).unwrap();
+}
+
 // 生成多未确认事务顺序 replay 的真实修复 fixture：
 // - 先写入一批稳定基线数据；
 // - 再连续提交多笔会互相覆盖、删除、重建同 key 的事务；
@@ -8279,6 +8958,146 @@ fn generate_quick_repair_multi_transaction_fixture(root: &std::path::Path) {
     receiver.recv_timeout(Duration::from_secs(60)).unwrap();
 }
 
+// 生成跨多个物理 commit log 文件的真实修复 fixture：
+// - 显式追加 checkpoint，把连续事务稳定切分到多个物理 commit log 文件；
+// - 每个文件都带有约 1 MiB 的 payload，避免测试因为日志负载过小而退化成单文件；
+// - 最后一笔删表事务额外附带一条最终值不变的持久化写，确保删表动作一定进入 commit log；
+// - 多个未确认事务会在 log ordered 表和 BTree 表上产生跨文件覆盖；
+// - 用于验证 quick repair 的“每文件一次 flush”与中途重启幂等性。
+fn generate_quick_repair_multi_file_fixture(root: &std::path::Path) {
+    remove_dir_if_exists(root);
+    std::fs::create_dir_all(root).unwrap();
+
+    let _handle = startup_global_time_loop(10);
+    let builder = MultiTaskRuntimeBuilder::default();
+    let rt = builder.build();
+    let rt_copy = rt.clone();
+    let root_copy = root.to_path_buf();
+    let (sender, receiver) = bounded(1);
+
+    let _ = rt.spawn(async move {
+        let guid_gen = GuidGen::new(run_nanos(), 0);
+        let commit_logger_builder = CommitLoggerBuilder::new(rt_copy.clone(), root_copy.join(".commit_log"));
+        let commit_logger = commit_logger_builder
+            .log_file_limit(2 * 1024 * 1024)
+            .build()
+            .await
+            .unwrap();
+
+        let tr_mgr = Transaction2PcManager::new(rt_copy.clone(),
+                                                guid_gen,
+                                                commit_logger);
+
+        let builder = KVDBManagerBuilder::new(rt_copy.clone(), tr_mgr, root_copy.join("db"));
+        let db = builder.startup_by_repair(true, DBStartupRepairMode::TryQuickRepair)
+            .await
+            .unwrap();
+
+        let log_ord_table = Atom::from(QUICK_REPAIR_LOG_ORD_TABLE);
+        let btree_table = Atom::from(QUICK_REPAIR_BTREE_TABLE);
+        let payload_table = Atom::from(QUICK_REPAIR_PAYLOAD_TABLE);
+
+        let tr = db.transaction(Atom::from("quick repair multi file fixture create table"), true, 500, 500).unwrap();
+        tr.create_table(log_ord_table.clone(),
+                        KVTableMeta::new(KVDBTableType::LogOrdTab,
+                                         true,
+                                         EnumType::Usize,
+                                         EnumType::Usize),
+                        true).await.unwrap();
+        tr.create_table(btree_table.clone(),
+                        KVTableMeta::new(KVDBTableType::BtreeOrdTab,
+                                         true,
+                                         EnumType::Usize,
+                                         EnumType::Usize),
+                        true).await.unwrap();
+        tr.create_table(payload_table.clone(),
+                        KVTableMeta::new(KVDBTableType::LogWTab,
+                                         true,
+                                         EnumType::Usize,
+                                         EnumType::Bin),
+                        true).await.unwrap();
+        let output = tr.prepare_modified().await.unwrap();
+        tr.commit_modified(output).await.unwrap();
+
+        let tr = db.transaction(Atom::from("quick repair multi file fixture tx1"), true, 500, 500).unwrap();
+        let mut upserts = Vec::new();
+        for key in 1..=16 {
+            upserts.push(TableKV::new(log_ord_table.clone(),
+                                      usize_to_binary(key),
+                                      Some(usize_to_binary(1000 + key))));
+        }
+        for key in 1..=16 {
+            upserts.push(TableKV::new(btree_table.clone(),
+                                      usize_to_binary(key),
+                                      Some(usize_to_binary(2000 + key))));
+        }
+        upserts.push(TableKV::new(payload_table.clone(),
+                                  usize_to_binary(1001),
+                                  Some(Binary::new(vec![1; 1024 * 1024]))));
+        tr.upsert(upserts).await.unwrap();
+        let output = tr.prepare_modified().await.unwrap();
+        tr.commit_modified(output).await.unwrap();
+        // 这里显式切到下一个 commit log/checkpoint，稳定制造多文件 replay 场景。
+        db.append_new_commit_log().await.unwrap();
+
+        let tr = db.transaction(Atom::from("quick repair multi file fixture tx2"), true, 500, 500).unwrap();
+        let mut upserts = Vec::new();
+        for key in 9..=24 {
+            upserts.push(TableKV::new(log_ord_table.clone(),
+                                      usize_to_binary(key),
+                                      Some(usize_to_binary(3000 + key))));
+        }
+        for key in 9..=24 {
+            upserts.push(TableKV::new(btree_table.clone(),
+                                      usize_to_binary(key),
+                                      Some(usize_to_binary(4000 + key))));
+        }
+        upserts.push(TableKV::new(payload_table.clone(),
+                                  usize_to_binary(1002),
+                                  Some(Binary::new(vec![2; 1024 * 1024]))));
+        tr.upsert(upserts).await.unwrap();
+        let output = tr.prepare_modified().await.unwrap();
+        tr.commit_modified(output).await.unwrap();
+        // 第二次显式切换后，后续事务会落到新的物理 commit log 文件中。
+        db.append_new_commit_log().await.unwrap();
+
+        let tr = db.transaction(Atom::from("quick repair multi file fixture tx3"), true, 500, 500).unwrap();
+        let mut upserts = Vec::new();
+        for key in 1..=8 {
+            upserts.push(TableKV::new(log_ord_table.clone(),
+                                      usize_to_binary(key),
+                                      Some(usize_to_binary(5000 + key))));
+        }
+        for key in 17..=24 {
+            upserts.push(TableKV::new(btree_table.clone(),
+                                      usize_to_binary(key),
+                                      Some(usize_to_binary(6000 + key))));
+        }
+        upserts.push(TableKV::new(payload_table.clone(),
+                                  usize_to_binary(1003),
+                                  Some(Binary::new(vec![3; 1024 * 1024]))));
+        tr.upsert(upserts).await.unwrap();
+        let output = tr.prepare_modified().await.unwrap();
+        tr.commit_modified(output).await.unwrap();
+
+        let tr = db.transaction(Atom::from("quick repair multi file fixture remove payload table"), true, 500, 500).unwrap();
+        // 单独删表在某些场景下可能不会稳定产出非空 commit log；
+        // 这里附带一条最终值不变的持久化写，只用于确保删表动作进入待修复日志。
+        tr.upsert(vec![
+            TableKV::new(log_ord_table.clone(),
+                         usize_to_binary(24),
+                         Some(usize_to_binary(3000 + 24))),
+        ]).await.unwrap();
+        tr.remove_table(payload_table.clone()).await.unwrap();
+        let output = tr.prepare_modified().await.unwrap();
+        tr.commit_modified(output).await.unwrap();
+
+        let _ = sender.send(());
+    });
+
+    receiver.recv_timeout(Duration::from_secs(60)).unwrap();
+}
+
 // 生成“删除后重建同名表”的真实修复 fixture：
 // - 先创建一个日志有序表并写入旧数据；
 // - 再在后续事务中删除该表，并以相同名称创建 BTree 表；
@@ -8361,10 +9180,35 @@ async fn startup_quick_repair_test_db(rt_copy: pi_async_rt::rt::multi_thread::Mu
                                       root_copy: PathBuf,
                                       repair_mode: DBStartupRepairMode)
     -> pi_db::db::KVDBManager<usize, pi_store::commit_logger::CommitLogger> {
+    startup_quick_repair_test_db_with_pipeline_depth_and_log_limit(rt_copy,
+                                                                   root_copy,
+                                                                   repair_mode,
+                                                                   None,
+                                                                   1024).await
+}
+
+async fn startup_quick_repair_test_db_with_pipeline_depth(rt_copy: pi_async_rt::rt::multi_thread::MultiTaskRuntime<()>,
+                                                          root_copy: PathBuf,
+                                                          repair_mode: DBStartupRepairMode,
+                                                          quick_repair_file_pipeline_depth: Option<usize>)
+    -> pi_db::db::KVDBManager<usize, pi_store::commit_logger::CommitLogger> {
+    startup_quick_repair_test_db_with_pipeline_depth_and_log_limit(rt_copy,
+                                                                   root_copy,
+                                                                   repair_mode,
+                                                                   quick_repair_file_pipeline_depth,
+                                                                   1024).await
+}
+
+async fn startup_quick_repair_test_db_with_pipeline_depth_and_log_limit(rt_copy: pi_async_rt::rt::multi_thread::MultiTaskRuntime<()>,
+                                                                        root_copy: PathBuf,
+                                                                        repair_mode: DBStartupRepairMode,
+                                                                        quick_repair_file_pipeline_depth: Option<usize>,
+                                                                        commit_log_file_limit_bytes: u64)
+    -> pi_db::db::KVDBManager<usize, pi_store::commit_logger::CommitLogger> {
     let guid_gen = GuidGen::new(run_nanos(), 0);
     let commit_logger_builder = CommitLoggerBuilder::new(rt_copy.clone(), root_copy.join(".commit_log"));
     let commit_logger = commit_logger_builder
-        .log_file_limit(1024)
+        .log_file_limit(commit_log_file_limit_bytes)
         .build()
         .await
         .unwrap();
@@ -8373,7 +9217,15 @@ async fn startup_quick_repair_test_db(rt_copy: pi_async_rt::rt::multi_thread::Mu
                                             guid_gen,
                                             commit_logger);
 
-    let builder = KVDBManagerBuilder::new(rt_copy.clone(), tr_mgr, root_copy.join("db"));
+    let builder = match quick_repair_file_pipeline_depth {
+        Some(depth) => {
+            KVDBManagerBuilder::new(rt_copy.clone(), tr_mgr, root_copy.join("db"))
+                .quick_repair_file_pipeline_depth(depth)
+        },
+        None => {
+            KVDBManagerBuilder::new(rt_copy.clone(), tr_mgr, root_copy.join("db"))
+        },
+    };
     builder.startup_by_repair(true, repair_mode).await.unwrap()
 }
 
@@ -8418,6 +9270,13 @@ fn startup_db_and_snapshot(root: &std::path::Path,
 // 逻辑视图用于验证事务可见结果，磁盘视图用于确认 quick flush 已真正落盘。
 fn startup_db_and_collect_quick_repair_state(root: &std::path::Path,
                                              repair_mode: DBStartupRepairMode) -> (QuickRepairSnapshot, QuickRepairDiskState) {
+    startup_db_and_collect_quick_repair_state_with_pipeline_depth(root, repair_mode, None)
+}
+
+fn startup_db_and_collect_quick_repair_state_with_pipeline_depth(root: &std::path::Path,
+                                                                 repair_mode: DBStartupRepairMode,
+                                                                 quick_repair_file_pipeline_depth: Option<usize>)
+    -> (QuickRepairSnapshot, QuickRepairDiskState) {
     let _handle = startup_global_time_loop(10);
     let builder = MultiTaskRuntimeBuilder::default();
     let rt = builder.build();
@@ -8426,7 +9285,10 @@ fn startup_db_and_collect_quick_repair_state(root: &std::path::Path,
     let (sender, receiver) = bounded(1);
 
     let _ = rt.spawn(async move {
-        let db = startup_quick_repair_test_db(rt_copy.clone(), root_copy.clone(), repair_mode).await;
+        let db = startup_quick_repair_test_db_with_pipeline_depth(rt_copy.clone(),
+                                                                  root_copy.clone(),
+                                                                  repair_mode,
+                                                                  quick_repair_file_pipeline_depth).await;
 
         let mut tables = db.tables().await
             .into_iter()
@@ -8445,19 +9307,17 @@ fn startup_db_and_collect_quick_repair_state(root: &std::path::Path,
             mem_ord: read_table_values(&tr, Atom::from(QUICK_REPAIR_MEM_TABLE)).await,
         };
 
-        let disk_state = QuickRepairDiskState {
-            meta_tables: load_meta_table_names(rt_copy.clone(), root_copy.join("db/.tables_meta")).await,
-            log_ord: load_usize_log_table_state(rt_copy.clone(), root_copy.join("db/.tables").join(QUICK_REPAIR_LOG_ORD_TABLE)).await,
-            log_write: load_usize_log_table_state(rt_copy.clone(), root_copy.join("db/.tables").join(QUICK_REPAIR_LOG_WRITE_TABLE)).await,
-            btree: load_btree_table_state(root_copy.join("db/.tables")
-                                                   .join(QUICK_REPAIR_BTREE_TABLE)
-                                                   .join("table.dat")),
-        };
+        drop(tr);
+        drop(db);
+        rt_copy.timeout(0).await;
 
-        let _ = sender.send((snapshot, disk_state));
+        let _ = sender.send(snapshot);
     });
 
-    receiver.recv_timeout(Duration::from_secs(60)).unwrap()
+    let snapshot = receiver.recv_timeout(Duration::from_secs(60)).unwrap();
+    drop(rt);
+
+    (snapshot, load_quick_repair_disk_state(root))
 }
 
 // 对同一份 crash fixture 分别执行 TryRepair 和 TryQuickRepair，
@@ -8475,6 +9335,25 @@ fn compare_repair_snapshots_on_fixture(base_root: &std::path::Path,
                                                       DBStartupRepairMode::TryRepair);
     let try_quick_repair_snapshot = startup_db_and_snapshot(try_quick_repair_root,
                                                             DBStartupRepairMode::TryQuickRepair);
+
+    (try_repair_snapshot, try_quick_repair_snapshot)
+}
+
+// 对同一份 LogOrdTab 大 payload crash fixture 分别执行 TryRepair 和 TryQuickRepair，
+// 比较两条修复路径恢复出的最终逻辑视图，确保 quick repair 不改变修复语义。
+fn compare_large_log_ord_payload_snapshots_on_fixture(base_root: &std::path::Path,
+                                                      try_repair_root: &std::path::Path,
+                                                      try_quick_repair_root: &std::path::Path)
+    -> (LargeLogOrdPayloadSnapshot, LargeLogOrdPayloadSnapshot) {
+    remove_dir_if_exists(try_repair_root);
+    remove_dir_if_exists(try_quick_repair_root);
+    copy_dir_all(base_root, try_repair_root);
+    copy_dir_all(base_root, try_quick_repair_root);
+
+    let try_repair_snapshot = startup_db_and_snapshot_large_log_ord_payload(try_repair_root,
+                                                                            DBStartupRepairMode::TryRepair);
+    let try_quick_repair_snapshot = startup_db_and_snapshot_large_log_ord_payload(try_quick_repair_root,
+                                                                                  DBStartupRepairMode::TryQuickRepair);
 
     (try_repair_snapshot, try_quick_repair_snapshot)
 }
@@ -8511,6 +9390,24 @@ async fn read_table_values<C, Log>(tr: &pi_db::db::KVDBTransaction<C, Log>,
         while let Some((key, value)) = values.next().await {
             values_map.insert(binary_to_usize(&key).unwrap(),
                               binary_to_usize(&value).unwrap());
+        }
+    }
+
+    values_map
+}
+
+// 读取二进制值日志有序表的全部逻辑值。
+// 这里按最终可见结果收集 key -> Vec<u8>，用于大 payload quick repair 的严格一致性断言。
+async fn read_binary_table_values<C, Log>(tr: &pi_db::db::KVDBTransaction<C, Log>,
+                                          table_name: Atom) -> BTreeMap<usize, Vec<u8>>
+    where C: Clone + Send + 'static,
+          Log: pi_async_transaction::AsyncCommitLog<C = C, Cid = Guid>
+{
+    let mut values_map = BTreeMap::new();
+
+    if let Some(mut values) = tr.values(table_name, None, false).await {
+        while let Some((key, value)) = values.next().await {
+            values_map.insert(binary_to_usize(&key).unwrap(), value.as_ref().to_vec());
         }
     }
 
@@ -8567,6 +9464,78 @@ fn startup_db_and_snapshot_recreate_table(root: &std::path::Path,
     receiver.recv_timeout(Duration::from_secs(60)).unwrap()
 }
 
+// 启动数据库并采集 LogOrdTab 大 payload 场景的最终逻辑视图。
+fn startup_db_and_snapshot_large_log_ord_payload(root: &std::path::Path,
+                                                 repair_mode: DBStartupRepairMode) -> LargeLogOrdPayloadSnapshot {
+    let _handle = startup_global_time_loop(10);
+    let builder = MultiTaskRuntimeBuilder::default();
+    let rt = builder.build();
+    let rt_copy = rt.clone();
+    let root_copy = root.to_path_buf();
+    let (sender, receiver) = bounded(1);
+
+    let _ = rt.spawn(async move {
+        let db = startup_quick_repair_test_db(rt_copy.clone(), root_copy.clone(), repair_mode).await;
+
+        let mut tables = db.tables().await
+            .into_iter()
+            .map(|table| table.as_str().to_string())
+            .collect::<Vec<_>>();
+        tables.sort();
+
+        let tr = db.transaction(Atom::from("quick repair large log ord payload snapshot"), false, 500, 500).unwrap();
+        let snapshot = LargeLogOrdPayloadSnapshot {
+            tables,
+            log_ord_payload: read_binary_table_values(&tr,
+                                                      Atom::from(QUICK_REPAIR_LOG_ORD_PAYLOAD_TABLE)).await,
+        };
+
+        let _ = sender.send(snapshot);
+    });
+
+    receiver.recv_timeout(Duration::from_secs(60)).unwrap()
+}
+
+// 启动数据库并采集 LogOrdTab 大 payload 场景的逻辑视图和磁盘视图。
+fn startup_db_and_collect_large_log_ord_payload_state(root: &std::path::Path,
+                                                      repair_mode: DBStartupRepairMode)
+    -> (LargeLogOrdPayloadSnapshot, LargeLogOrdPayloadDiskState) {
+    let _handle = startup_global_time_loop(10);
+    let builder = MultiTaskRuntimeBuilder::default();
+    let rt = builder.build();
+    let rt_copy = rt.clone();
+    let root_copy = root.to_path_buf();
+    let (sender, receiver) = bounded(1);
+
+    let _ = rt.spawn(async move {
+        let db = startup_quick_repair_test_db(rt_copy.clone(), root_copy.clone(), repair_mode).await;
+
+        let mut tables = db.tables().await
+            .into_iter()
+            .map(|table| table.as_str().to_string())
+            .collect::<Vec<_>>();
+        tables.sort();
+
+        let tr = db.transaction(Atom::from("quick repair large log ord payload disk snapshot"), false, 500, 500).unwrap();
+        let snapshot = LargeLogOrdPayloadSnapshot {
+            tables,
+            log_ord_payload: read_binary_table_values(&tr,
+                                                      Atom::from(QUICK_REPAIR_LOG_ORD_PAYLOAD_TABLE)).await,
+        };
+
+        drop(tr);
+        drop(db);
+        rt_copy.timeout(0).await;
+
+        let _ = sender.send(snapshot);
+    });
+
+    let snapshot = receiver.recv_timeout(Duration::from_secs(60)).unwrap();
+    drop(rt);
+
+    (snapshot, load_large_log_ord_payload_disk_state(root))
+}
+
 // 启动数据库并采集“删除后重建同名表”场景的逻辑视图和磁盘视图。
 fn startup_db_and_collect_recreate_state(root: &std::path::Path,
                                          repair_mode: DBStartupRepairMode) -> (RecreateTableSnapshot, RecreateTableDiskState) {
@@ -8592,17 +9561,17 @@ fn startup_db_and_collect_recreate_state(root: &std::path::Path,
             recreate: read_table_values(&tr, Atom::from(QUICK_REPAIR_RECREATE_TABLE)).await,
         };
 
-        let disk_state = RecreateTableDiskState {
-            meta_tables: load_meta_table_names(rt_copy.clone(), root_copy.join("db/.tables_meta")).await,
-            recreate: load_btree_table_state(root_copy.join("db/.tables")
-                                                      .join(QUICK_REPAIR_RECREATE_TABLE)
-                                                      .join("table.dat")),
-        };
+        drop(tr);
+        drop(db);
+        rt_copy.timeout(0).await;
 
-        let _ = sender.send((snapshot, disk_state));
+        let _ = sender.send(snapshot);
     });
 
-    receiver.recv_timeout(Duration::from_secs(60)).unwrap()
+    let snapshot = receiver.recv_timeout(Duration::from_secs(60)).unwrap();
+    drop(rt);
+
+    (snapshot, load_recreate_table_disk_state(root))
 }
 
 async fn load_latest_log_entries(rt: pi_async_rt::rt::multi_thread::MultiTaskRuntime<()>,
@@ -8636,6 +9605,20 @@ async fn load_usize_log_table_state(rt: pi_async_rt::rt::multi_thread::MultiTask
     result
 }
 
+async fn load_binary_log_table_state(rt: pi_async_rt::rt::multi_thread::MultiTaskRuntime<()>,
+                                     path: PathBuf) -> BTreeMap<usize, Vec<u8>> {
+    let entries = load_latest_log_entries(rt, path).await;
+    let mut result = BTreeMap::new();
+
+    for (key, value) in entries {
+        if let Some(value) = value {
+            result.insert(binary_to_usize(&Binary::new(key)).unwrap(), value);
+        }
+    }
+
+    result
+}
+
 async fn load_meta_table_names(rt: pi_async_rt::rt::multi_thread::MultiTaskRuntime<()>,
                                path: PathBuf) -> Vec<String> {
     let entries = load_latest_log_entries(rt, path).await;
@@ -8649,6 +9632,54 @@ async fn load_meta_table_names(rt: pi_async_rt::rt::multi_thread::MultiTaskRunti
     result.sort();
 
     result
+}
+
+fn load_quick_repair_disk_state(root: &std::path::Path) -> QuickRepairDiskState {
+    let _handle = startup_global_time_loop(10);
+    let builder = MultiTaskRuntimeBuilder::default();
+    let rt = builder.build();
+
+    QuickRepairDiskState {
+        meta_tables: futures::executor::block_on(load_meta_table_names(rt.clone(),
+                                                                       root.join("db/.tables_meta"))),
+        log_ord: futures::executor::block_on(load_usize_log_table_state(rt.clone(),
+                                                                        root.join("db/.tables")
+                                                                            .join(QUICK_REPAIR_LOG_ORD_TABLE))),
+        log_write: futures::executor::block_on(load_usize_log_table_state(rt,
+                                                                          root.join("db/.tables")
+                                                                              .join(QUICK_REPAIR_LOG_WRITE_TABLE))),
+        btree: load_btree_table_state(root.join("db/.tables")
+                                           .join(QUICK_REPAIR_BTREE_TABLE)
+                                           .join("table.dat")),
+    }
+}
+
+fn load_recreate_table_disk_state(root: &std::path::Path) -> RecreateTableDiskState {
+    let _handle = startup_global_time_loop(10);
+    let builder = MultiTaskRuntimeBuilder::default();
+    let rt = builder.build();
+
+    RecreateTableDiskState {
+        meta_tables: futures::executor::block_on(load_meta_table_names(rt,
+                                                                       root.join("db/.tables_meta"))),
+        recreate: load_btree_table_state(root.join("db/.tables")
+                                              .join(QUICK_REPAIR_RECREATE_TABLE)
+                                              .join("table.dat")),
+    }
+}
+
+fn load_large_log_ord_payload_disk_state(root: &std::path::Path) -> LargeLogOrdPayloadDiskState {
+    let _handle = startup_global_time_loop(10);
+    let builder = MultiTaskRuntimeBuilder::default();
+    let rt = builder.build();
+
+    LargeLogOrdPayloadDiskState {
+        meta_tables: futures::executor::block_on(load_meta_table_names(rt.clone(),
+                                                                       root.join("db/.tables_meta"))),
+        log_ord_payload: futures::executor::block_on(load_binary_log_table_state(rt,
+                                                                                 root.join("db/.tables")
+                                                                                     .join(QUICK_REPAIR_LOG_ORD_PAYLOAD_TABLE))),
+    }
 }
 
 fn load_btree_table_state(path: PathBuf) -> BTreeMap<usize, usize> {
@@ -8761,6 +9792,34 @@ fn expected_quick_repair_meta_snapshot() -> QuickRepairSnapshot {
     }
 }
 
+fn expected_quick_repair_same_file_meta_snapshot() -> QuickRepairSnapshot {
+    let mut log_ord = BTreeMap::new();
+    log_ord.insert(1, 101);
+    log_ord.insert(2, 102);
+
+    let mut log_write = BTreeMap::new();
+    log_write.insert(5, None);
+    log_write.insert(6, None);
+    log_write.insert(7, None);
+
+    let mut btree = BTreeMap::new();
+    btree.insert(10, 2001);
+    btree.insert(11, 2002);
+
+    QuickRepairSnapshot {
+        tables: vec![
+            ".tables_meta".to_string(),
+            QUICK_REPAIR_BTREE_TABLE.to_string(),
+            QUICK_REPAIR_LOG_ORD_TABLE.to_string(),
+            QUICK_REPAIR_LOG_WRITE_TABLE.to_string(),
+        ],
+        log_ord,
+        log_write,
+        btree,
+        mem_ord: BTreeMap::new(),
+    }
+}
+
 fn expected_quick_repair_meta_disk_state() -> QuickRepairDiskState {
     let mut log_ord = BTreeMap::new();
     log_ord.insert(1, 101);
@@ -8849,6 +9908,43 @@ fn expected_quick_repair_btree_disk_state() -> QuickRepairDiskState {
     }
 }
 
+fn expected_quick_repair_btree_same_key_snapshot() -> QuickRepairSnapshot {
+    let mut log_write = BTreeMap::new();
+    log_write.insert(5, None);
+    log_write.insert(6, None);
+    log_write.insert(7, None);
+
+    let mut btree = BTreeMap::new();
+    btree.insert(10, 3000);
+    btree.insert(12, 1220);
+    btree.insert(13, 1300);
+
+    QuickRepairSnapshot {
+        tables: vec![
+            ".tables_meta".to_string(),
+            QUICK_REPAIR_BTREE_TABLE.to_string(),
+        ],
+        log_ord: BTreeMap::new(),
+        log_write,
+        btree,
+        mem_ord: BTreeMap::new(),
+    }
+}
+
+fn expected_quick_repair_btree_same_key_disk_state() -> QuickRepairDiskState {
+    let mut btree = BTreeMap::new();
+    btree.insert(10, 3000);
+    btree.insert(12, 1220);
+    btree.insert(13, 1300);
+
+    QuickRepairDiskState {
+        meta_tables: vec![QUICK_REPAIR_BTREE_TABLE.to_string()],
+        log_ord: BTreeMap::new(),
+        log_write: BTreeMap::new(),
+        btree,
+    }
+}
+
 fn expected_quick_repair_multi_transaction_snapshot() -> QuickRepairSnapshot {
     let mut log_ord = BTreeMap::new();
     log_ord.insert(1, 13);
@@ -8905,6 +10001,100 @@ fn expected_quick_repair_multi_transaction_disk_state() -> QuickRepairDiskState 
         log_ord,
         log_write,
         btree,
+    }
+}
+
+fn expected_quick_repair_multi_file_snapshot() -> QuickRepairSnapshot {
+    let mut log_ord = BTreeMap::new();
+    for key in 1..=8 {
+        log_ord.insert(key, 5000 + key);
+    }
+    for key in 9..=24 {
+        log_ord.insert(key, 3000 + key);
+    }
+
+    let mut log_write = BTreeMap::new();
+    log_write.insert(5, None);
+    log_write.insert(6, None);
+    log_write.insert(7, None);
+
+    let mut btree = BTreeMap::new();
+    for key in 1..=8 {
+        btree.insert(key, 2000 + key);
+    }
+    for key in 9..=16 {
+        btree.insert(key, 4000 + key);
+    }
+    for key in 17..=24 {
+        btree.insert(key, 6000 + key);
+    }
+
+    QuickRepairSnapshot {
+        tables: vec![
+            ".tables_meta".to_string(),
+            QUICK_REPAIR_BTREE_TABLE.to_string(),
+            QUICK_REPAIR_LOG_ORD_TABLE.to_string(),
+        ],
+        log_ord,
+        log_write,
+        btree,
+        mem_ord: BTreeMap::new(),
+    }
+}
+
+fn expected_quick_repair_multi_file_disk_state() -> QuickRepairDiskState {
+    let mut log_ord = BTreeMap::new();
+    for key in 1..=8 {
+        log_ord.insert(key, 5000 + key);
+    }
+    for key in 9..=24 {
+        log_ord.insert(key, 3000 + key);
+    }
+
+    let mut btree = BTreeMap::new();
+    for key in 1..=8 {
+        btree.insert(key, 2000 + key);
+    }
+    for key in 9..=16 {
+        btree.insert(key, 4000 + key);
+    }
+    for key in 17..=24 {
+        btree.insert(key, 6000 + key);
+    }
+
+    QuickRepairDiskState {
+        meta_tables: vec![
+            QUICK_REPAIR_BTREE_TABLE.to_string(),
+            QUICK_REPAIR_LOG_ORD_TABLE.to_string(),
+        ],
+        log_ord,
+        log_write: BTreeMap::new(),
+        btree,
+    }
+}
+
+fn expected_large_log_ord_payload_snapshot() -> LargeLogOrdPayloadSnapshot {
+    let mut log_ord_payload = BTreeMap::new();
+    log_ord_payload.insert(1, vec![3; 1024 * 1024]);
+    log_ord_payload.insert(3, vec![5; 1024 * 1024]);
+
+    LargeLogOrdPayloadSnapshot {
+        tables: vec![
+            ".tables_meta".to_string(),
+            QUICK_REPAIR_LOG_ORD_PAYLOAD_TABLE.to_string(),
+        ],
+        log_ord_payload,
+    }
+}
+
+fn expected_large_log_ord_payload_disk_state() -> LargeLogOrdPayloadDiskState {
+    let mut log_ord_payload = BTreeMap::new();
+    log_ord_payload.insert(1, vec![3; 1024 * 1024]);
+    log_ord_payload.insert(3, vec![5; 1024 * 1024]);
+
+    LargeLogOrdPayloadDiskState {
+        meta_tables: vec![QUICK_REPAIR_LOG_ORD_PAYLOAD_TABLE.to_string()],
+        log_ord_payload,
     }
 }
 

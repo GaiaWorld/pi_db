@@ -6,12 +6,12 @@ use std::collections::{VecDeque, HashMap, BTreeMap};
 use std::io::{Error, Result as IOResult, ErrorKind};
 use std::sync::{Arc,
                 OnceLock,
-                atomic::{AtomicBool, AtomicU64, Ordering}};
+                atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering}};
 
-use futures::{future::{FutureExt, BoxFuture}, stream::BoxStream, StreamExt};
+use futures::{future::{FutureExt, BoxFuture, try_join}, stream::BoxStream, StreamExt};
 use crossbeam_channel::bounded;
 use async_lock::{Mutex, RwLock};
-use async_channel::{Sender, Receiver, unbounded};
+use async_channel::{Sender, Receiver, bounded as async_bounded, unbounded};
 use dashmap::DashMap;
 use lazy_static::lazy_static;
 use bytes::BufMut;
@@ -67,6 +67,49 @@ pub(crate) const DEFAULT_DB_TABLES_META_DIR: &str = ".tables_meta";
 const DEFAULT_DB_TABLES_DIR: &str = ".tables";
 
 ///
+/// quick repair 按文件批次流水线处理时的默认深度。
+/// 含义是：
+/// 1. 一个文件正在 replay/flush；
+/// 2. 允许再有一个文件批次处于 producer 侧缓冲/待交付状态。
+///
+const DEFAULT_QUICK_REPAIR_FILE_PIPELINE_DEPTH: usize = 2;
+
+///
+/// quick repair 按文件批次流水线处理时允许的最大深度。
+///
+const MAX_QUICK_REPAIR_FILE_PIPELINE_DEPTH: usize = 8;
+
+///
+/// 开启 quick repair 统计型日志的环境变量。
+/// 非 `0`/`false`/空串即视为开启。
+///
+const QUICK_REPAIR_PROFILE_LOG_ENV: &str = "PI_DB_QUICK_REPAIR_PROFILE_LOG";
+
+///
+/// 开启 quick repair 统计型日志后，按记录数输出批次内进度的间隔。
+/// `0` 表示关闭批次内进度日志。
+///
+const QUICK_REPAIR_PROFILE_RECORD_INTERVAL_ENV: &str = "PI_DB_QUICK_REPAIR_PROFILE_RECORD_INTERVAL";
+
+#[inline]
+pub(crate) fn quick_repair_profile_log_enabled() -> bool {
+    match std::env::var(QUICK_REPAIR_PROFILE_LOG_ENV) {
+        Ok(value) => {
+            let value = value.trim();
+            !value.is_empty() && value != "0" && value.to_ascii_lowercase() != "false"
+        },
+        Err(_) => false,
+    }
+}
+
+#[inline]
+pub(crate) fn quick_repair_profile_log<S: AsRef<str>>(message: S) {
+    if quick_repair_profile_log_enabled() {
+        println!("[quick_repair_profile][db] {}", message.as_ref());
+    }
+}
+
+///
 /// 数据库未启动状态
 ///
 const DB_UNSTARTUP_STATUS: u64 = 0;
@@ -101,6 +144,14 @@ const STARTUP_DB_SOURCE: &str = "Startup db";
 ///
 const REPAIR_DB_SOURCE: &str = "Repair db";
 
+///
+/// 快速修复数据库时的源。
+/// 与旧 try_repair 分开，便于只对 try_quick_repair 打开专用的快速持久化登记路径。
+/// 这里故意使用极不自然的内部标记字符串，只用于尽量降低普通事务误撞 quick repair 分支的概率。
+/// 注意：这仍然不是绝对隔离机制，后续若要彻底消除误撞风险，应改成内部显式标记而不是 source 字符串判定。
+///
+pub(crate) const QUICK_REPAIR_DB_SOURCE: &str = "__PiDb__qUiCk_RePaIr__InTeRnAl__DoNoT_uSe__";
+
 // 表缓存大小仪表
 #[cfg(feature = "trace")]
 static TABLE_CACHE_SIZE_METER: OnceLock<Meter> = OnceLock::new();
@@ -125,11 +176,12 @@ pub struct KVDBManagerBuilder<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>,
 > {
-    rt:                 MultiTaskRuntime<()>,               //异步运行时
-    tr_mgr:             Transaction2PcManager<C, Log>,      //事务管理器
-    db_path:            PathBuf,                            //数据库的表文件所在目录
-    tables_meta_path:   PathBuf,                            //数据库的元信息表文件所在目录
-    tables_path:        PathBuf,                            //数据库表文件所在目录
+    rt:                                 MultiTaskRuntime<()>,   //异步运行时
+    tr_mgr:                             Transaction2PcManager<C, Log>, //事务管理器
+    db_path:                            PathBuf,                //数据库的表文件所在目录
+    tables_meta_path:                   PathBuf,                //数据库的元信息表文件所在目录
+    tables_path:                        PathBuf,                //数据库表文件所在目录
+    quick_repair_file_pipeline_depth:   usize,                  //quick repair 按文件批次处理时的流水线深度
 }
 
 ///
@@ -162,7 +214,19 @@ impl<
             db_path,
             tables_meta_path,
             tables_path,
+            quick_repair_file_pipeline_depth: DEFAULT_QUICK_REPAIR_FILE_PIPELINE_DEPTH,
         }
+    }
+
+    /// 设置 quick repair 按 commit log 文件批次处理时的流水线深度。
+    /// 最小值固定为 `2`，最大值固定为 `8`，超出范围时回落到默认值。
+    pub fn quick_repair_file_pipeline_depth(mut self, mut depth: usize) -> Self {
+        if depth < DEFAULT_QUICK_REPAIR_FILE_PIPELINE_DEPTH || depth > MAX_QUICK_REPAIR_FILE_PIPELINE_DEPTH {
+            depth = DEFAULT_QUICK_REPAIR_FILE_PIPELINE_DEPTH;
+        }
+
+        self.quick_repair_file_pipeline_depth = depth;
+        self
     }
 }
 
@@ -220,6 +284,16 @@ impl<
     ) -> IOResult<KVDBManager<C, Log>>
     where F: FnMut(&KVDBManager<C, Log>, &Transaction2PcManager<C, Log>, &mut Vec<KVDBEvent<Guid>>) + Send + Sync + 'static
     {
+        let startup_profile_enabled = repair_mode == DBStartupRepairMode::TryQuickRepair
+            && quick_repair_profile_log_enabled();
+        let startup_begin = Instant::now();
+        if startup_profile_enabled {
+            quick_repair_profile_log(format!("startup_by_repair begin: repair_mode={:?}, enable_accelerated_repair={}, db_path={:?}",
+                                             repair_mode,
+                                             enable_accelerated_repair,
+                                             self.db_path));
+        }
+
         if !self.tables_meta_path.exists() {
             //指定路径的元信息表目录不存在，则创建
             let _ = create_dir(self.rt.clone(), self.tables_meta_path.clone()).await?;
@@ -236,6 +310,7 @@ impl<
         let db_path = self.db_path;
         let tables_meta_path = self.tables_meta_path;
         let tables_path = self.tables_path;
+        let quick_repair_file_pipeline_depth = self.quick_repair_file_pipeline_depth;
         let tables = Arc::new(RwLock::new(XHashMap::default()));
         let status = AtomicU64::new(DB_INITING_STATUS);
         let (notifier, listener) = if db_event_listener.is_some() {
@@ -250,6 +325,7 @@ impl<
             db_path,
             tables_meta_path,
             tables_path,
+            quick_repair_file_pipeline_depth,
             tables,
             status,
             listener,
@@ -259,6 +335,7 @@ impl<
 
         //加载并注册元信息表
         let meta_table_name = Atom::from(DEFAULT_DB_TABLES_META_DIR);
+        let meta_table_load_begin = Instant::now();
         let meta_table: MetaTable<C, Log> =
             MetaTable::new(db_mgr.0.rt.clone(),
                            db_mgr.tables_meta_path().to_path_buf(),
@@ -272,8 +349,14 @@ impl<
                            60 * 1000,
                            db_mgr.0.notifier.clone()).await;
         db_mgr.0.tables.write().await.insert(meta_table_name.clone(), KVDBTable::MetaTab(meta_table));
+        if startup_profile_enabled {
+            quick_repair_profile_log(format!("startup phase meta table loaded: elapsed_ms={}, total_elapsed_ms={}",
+                                             meta_table_load_begin.elapsed().as_millis(),
+                                             startup_begin.elapsed().as_millis()));
+        }
 
         //根据元信息表的元信息，加载其它表，加载操作使用的事务，不需要预提交和提交
+        let table_load_begin = Instant::now();
         let mut tr = db_mgr
             .transaction(Atom::from(STARTUP_DB_SOURCE),
                          true,
@@ -358,12 +441,19 @@ impl<
                                               e)));
             }
         }
+        let loaded_tables = db_mgr.table_size().await;
         info!("Load db succeeded, tables: {:?}, time: {:?}",
-            db_mgr.table_size().await,
+            loaded_tables,
             now.elapsed());
+        if startup_profile_enabled {
+            quick_repair_profile_log(format!("startup phase tables loaded: tables={}, elapsed_ms={}, total_elapsed_ms={}",
+                                             loaded_tables,
+                                             table_load_begin.elapsed().as_millis(),
+                                             startup_begin.elapsed().as_millis()));
+        }
 
         //如果有未确认的提交日志，则尝试修复数据库表数据
-        let now = Instant::now();
+        let repair_begin = Instant::now();
         let repair_result = match repair_mode {
             DBStartupRepairMode::TryRepair => {
                 db_mgr.try_repair(enable_accelerated_repair).await
@@ -384,7 +474,14 @@ impl<
                     info!("Repair db succeeded, logs: {}, bytes: {}, time: {:?}",
                         repaired_log_len,
                         repaired_bytes_len,
-                        now.elapsed());
+                        repair_begin.elapsed());
+                }
+                if startup_profile_enabled {
+                    quick_repair_profile_log(format!("startup phase repair finished: repaired_logs={}, repaired_bytes={}, repair_elapsed_ms={}, total_elapsed_ms={}",
+                                                     repaired_log_len,
+                                                     repaired_bytes_len,
+                                                     repair_begin.elapsed().as_millis(),
+                                                     startup_begin.elapsed().as_millis()));
                 }
             }
         }
@@ -460,6 +557,11 @@ impl<
 
         db_mgr.0.status.store(DB_INITED_STATUS, Ordering::SeqCst); //设置数据库状态为已初始化
         info!("Startup db succeeded");
+        if startup_profile_enabled {
+            quick_repair_profile_log(format!("startup_by_repair finished: repair_mode={:?}, total_elapsed_ms={}",
+                                             repair_mode,
+                                             startup_begin.elapsed().as_millis()));
+        }
 
         //在Linux下启动完成后清理一次内存
         #[cfg(target_os = "linux")]
@@ -1012,230 +1114,859 @@ impl<
         return Ok(replay_result);
     }
 
-    /// 尝试按顺序重播未确认的提交日志，并使用快速装载路径修复持久化表。
+    /// 尝试按 commit log 文件批次顺序重播未确认的提交日志，并使用快速装载路径修复持久化表。
     ///
     /// 关键约束：
     /// 1. 仍然严格按提交日志顺序逐事务重放，不能跨事务乱序。
     /// 2. 元信息表仍走 repair create/remove table，保证表结构恢复语义不变。
     /// 3. 用户表只快速装载持久化表的 `DirtyWrite` 动作，内存表不参与 quick repair。
     /// 4. 预提交阶段仍沿用各表既有的 `prepare_repair`，提交阶段仍沿用 `commit_repair`。
-    /// 5. replay 结束后只对本次修复中触达过的持久化表做一次立即 flush，不给正常事务路径留下额外模式。
+    /// 5. 每个 commit log 文件批次 replay 完成后立即 flush 本文件触达的持久化表。
+    /// 6. 文件级 flush 不等于文件级 confirm；重播事务的提交确认仍统一缓冲到 `finish_replay`。
+    /// 7. 生产者只做按文件批次缓冲，真实 replay/flush 由单消费者 async worker 顺序执行。
     ///
-    /// 粒度说明：
-    /// 1. `replay_commit_log` 每次回调对应一条未确认 commit log 记录，也就是一个已写入提交日志的根事务。
-    /// 2. 一条 commit log 记录内部可能包含多个表块；这些表块会先全部装载、prepare、commit 完成后，再继续下一条事务。
-    /// 3. quick repair 自己的显式 flush 不在“每条事务”或“每个表块”后执行，而是在整轮 replay 结束后按表统一执行。
+    /// 流水线语义：
+    /// 1. 文件流水线深度默认是 `2`。
+    /// 2. 对应含义是“一个文件正在 replay/flush，同时最多允许 producer 再向前缓冲一个文件批次”。
+    /// 3. 当流水线深度已满时，背压只作用在文件批次交接点，不在每条记录上阻塞。
     pub(crate) async fn try_quick_repair(&self, enable_accelerated_repair: bool) -> IOResult<(usize, usize)> {
-        let db_mgr = self.clone();
-        let tables = Arc::new(Mutex::new(BTreeMap::new()));
-        let tables_copy = tables.clone();
+        let profile = QuickRepairProfileState::from_env();
+        let pipeline_depth = self.0.quick_repair_file_pipeline_depth;
+        let ahead_limit = pipeline_depth.checked_sub(1).unwrap_or(1);
+        profile.log(format!("start try_quick_repair: pipeline_depth={}, ahead_limit={}",
+                            pipeline_depth,
+                            ahead_limit));
+        self.set_quick_repair_timeout_collect_suspended(true).await;
+        profile.log("suspend timeout collect loops for quick repair");
+
+        let result = async {
+            let (permit_sender, permit_receiver) = bounded(ahead_limit);
+            for _ in 0..ahead_limit {
+                let _ = permit_sender.send(());
+            }
+
+            let (batch_sender, batch_receiver) = async_bounded(ahead_limit);
+            let worker_result = AsyncValue::new();
+
+            let worker_db = self.clone();
+            let worker_result_copy = worker_result.clone();
+            let worker_permit_sender = permit_sender.clone();
+            let worker_profile = profile.clone();
+            let _ = self.0.rt.spawn(async move {
+                let result = worker_db
+                    .quick_repair_consume_file_batches(enable_accelerated_repair,
+                                                       batch_receiver,
+                                                       worker_permit_sender,
+                                                       worker_profile)
+                    .await;
+                worker_result_copy.set(result);
+            });
+            drop(permit_sender);
+
+        let current_batch = Arc::new(SpinLock::new(None::<QuickRepairFileBatch>));
+        let current_batch_copy = current_batch.clone();
+        let replay_profile = profile.clone();
         let replay_callback = move |commit_uid: Guid, prepare_output: Vec<u8>| -> IOResult<()> {
-            let db_mgr_copy = db_mgr.clone();
-            let commit_uid_copy = commit_uid.clone();
-            let meta_table_name = Atom::from(DEFAULT_DB_TABLES_META_DIR);
-            let (sender, receiver) = bounded(1);
-
-            let tables_clone = tables_copy.clone();
-            let boxed = async move {
-                let bytes_len = prepare_output.len(); //获取日志缓冲区长度
-                let mut offset = 0; //日志缓冲区偏移
-                let bytes = prepare_output.as_slice();
-                let uid = u128::from_le_bytes(bytes[0..16].try_into().unwrap()); //获取事务唯一id
-                let transaciton_uid = Guid(uid);
-                offset += 16; //移动缓冲区指针
-
-                if let Some(tr) = db_mgr_copy.transaction(Atom::from(REPAIR_DB_SOURCE),
-                                                          true,
-                                                          5000,
-                                                          5000)
-                {
-                    //顺序解析本次提交日志的 prepare_output，并按表恢复动作
-                    while offset < bytes_len {
-                        //获取表名、操作的键值对数量和新的日志缓冲区偏移
-                        let (table, kvs_len, new_offset) =
-                            <MetaTable<C, Log> as KVTable>::get_init_table_prepare_output(&prepare_output, offset);
-                        //获取操作的表键值列表和新的日志缓冲区偏移
-                        let (writes, new_offset)
-                            = <MetaTable<C, Log> as KVTable>::get_all_key_value_from_table_prepare_output(&prepare_output,
-                                                                                                           &table,
-                                                                                                           kvs_len,
-                                                                                                           new_offset);
-
-                        if table == meta_table_name {
-                            //元信息表仍然按旧 repair 语义创建或删除表，避免破坏表生命周期恢复逻辑
-                            tables_clone
-                                .lock()
-                                .await
-                                .insert(meta_table_name.clone(), ());
-                            for write in writes {
-                                if let Some(value) = write.value {
-                                    let table_name = match binary_to_table(&write.key) {
-                                        Err(e) => {
-                                            panic!("From binary to table name failed, reason: {:?}", e);
-                                        },
-                                        Ok(table_name) => {
-                                            table_name
-                                        }
-                                    };
-                                    let table_meta = KVTableMeta::from(value);
-
-                                    if let Err(e) = tr.repair_create_table(table_name.clone(),
-                                                                          table_meta.clone(),
-                                                                          enable_accelerated_repair).await {
-                                        let _ = sender.send(Err(Error::new(ErrorKind::Other, format!("Quick repair tables meta failed, transaction_uid: {:?}, commit_uid: {:?}, table_name: {:?}, table_meta: {:?}, reason: {:?}", transaciton_uid, commit_uid_copy, table_name, table_meta, e))));
-                                        return;
-                                    }
-                                } else {
-                                    //元信息表里的 key 是序列化后的表名，删除表时要先解码，避免把原始字节当成表名。
-                                    let table_name = match binary_to_table(&write.key) {
-                                        Err(e) => {
-                                            panic!("From binary to table name failed, reason: {:?}", e);
-                                        },
-                                        Ok(table_name) => {
-                                            table_name
-                                        }
-                                    };
-
-                                    if let Err(e) = tr.repair_remove_table(table_name.clone()).await {
-                                        let _ = sender.send(Err(Error::new(ErrorKind::Other, format!("Quick repair tables meta failed, transaction_uid: {:?}, commit_uid: {:?}, table_name: {:?}, reason: {:?}", transaciton_uid, commit_uid_copy, table_name, e))));
-                                        return;
-                                    }
-                                }
-                            }
-                        } else {
-                            //用户表不再逐 key 走普通 upsert/delete，而是聚合为快速修复写集合
-                            let mut quick_repair_writes = Vec::with_capacity(writes.len());
-                            for write in writes {
-                                quick_repair_writes.push((write.key, write.value));
-                            }
-
-                            if !quick_repair_writes.is_empty() {
-                                tables_clone
-                                    .lock()
-                                    .await
-                                    .insert(table.clone(), ());
-                                if let Err(e) = tr.quick_repair_writes(table.clone(),
-                                                                       quick_repair_writes).await {
-                                    let _ = sender.send(Err(Error::new(ErrorKind::Other, format!("Quick repair db failed, transaction_uid: {:?}, commit_uid: {:?}, table_name: {:?}, reason: {:?}", transaciton_uid, commit_uid_copy, table, e))));
-                                    return;
-                                }
-                            }
-                        }
-
-                        //更新日志缓冲区偏移
-                        offset = new_offset;
+            let record = Self::quick_repair_parse_commit_log_record(commit_uid, prepare_output)?;
+            let mut current_batch = current_batch_copy.lock();
+            if current_batch.is_none() {
+                let permit_wait_begin = Instant::now();
+                match permit_receiver.recv() {
+                        Err(e) => {
+                            return Err(Error::new(ErrorKind::Other,
+                                                  format!("Quick repair acquire file batch permit failed, reason: {:?}",
+                                                          e)));
+                        },
+                        Ok(()) => {
+                            let file_index = replay_profile.next_file_batch_index();
+                            *current_batch = Some(QuickRepairFileBatch::with_capacity(file_index,
+                                                                                      permit_wait_begin.elapsed().as_millis(),
+                                                                                      64));
+                        },
                     }
-
-                    //快速装载动作后仍然要执行 prepare_repair，只是跳过内存表
-                    if let Err(e) = tr.prepare_quick_repair(transaciton_uid.clone()).await {
-                        let _ = sender.send(Err(Error::new(ErrorKind::Other,
-                                                           format!("Quick repair db failed, transaction_uid: {:?}, commit_uid: {:?}, reason: {:?}",
-                                                                   transaciton_uid,
-                                                                   commit_uid_copy,
-                                                                   e))));
-                        return;
-                    }
-
-                    //提交阶段仍沿用旧 repair commit 逻辑，保证提交确认、.bak 改名等行为保持一致
-                    if let Err(e) = tr
-                        .commit_repair(transaciton_uid.clone(),
-                                       commit_uid_copy.clone(),
-                                       prepare_output).await {
-                        let _ = sender.send(Err(Error::new(ErrorKind::Other,
-                                                           format!("Quick repair db failed, transaction_uid: {:?}, commit_uid: {:?}, reason: {:?}",
-                                                                   transaciton_uid,
-                                                                   commit_uid_copy,
-                                                                   e))));
-                        return;
-                    }
-
-                    let _ = sender.send(Ok(()));
-                } else {
-                    let _ = sender.send(Err(Error::new(ErrorKind::Other, format!("Quick repair db failed, transaction_uid: {:?}, commit_uid: {:?}, reason: get db transaction error", transaciton_uid, commit_uid_copy))));
                 }
-            }.boxed();
-            let _ = db_mgr.0.rt.spawn(boxed);
 
-            match receiver.recv() {
+            current_batch
+                .as_mut()
+                .unwrap()
+                .push_record(record);
+            Ok(())
+        };
+
+            let current_batch_copy = current_batch.clone();
+            let batch_sender_copy = batch_sender.clone();
+            let file_finished_profile = profile.clone();
+            let file_finished = move || -> IOResult<()> {
+                let batch = {
+                    let mut current_batch = current_batch_copy.lock();
+                    match current_batch.take() {
+                        None => {
+                            return Err(Error::new(ErrorKind::Other,
+                                                  "Quick repair file batch finished but current batch is missing"));
+                        },
+                        Some(batch) => {
+                            batch
+                        },
+                    }
+                };
+
+                if batch.is_empty() {
+                    return Ok(());
+                }
+
+                let file_index = batch.file_index;
+                let record_count = batch.record_count();
+                let payload_bytes = batch.payload_bytes();
+                let permit_wait_ms = batch.permit_wait_ms;
+                let send_wait_begin = Instant::now();
+                match batch_sender_copy.send_blocking(batch) {
+                    Err(e) => {
+                        Err(Error::new(ErrorKind::Other,
+                                       format!("Quick repair send file batch failed, reason: {:?}", e)))
+                    },
+                    Ok(()) => {
+                        let send_wait_ms = send_wait_begin.elapsed().as_millis();
+                        file_finished_profile.on_batch_buffered(file_index,
+                                                               record_count,
+                                                               payload_bytes,
+                                                               permit_wait_ms,
+                                                               send_wait_ms);
+                        Ok(())
+                    },
+                }
+            };
+
+            let replay_begin = Instant::now();
+            let replay_result = self
+                .0
+                .tr_mgr
+                .replay_commit_log_by_file(replay_callback, file_finished)
+                .await;
+            let replay_loader_elapsed_ms = replay_begin.elapsed().as_millis();
+
+            drop(batch_sender);
+
+            let worker_result = worker_result.await;
+
+            match replay_result {
                 Err(e) => {
-                    Err(Error::new(ErrorKind::Other, format!("Quick repair db failed, commit_uid: {:?}, reason: {:?}", commit_uid, e)))
+                    if let Err(worker_error) = worker_result {
+                        return Err(worker_error);
+                    }
+
+                    Err(e)
                 },
-                Ok(result) => {
-                    result
+                Ok(replay_result) => {
+                    if current_batch.lock().is_some() {
+                        return Err(Error::new(ErrorKind::Other,
+                                              "Quick repair replay finished but current file batch was not delivered"));
+                    }
+
+                    if let Err(e) = worker_result {
+                        return Err(e);
+                    }
+
+                    // 文件级 flush 全部成功后，仍沿用原有 finish_replay 统一执行 replay confirm；
+                    // quick repair 不会在文件边界上提前确认提交日志。
+                    let finish_replay_begin = Instant::now();
+                    let _ = self.0.tr_mgr.finish_replay().await?;
+                    let finish_replay_elapsed_ms = finish_replay_begin.elapsed().as_millis();
+                    profile.on_finish(replay_loader_elapsed_ms,
+                                      finish_replay_elapsed_ms,
+                                      replay_result.0,
+                                      replay_result.1);
+                    Ok(replay_result)
                 },
             }
-        };
+        }.await;
 
-        //重播所有未确认的提交日志
-        let replay_result = self.0.tr_mgr.replay_commit_log(replay_callback).await?;
+        self.set_quick_repair_timeout_collect_suspended(false).await;
+        profile.log("resume timeout collect loops after quick repair");
 
-        //重播完成后，立即刷出本次修复涉及的持久化表，避免继续等待后台整理周期。
-        // 这里的“本次修复”是指当前启动过程中扫描到的全部未确认 commit log，
-        // 因此 flush 粒度是“整轮 replay 结束后按表统一 flush”，而不是逐事务 flush。
-        self.quick_collect_repaired_tables(tables).await?;
-
-        //通知事务管理器重播阶段已结束
-        let _ = self.0.tr_mgr.finish_replay().await?;
-
-        Ok(replay_result)
+        result
     }
 
-    /// 对 quick repair 期间触达过的持久化表执行一次立即 flush。
-    /// 这里不会设置额外的全局 repair 模式，只是一次性复用表自身的 collect_waits 能力。
-    ///
-    /// 注意：
-    /// 1. 这个方法处理的是当前启动修复这一轮 replay 中累计触达的所有持久化表。
-    /// 2. 单个表的一次 `quick_flush_waits` 会尝试排空该表当前等待队列里累计的已提交修复事务。
-    /// 3. 如果某个表在 replay 过程中因 `waits_limit` 达阈值而提前触发过整理，这是原有表实现的行为；
-    ///    本方法只负责在 replay 结束后做最后一次兜底 flush。
-    async fn quick_collect_repaired_tables(&self,
-                                           tables: Arc<Mutex<BTreeMap<Atom, ()>>>) -> IOResult<()> {
-        let table_names = {
-            let locked = tables.lock().await;
-            locked.keys().cloned().collect::<Vec<_>>()
-        };
+    fn quick_repair_parse_commit_log_record(commit_uid: Guid,
+                                            prepare_output: Vec<u8>) -> IOResult<QuickRepairCommitLogRecord> {
+        let bytes_len = prepare_output.len();
+        if bytes_len < 16 {
+            return Err(Error::new(ErrorKind::Other,
+                                  format!("Quick repair parse commit log failed, commit_uid: {:?}, reason: invalid prepare output len {}",
+                                          commit_uid,
+                                          bytes_len)));
+        }
 
+        let mut offset = 0;
+        let uid = u128::from_le_bytes(prepare_output[0..16].try_into().unwrap());
+        let transaction_uid = Guid(uid);
+        offset += 16;
+
+        let mut table_writes = Vec::new();
+        while offset < bytes_len {
+            let (table, kvs_len, new_offset) =
+                <MetaTable<C, Log> as KVTable>::get_init_table_prepare_output(&prepare_output, offset);
+            let (writes, new_offset) =
+                <MetaTable<C, Log> as KVTable>::get_all_key_value_from_table_prepare_output(&prepare_output,
+                                                                                             &table,
+                                                                                             kvs_len,
+                                                                                             new_offset);
+            table_writes.push((table, writes.into_iter().map(|write| (write.key, write.value)).collect()));
+            offset = new_offset;
+        }
+
+        Ok(QuickRepairCommitLogRecord {
+            commit_uid,
+            prepare_output,
+            transaction_uid,
+            payload_bytes: bytes_len,
+            table_writes,
+        })
+    }
+
+    async fn set_quick_repair_timeout_collect_suspended(&self, suspended: bool) {
+        let tables = self.0.tables.read().await;
+        for table in tables.values() {
+            match table {
+                KVDBTable::MetaTab(table) => table.set_timeout_collect_suspended(suspended),
+                KVDBTable::MemOrdTab(_) => (),
+                KVDBTable::LogOrdTab(table) => table.set_timeout_collect_suspended(suspended),
+                KVDBTable::LogWTab(table) => table.set_timeout_collect_suspended(suspended),
+                KVDBTable::BtreeOrdTab(table) => table.set_timeout_collect_suspended(suspended),
+            }
+        }
+    }
+
+    /// 对 quick repair 当前文件批次触达过的持久化表执行一次立即 flush。
+    /// 这里不会设置额外的全局 repair 模式，只是一次性复用表自身的 collect_waits 能力。
+    async fn quick_collect_repaired_tables(&self,
+                                           file_index: usize,
+                                           tables: BTreeMap<Atom, ()>,
+                                           profile: &QuickRepairProfileState) -> IOResult<usize> {
+        let table_names = tables.keys().cloned().collect::<Vec<_>>();
+        let table_count = table_names.len();
+
+        // quick repair 仍以“文件级 barrier”为边界：
+        // 1. 继续保持严格串行 flush；
+        // 2. 同一文件批次中的触达表，按当前 DB 视图逐张执行 barrier；
+        // 3. 全部 flush 完成后才允许进入下一个文件批次。
+        // 这里先回退之前的“分表并发 flush”优化，优先保证顺序语义与可靠性，
+        // 避免在 remove_table / recreate 等生命周期混合场景里再次引入难以证明的边界行为。
         for table_name in table_names {
             match self.get_table(&table_name).await {
                 Some(KVDBTable::MetaTab(table)) => {
+                    let flush_begin = Instant::now();
                     if let Err(e) = table.quick_flush_waits().await {
                         return Err(Error::new(ErrorKind::Other,
                                               format!("Quick flush repaired meta table failed, table: {:?}, reason: {:?}",
                                                       table_name,
                                                       e)));
                     }
+                    profile.on_table_flush(file_index, "MetaTab", &table_name, flush_begin.elapsed().as_millis());
                 },
-                Some(KVDBTable::MemOrdTab(_)) => (),
                 Some(KVDBTable::LogOrdTab(table)) => {
+                    let flush_begin = Instant::now();
                     if let Err(e) = table.quick_flush_waits().await {
                         return Err(Error::new(ErrorKind::Other,
                                               format!("Quick flush repaired log ordered table failed, table: {:?}, reason: {:?}",
                                                       table_name,
                                                       e)));
                     }
+                    profile.on_table_flush(file_index, "LogOrdTab", &table_name, flush_begin.elapsed().as_millis());
                 },
                 Some(KVDBTable::LogWTab(table)) => {
+                    let flush_begin = Instant::now();
                     if let Err(e) = table.quick_flush_waits().await {
                         return Err(Error::new(ErrorKind::Other,
                                               format!("Quick flush repaired only writable table failed, table: {:?}, reason: {:?}",
                                                       table_name,
                                                       e)));
                     }
+                    profile.on_table_flush(file_index, "LogWTab", &table_name, flush_begin.elapsed().as_millis());
                 },
                 Some(KVDBTable::BtreeOrdTab(table)) => {
+                    let flush_begin = Instant::now();
                     if let Err(e) = table.quick_flush_waits().await {
                         return Err(Error::new(ErrorKind::Other,
                                               format!("Quick flush repaired b-tree ordered table failed, table: {:?}, reason: {:?}",
                                                       table_name,
                                                       e)));
                     }
+                    profile.on_table_flush(file_index, "BtreeOrdTab", &table_name, flush_begin.elapsed().as_millis());
                 },
-                None => (),
+                Some(KVDBTable::MemOrdTab(_)) | None => (),
             }
+        }
+
+        Ok(table_count)
+    }
+
+    async fn quick_repair_consume_file_batches(&self,
+                                               enable_accelerated_repair: bool,
+                                               batch_receiver: async_channel::Receiver<QuickRepairFileBatch>,
+                                               permit_sender: crossbeam_channel::Sender<()>,
+                                               profile: Arc<QuickRepairProfileState>)
+        -> IOResult<()> {
+        let mut flushed_file_batches = 0usize;
+
+        while let Ok(batch) = batch_receiver.recv().await {
+            //当前文件批次已经从等待队列切换到消费者执行路径，
+            //可以放行 producer 再向前缓冲一个后继文件批次。
+            let _ = permit_sender.send(());
+
+            let stats = self.quick_repair_replay_file_batch(enable_accelerated_repair,
+                                                            batch,
+                                                            profile.as_ref()).await?;
+            profile.on_batch_flushed(&stats);
+            flushed_file_batches += 1;
+            self.quick_repair_test_abort_after_file_flush(flushed_file_batches);
         }
 
         Ok(())
     }
+
+    async fn quick_repair_replay_file_batch(&self,
+                                            enable_accelerated_repair: bool,
+                                            batch: QuickRepairFileBatch,
+                                            profile: &QuickRepairProfileState) -> IOResult<QuickRepairFileBatchReplayStats> {
+        let meta_table_name = Atom::from(DEFAULT_DB_TABLES_META_DIR);
+        let mut tables = BTreeMap::new();
+        let file_index = batch.file_index;
+        let record_count = batch.record_count();
+        let payload_bytes = batch.payload_bytes();
+        let replay_begin = Instant::now();
+        let mut transaction_elapsed_us = 0;
+        let mut load_elapsed_us = 0;
+        let mut prepare_elapsed_us = 0;
+        let mut prepare_meta_elapsed_us = 0;
+        let mut prepare_log_ord_elapsed_us = 0;
+        let mut prepare_log_write_elapsed_us = 0;
+        let mut prepare_btree_elapsed_us = 0;
+        let mut commit_elapsed_us = 0;
+
+        for (index, record) in batch.records.into_iter().enumerate() {
+            let record_stats = self.quick_repair_replay_record(enable_accelerated_repair,
+                                                               &meta_table_name,
+                                                               &mut tables,
+                                                               file_index,
+                                                               index + 1,
+                                                               record).await?;
+            transaction_elapsed_us += record_stats.transaction_elapsed_us;
+            load_elapsed_us += record_stats.load_elapsed_us;
+            prepare_elapsed_us += record_stats.prepare_elapsed_us;
+            prepare_meta_elapsed_us += record_stats.prepare_meta_elapsed_us;
+            prepare_log_ord_elapsed_us += record_stats.prepare_log_ord_elapsed_us;
+            prepare_log_write_elapsed_us += record_stats.prepare_log_write_elapsed_us;
+            prepare_btree_elapsed_us += record_stats.prepare_btree_elapsed_us;
+            commit_elapsed_us += record_stats.commit_elapsed_us;
+            profile.on_batch_replay_progress(file_index,
+                                             index + 1,
+                                             record_count,
+                                             replay_begin.elapsed().as_millis());
+        }
+
+        let replay_elapsed_ms = replay_begin.elapsed().as_millis();
+        let flush_begin = Instant::now();
+        let table_count = self.quick_collect_repaired_tables(file_index, tables, profile).await?;
+        let flush_elapsed_ms = flush_begin.elapsed().as_millis();
+
+        Ok(QuickRepairFileBatchReplayStats {
+            file_index,
+            record_count,
+            payload_bytes,
+            table_count,
+            replay_elapsed_ms,
+            flush_elapsed_ms,
+            transaction_elapsed_us,
+            load_elapsed_us,
+            prepare_elapsed_us,
+            prepare_meta_elapsed_us,
+            prepare_log_ord_elapsed_us,
+            prepare_log_write_elapsed_us,
+            prepare_btree_elapsed_us,
+            commit_elapsed_us,
+        })
+    }
+
+    #[cfg(debug_assertions)]
+    fn quick_repair_test_abort_after_file_flush(&self,
+                                                flushed_file_batches: usize) {
+        const QUICK_REPAIR_TEST_ABORT_AFTER_FILE_FLUSHES_ENV: &str = "PI_DB_QUICK_REPAIR_TEST_ABORT_AFTER_FILE_FLUSHES";
+
+        if let Ok(expected) = std::env::var(QUICK_REPAIR_TEST_ABORT_AFTER_FILE_FLUSHES_ENV) {
+            if let Ok(expected) = expected.parse::<usize>() {
+                if expected > 0 && flushed_file_batches >= expected {
+                    // 仅供 quick repair 集成测试使用：
+                    // 在“部分文件已 flush，但整体尚未 finish_replay”这一窗口直接退出进程，
+                    // 用于稳定复现重启后的幂等恢复场景。
+                    std::process::exit(0);
+                }
+            }
+        }
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[inline(always)]
+    fn quick_repair_test_abort_after_file_flush(&self,
+                                                _flushed_file_batches: usize) {}
+
+    async fn quick_repair_replay_record(&self,
+                                        enable_accelerated_repair: bool,
+                                        meta_table_name: &Atom,
+                                        tables: &mut BTreeMap<Atom, ()>,
+                                        file_index: usize,
+                                        record_index: usize,
+                                        record: QuickRepairCommitLogRecord) -> IOResult<QuickRepairRecordReplayStats> {
+        let mut stats = QuickRepairRecordReplayStats::default();
+        let QuickRepairCommitLogRecord {
+            commit_uid,
+            prepare_output,
+            transaction_uid,
+            table_writes,
+            ..
+        } = record;
+        let transaciton_uid = transaction_uid;
+
+        let transaction_begin = Instant::now();
+        if let Some(tr) = self.transaction(Atom::from(QUICK_REPAIR_DB_SOURCE),
+                                           true,
+                                           5000,
+                                           5000) {
+            stats.transaction_elapsed_us = transaction_begin.elapsed().as_micros();
+            let load_begin = Instant::now();
+            for (table, writes) in table_writes {
+                if &table == meta_table_name {
+                    tables.insert(meta_table_name.clone(), ());
+                    for (key, value) in writes {
+                        if let Some(value) = value {
+                            let table_name = match binary_to_table(&key) {
+                                Err(e) => {
+                                    panic!("From binary to table name failed, reason: {:?}", e);
+                                },
+                                Ok(table_name) => {
+                                    table_name
+                                }
+                            };
+                            let table_meta = KVTableMeta::from(value);
+                            quick_repair_profile_log(format!("meta create table: file_batch={}, record_index={}, transaction_uid={:?}, commit_uid={:?}, table_name={:?}, table_type={:?}",
+                                                             file_index,
+                                                             record_index,
+                                                             transaciton_uid,
+                                                             commit_uid,
+                                                             table_name,
+                                                             table_meta.table_type));
+
+                            if let Err(e) = tr.repair_create_table(table_name.clone(),
+                                                                  table_meta.clone(),
+                                                                  enable_accelerated_repair).await {
+                                return Err(Error::new(ErrorKind::Other,
+                                                      format!("Quick repair tables meta failed, file_batch: {}, record_index: {}, transaction_uid: {:?}, commit_uid: {:?}, table_name: {:?}, table_meta: {:?}, reason: {:?}",
+                                                              file_index,
+                                                              record_index,
+                                                              transaciton_uid,
+                                                              commit_uid,
+                                                              table_name,
+                                                              table_meta,
+                                                              e)));
+                            }
+                        } else {
+                            let table_name = match binary_to_table(&key) {
+                                Err(e) => {
+                                    panic!("From binary to table name failed, reason: {:?}", e);
+                                },
+                                Ok(table_name) => {
+                                    table_name
+                                }
+                            };
+                            quick_repair_profile_log(format!("meta remove table: file_batch={}, record_index={}, transaction_uid={:?}, commit_uid={:?}, table_name={:?}",
+                                                             file_index,
+                                                             record_index,
+                                                             transaciton_uid,
+                                                             commit_uid,
+                                                             table_name));
+
+                            if let Err(e) = tr.repair_remove_table(table_name.clone()).await {
+                                return Err(Error::new(ErrorKind::Other,
+                                                      format!("Quick repair tables meta failed, file_batch: {}, record_index: {}, transaction_uid: {:?}, commit_uid: {:?}, table_name: {:?}, reason: {:?}",
+                                                              file_index,
+                                                              record_index,
+                                                              transaciton_uid,
+                                                              commit_uid,
+                                                              table_name,
+                                                              e)));
+                            }
+                        }
+                    }
+                } else {
+                    if !writes.is_empty() {
+                        tables.insert(table.clone(), ());
+                        if let Err(e) = tr.quick_repair_writes(table.clone(),
+                                                               writes).await {
+                            return Err(Error::new(ErrorKind::Other,
+                                                  format!("Quick repair db failed, file_batch: {}, record_index: {}, transaction_uid: {:?}, commit_uid: {:?}, table_name: {:?}, reason: {:?}",
+                                                          file_index,
+                                                          record_index,
+                                                          transaciton_uid,
+                                                          commit_uid,
+                                                          table,
+                                                          e)));
+                        }
+                    }
+                }
+            }
+            stats.load_elapsed_us = load_begin.elapsed().as_micros();
+
+            let prepare_begin = Instant::now();
+            let prepare_breakdown = match tr.prepare_quick_repair(transaciton_uid.clone()).await {
+                Err(e) => {
+                    return Err(Error::new(ErrorKind::Other,
+                                          format!("Quick repair db failed, file_batch: {}, record_index: {}, transaction_uid: {:?}, commit_uid: {:?}, reason: {:?}",
+                                                  file_index,
+                                                  record_index,
+                                                  transaciton_uid,
+                                                  commit_uid,
+                                                  e)));
+                },
+                Ok(prepare_breakdown) => {
+                    prepare_breakdown
+                },
+            };
+            stats.prepare_elapsed_us = prepare_begin.elapsed().as_micros();
+            stats.prepare_meta_elapsed_us = prepare_breakdown.meta_elapsed_us;
+            stats.prepare_log_ord_elapsed_us = prepare_breakdown.log_ord_elapsed_us;
+            stats.prepare_log_write_elapsed_us = prepare_breakdown.log_write_elapsed_us;
+            stats.prepare_btree_elapsed_us = prepare_breakdown.btree_elapsed_us;
+
+            let commit_begin = Instant::now();
+            if let Err(e) = tr
+                .commit_repair(transaciton_uid.clone(),
+                               commit_uid.clone(),
+                               prepare_output).await {
+                return Err(Error::new(ErrorKind::Other,
+                                      format!("Quick repair db failed, file_batch: {}, record_index: {}, transaction_uid: {:?}, commit_uid: {:?}, reason: {:?}",
+                                              file_index,
+                                              record_index,
+                                              transaciton_uid,
+                                              commit_uid,
+                                              e)));
+            }
+            stats.commit_elapsed_us = commit_begin.elapsed().as_micros();
+
+            Ok(stats)
+        } else {
+            Err(Error::new(ErrorKind::Other,
+                           format!("Quick repair db failed, file_batch: {}, record_index: {}, transaction_uid: {:?}, commit_uid: {:?}, reason: get db transaction error",
+                                   file_index,
+                                   record_index,
+                                   transaciton_uid,
+                                   commit_uid)))
+        }
+    }
+}
+
+///
+/// quick repair 按文件批次缓冲的一条提交日志记录。
+///
+struct QuickRepairCommitLogRecord {
+    commit_uid:      Guid,
+    prepare_output:  Vec<u8>,
+    transaction_uid: Guid,
+    payload_bytes:   usize,
+    table_writes:    Vec<(Atom, Vec<(Binary, Option<Binary>)>)>,
+}
+
+///
+/// quick repair 统计型日志的共享状态。
+/// 只在显式开启环境变量时输出，用于定位批次装载、顺序重放、文件级 flush 和 replay confirm 的耗时。
+///
+struct QuickRepairProfileState {
+    enabled:            bool,
+    record_interval:    usize,
+    begin:              Instant,
+    next_file_index:    AtomicUsize,
+    counters:           SpinLock<QuickRepairProfileCounters>,
+}
+
+#[derive(Default)]
+struct QuickRepairProfileCounters {
+    buffered_files:     usize,
+    buffered_records:   usize,
+    buffered_bytes:     usize,
+    replayed_files:     usize,
+    replayed_records:   usize,
+    replayed_bytes:     usize,
+    total_permit_wait_ms: u128,
+    total_send_wait_ms: u128,
+    total_replay_ms:    u128,
+    total_flush_ms:     u128,
+    total_tables:       usize,
+    total_transaction_us: u128,
+    total_load_us:      u128,
+    total_prepare_us:   u128,
+    total_prepare_meta_us: u128,
+    total_prepare_log_ord_us: u128,
+    total_prepare_log_write_us: u128,
+    total_prepare_btree_us: u128,
+    total_commit_us:    u128,
+}
+
+impl QuickRepairProfileState {
+    fn from_env() -> Arc<Self> {
+        let enabled = match std::env::var(QUICK_REPAIR_PROFILE_LOG_ENV) {
+            Ok(value) => {
+                let value = value.trim();
+                !value.is_empty() && value != "0" && value.to_ascii_lowercase() != "false"
+            },
+            Err(_) => {
+                false
+            },
+        };
+        let record_interval = match std::env::var(QUICK_REPAIR_PROFILE_RECORD_INTERVAL_ENV) {
+            Ok(value) => value.parse::<usize>().unwrap_or(0),
+            Err(_) => 0,
+        };
+
+        Arc::new(QuickRepairProfileState {
+            enabled,
+            record_interval,
+            begin: Instant::now(),
+            next_file_index: AtomicUsize::new(1),
+            counters: SpinLock::new(QuickRepairProfileCounters::default()),
+        })
+    }
+
+    #[inline(always)]
+    fn next_file_batch_index(&self) -> usize {
+        self.next_file_index.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn log<S: AsRef<str>>(&self, message: S) {
+        if self.enabled {
+            println!("[quick_repair_profile][+{}ms] {}",
+                     self.begin.elapsed().as_millis(),
+                     message.as_ref());
+        }
+    }
+
+    fn on_batch_buffered(&self,
+                         file_index: usize,
+                         record_count: usize,
+                         payload_bytes: usize,
+                         permit_wait_ms: u128,
+                         send_wait_ms: u128) {
+        if !self.enabled {
+            return;
+        }
+
+        {
+            let mut counters = self.counters.lock();
+            counters.buffered_files += 1;
+            counters.buffered_records += record_count;
+            counters.buffered_bytes += payload_bytes;
+            counters.total_permit_wait_ms += permit_wait_ms;
+            counters.total_send_wait_ms += send_wait_ms;
+        }
+
+        self.log(format!("buffered file batch: file_batch={}, records={}, payload_bytes={}, permit_wait_ms={}, send_wait_ms={}",
+                         file_index,
+                         record_count,
+                         payload_bytes,
+                         permit_wait_ms,
+                         send_wait_ms));
+    }
+
+    fn on_batch_replay_progress(&self,
+                                file_index: usize,
+                                replayed_records: usize,
+                                total_records: usize,
+                                elapsed_ms: u128) {
+        if !self.enabled || self.record_interval == 0 {
+            return;
+        }
+
+        if replayed_records % self.record_interval != 0 && replayed_records != total_records {
+            return;
+        }
+
+        self.log(format!("replay progress: file_batch={}, records={}/{}, replay_elapsed_ms={}",
+                         file_index,
+                         replayed_records,
+                         total_records,
+                         elapsed_ms));
+    }
+
+    fn on_table_flush(&self,
+                      file_index: usize,
+                      table_type: &str,
+                      table_name: &Atom,
+                      flush_elapsed_ms: u128) {
+        if !self.enabled {
+            return;
+        }
+
+        self.log(format!("table flush: file_batch={}, table_type={}, table_name={:?}, flush_elapsed_ms={}",
+                         file_index,
+                         table_type,
+                         table_name,
+                         flush_elapsed_ms));
+    }
+
+    fn on_batch_flushed(&self,
+                        stats: &QuickRepairFileBatchReplayStats) {
+        if !self.enabled {
+            return;
+        }
+
+        {
+            let mut counters = self.counters.lock();
+            counters.replayed_files += 1;
+            counters.replayed_records += stats.record_count;
+            counters.replayed_bytes += stats.payload_bytes;
+            counters.total_replay_ms += stats.replay_elapsed_ms;
+            counters.total_flush_ms += stats.flush_elapsed_ms;
+            counters.total_tables += stats.table_count;
+            counters.total_transaction_us += stats.transaction_elapsed_us;
+            counters.total_load_us += stats.load_elapsed_us;
+            counters.total_prepare_us += stats.prepare_elapsed_us;
+            counters.total_prepare_meta_us += stats.prepare_meta_elapsed_us;
+            counters.total_prepare_log_ord_us += stats.prepare_log_ord_elapsed_us;
+            counters.total_prepare_log_write_us += stats.prepare_log_write_elapsed_us;
+            counters.total_prepare_btree_us += stats.prepare_btree_elapsed_us;
+            counters.total_commit_us += stats.commit_elapsed_us;
+        }
+
+        self.log(format!("file batch finished: file_batch={}, records={}, payload_bytes={}, tables={}, replay_elapsed_ms={}, flush_elapsed_ms={}, transaction_ms={:.3}, load_ms={:.3}, prepare_ms={:.3}, prepare_meta_ms={:.3}, prepare_log_ord_ms={:.3}, prepare_log_write_ms={:.3}, prepare_btree_ms={:.3}, commit_ms={:.3}, total_elapsed_ms={}",
+                         stats.file_index,
+                         stats.record_count,
+                         stats.payload_bytes,
+                         stats.table_count,
+                         stats.replay_elapsed_ms,
+                         stats.flush_elapsed_ms,
+                         stats.transaction_elapsed_us as f64 / 1000.0,
+                         stats.load_elapsed_us as f64 / 1000.0,
+                         stats.prepare_elapsed_us as f64 / 1000.0,
+                         stats.prepare_meta_elapsed_us as f64 / 1000.0,
+                         stats.prepare_log_ord_elapsed_us as f64 / 1000.0,
+                         stats.prepare_log_write_elapsed_us as f64 / 1000.0,
+                         stats.prepare_btree_elapsed_us as f64 / 1000.0,
+                         stats.commit_elapsed_us as f64 / 1000.0,
+                         stats.replay_elapsed_ms + stats.flush_elapsed_ms));
+    }
+
+    fn on_finish(&self,
+                 replay_loader_elapsed_ms: u128,
+                 finish_replay_elapsed_ms: u128,
+                 repaired_logs: usize,
+                 repaired_bytes: usize) {
+        if !self.enabled {
+            return;
+        }
+
+        let counters = self.counters.lock();
+        self.log(format!("summary: repaired_logs={}, repaired_log_bytes={}, buffered_files={}, replayed_files={}, buffered_records={}, replayed_records={}, buffered_bytes={}, replayed_bytes={}, total_permit_wait_ms={}, total_send_wait_ms={}, total_replay_ms={}, total_flush_ms={}, total_tables={}, total_transaction_ms={:.3}, total_load_ms={:.3}, total_prepare_ms={:.3}, total_prepare_meta_ms={:.3}, total_prepare_log_ord_ms={:.3}, total_prepare_log_write_ms={:.3}, total_prepare_btree_ms={:.3}, total_commit_ms={:.3}, replay_loader_elapsed_ms={}, finish_replay_elapsed_ms={}, total_elapsed_ms={}",
+                         repaired_logs,
+                         repaired_bytes,
+                         counters.buffered_files,
+                         counters.replayed_files,
+                         counters.buffered_records,
+                         counters.replayed_records,
+                         counters.buffered_bytes,
+                         counters.replayed_bytes,
+                         counters.total_permit_wait_ms,
+                         counters.total_send_wait_ms,
+                         counters.total_replay_ms,
+                         counters.total_flush_ms,
+                         counters.total_tables,
+                         counters.total_transaction_us as f64 / 1000.0,
+                         counters.total_load_us as f64 / 1000.0,
+                         counters.total_prepare_us as f64 / 1000.0,
+                         counters.total_prepare_meta_us as f64 / 1000.0,
+                         counters.total_prepare_log_ord_us as f64 / 1000.0,
+                         counters.total_prepare_log_write_us as f64 / 1000.0,
+                         counters.total_prepare_btree_us as f64 / 1000.0,
+                         counters.total_commit_us as f64 / 1000.0,
+                         replay_loader_elapsed_ms,
+                         finish_replay_elapsed_ms,
+                         self.begin.elapsed().as_millis()));
+    }
+}
+
+///
+/// quick repair 的一个 commit log 文件批次。
+/// 一个批次内的所有记录都属于同一个物理 commit log 文件。
+///
+struct QuickRepairFileBatch {
+    file_index:      usize,
+    permit_wait_ms:  u128,
+    payload_bytes:   usize,
+    records:         Vec<QuickRepairCommitLogRecord>,
+}
+
+impl QuickRepairFileBatch {
+    fn with_capacity(file_index: usize,
+                     permit_wait_ms: u128,
+                     capacity: usize) -> Self {
+        QuickRepairFileBatch {
+            file_index,
+            permit_wait_ms,
+            payload_bytes: 0,
+            records: Vec::with_capacity(capacity),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.records.is_empty()
+    }
+
+    fn push_record(&mut self,
+                   record: QuickRepairCommitLogRecord) {
+        self.payload_bytes += record.payload_bytes;
+        self.records.push(record);
+    }
+
+    fn record_count(&self) -> usize {
+        self.records.len()
+    }
+
+    fn payload_bytes(&self) -> usize {
+        self.payload_bytes
+    }
+}
+
+struct QuickRepairFileBatchReplayStats {
+    file_index:          usize,
+    record_count:        usize,
+    payload_bytes:       usize,
+    table_count:         usize,
+    replay_elapsed_ms:   u128,
+    flush_elapsed_ms:    u128,
+    transaction_elapsed_us: u128,
+    load_elapsed_us:     u128,
+    prepare_elapsed_us:  u128,
+    prepare_meta_elapsed_us: u128,
+    prepare_log_ord_elapsed_us: u128,
+    prepare_log_write_elapsed_us: u128,
+    prepare_btree_elapsed_us: u128,
+    commit_elapsed_us:   u128,
+}
+
+#[derive(Default)]
+struct QuickRepairRecordReplayStats {
+    transaction_elapsed_us: u128,
+    load_elapsed_us:     u128,
+    prepare_elapsed_us:  u128,
+    prepare_meta_elapsed_us: u128,
+    prepare_log_ord_elapsed_us: u128,
+    prepare_log_write_elapsed_us: u128,
+    prepare_btree_elapsed_us: u128,
+    commit_elapsed_us:   u128,
+}
+
+#[derive(Default)]
+struct QuickRepairPrepareBreakdown {
+    meta_elapsed_us:       u128,
+    log_ord_elapsed_us:    u128,
+    log_write_elapsed_us:  u128,
+    btree_elapsed_us:      u128,
 }
 
 // 内部键值对数据库管理器
@@ -1243,15 +1974,16 @@ struct InnerKVDBManager<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>,
 > {
-    rt:                 MultiTaskRuntime<()>,                           //异步运行时
-    tr_mgr:             Transaction2PcManager<C, Log>,                  //事务管理器
-    db_path:            PathBuf,                                        //数据库的表文件所在目录的路径
-    tables_meta_path:   PathBuf,                                        //数据库的元信息表文件所在目录的路径
-    tables_path:        PathBuf,                                        //数据库表文件所在目录的路径
-    tables:             Arc<RwLock<XHashMap<Atom, KVDBTable<C, Log>>>>, //数据表
-    status:             AtomicU64,                                      //数据库状态
-    listener:           Option<Receiver<KVDBEvent<Guid>>>,              //数据库事件监听器
-    notifier:           Option<Sender<KVDBEvent<Guid>>>,                //数据库事件通知器
+    rt:                                 MultiTaskRuntime<()>,               //异步运行时
+    tr_mgr:                             Transaction2PcManager<C, Log>,      //事务管理器
+    db_path:                            PathBuf,                            //数据库的表文件所在目录的路径
+    tables_meta_path:                   PathBuf,                            //数据库的元信息表文件所在目录的路径
+    tables_path:                        PathBuf,                            //数据库表文件所在目录的路径
+    quick_repair_file_pipeline_depth:   usize,                              //quick repair 按文件批次处理时的流水线深度
+    tables:                             Arc<RwLock<XHashMap<Atom, KVDBTable<C, Log>>>>, //数据表
+    status:                             AtomicU64,                          //数据库状态
+    listener:                           Option<Receiver<KVDBEvent<Guid>>>,  //数据库事件监听器
+    notifier:                           Option<Sender<KVDBEvent<Guid>>>,    //数据库事件通知器
 }
 
 ///
@@ -2289,7 +3021,7 @@ impl<
     /// 与旧 repair 的差异是这里会显式跳过内存表，只让持久化表进入 prepare repair。
     async fn prepare_quick_repair(&self,
                                   transaction_uid: Guid)
-                                  -> Result<(), KVTableTrError> {
+                                  -> Result<QuickRepairPrepareBreakdown, KVTableTrError> {
         match self {
             KVDBTransaction::RootTr(tr) => {
                 tr.prepare_quick_repair(transaction_uid).await
@@ -3022,6 +3754,8 @@ impl<
         //并发创建待创建的表
         let result = AsyncValue::new();
         let count = Arc::new(AtomicU64::new(require_create_tables.len() as u64));
+        let startup_table_load_profile = self.get_source().as_str() == STARTUP_DB_SOURCE
+            && quick_repair_profile_log_enabled();
         for (name, meta, options) in require_create_tables.clone() {
             let db_rt = self.0.db_mgr.0.rt.clone();
             let tables_path = self
@@ -3040,8 +3774,16 @@ impl<
             let count_copy = count.clone();
 
             let notifier = self.0.db_mgr.0.notifier.clone();
+            let startup_table_load_profile_copy = startup_table_load_profile;
             let _ = self.0.db_mgr.0.rt.spawn(async move {
                 //待创建的指定名称的表不存在，则创建指定名称的表，并将表的元信息注册到元信息表
+                let table_load_begin = Instant::now();
+                let table_type_label = match meta.table_type {
+                    KVDBTableType::MemOrdTab => "MemOrdTab",
+                    KVDBTableType::LogOrdTab => "LogOrdTab",
+                    KVDBTableType::LogWTab => "LogWTab",
+                    KVDBTableType::BtreeOrdTab => "BtreeOrdTab",
+                };
                 match meta.table_type {
                     KVDBTableType::MemOrdTab => {
                         //创建一个有序内存表
@@ -3143,6 +3885,13 @@ impl<
                             return;
                         }
                     },
+                }
+
+                if startup_table_load_profile_copy {
+                    quick_repair_profile_log(format!("startup table loaded: table_name={:?}, table_type={}, elapsed_ms={}",
+                                                     name,
+                                                     table_type_label,
+                                                     table_load_begin.elapsed().as_millis()));
                 }
 
                 if count_copy.fetch_sub(1, Ordering::AcqRel) <= 1 {
@@ -3392,6 +4141,17 @@ impl<
                 },
             }
         } else {
+            let existing_tables = {
+                let tables = self.0.db_mgr.0.tables.read().await;
+                let mut names = tables.keys()
+                    .map(|name| name.as_str().to_string())
+                    .collect::<Vec<_>>();
+                names.sort();
+                names
+            };
+            quick_repair_profile_log(format!("table missing before quick repair writes: target_table={:?}, existing_tables={:?}",
+                                             table_name,
+                                             existing_tables));
             return Err(KVTableTrError::new_transaction_error(ErrorLevel::Fatal,
                                                              format!("Quick repair db failed, table: {:?}, reason: table not exist",
                                                                      table_name.as_str())));
@@ -4348,24 +5108,33 @@ impl<
     /// quick repair 只需要持久化表参与预提交，内存表必须跳过，避免恢复出不存在于重启后语义中的状态。
     async fn prepare_quick_repair(&self,
                                   transaction_uid: Guid)
-                                  -> Result<(), KVTableTrError> {
+                                  -> Result<QuickRepairPrepareBreakdown, KVTableTrError> {
+        let mut breakdown = QuickRepairPrepareBreakdown::default();
         let mut childs = self.to_children();
         while let Some(child) = childs.next() {
             match &child {
                 KVDBTransaction::MetaTabTr(tr) => {
-                    tr.prepare_repair(transaction_uid.clone());
+                    let begin = Instant::now();
+                    tr.prepare_quick_repair(transaction_uid.clone());
+                    breakdown.meta_elapsed_us += begin.elapsed().as_micros();
                 },
                 KVDBTransaction::MemOrdTabTr(_) => {
                     continue;
                 },
                 KVDBTransaction::LogOrdTabTr(tr) => {
-                    tr.prepare_repair(transaction_uid.clone());
+                    let begin = Instant::now();
+                    tr.prepare_quick_repair(transaction_uid.clone());
+                    breakdown.log_ord_elapsed_us += begin.elapsed().as_micros();
                 },
                 KVDBTransaction::LogWTabTr(tr) => {
-                    tr.prepare_repair(transaction_uid.clone());
+                    let begin = Instant::now();
+                    tr.prepare_quick_repair(transaction_uid.clone());
+                    breakdown.log_write_elapsed_us += begin.elapsed().as_micros();
                 },
                 KVDBTransaction::BtreeOrdTabTr(tr) => {
-                    tr.prepare_repair(transaction_uid.clone());
+                    let begin = Instant::now();
+                    tr.prepare_quick_repair(transaction_uid.clone());
+                    breakdown.btree_elapsed_us += begin.elapsed().as_micros();
                 },
                 KVDBTransaction::RootTr(_) => {
                     continue;
@@ -4373,7 +5142,7 @@ impl<
             }
         }
 
-        Ok(())
+        Ok(breakdown)
     }
 
     /// 异步提交本次事务对键值对数据库的所有修复修改

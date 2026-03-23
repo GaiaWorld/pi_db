@@ -36,7 +36,7 @@ use crate::{Binary,
             KVActionLog,
             KVDBCommitConfirm,
             KVTableTrError,
-            db::{KVDBTransaction, KVDBChildTrList},
+            db::{KVDBTransaction, KVDBChildTrList, QUICK_REPAIR_DB_SOURCE, quick_repair_profile_log},
             tables::KVTable};
 use std::collections::VecDeque;
 
@@ -165,22 +165,52 @@ impl<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>,
 > LogWriteTable<C, Log> {
+    /// 仅供 quick repair 使用：
+    /// 暂时挂起原有后台 `wait_timeout` 周期整理，避免它与文件级 quick flush 并发竞争。
+    /// 这不会影响 waits_limit 触发的即时整理，也不会改变正常事务或 try_repair 的行为。
+    pub(crate) fn set_timeout_collect_suspended(&self, suspended: bool) {
+        self.0.timeout_collect_suspended.store(suspended, Ordering::Release);
+    }
+
     /// 仅供 quick repair 使用的一次性 flush。
-    /// 只在修复完成后主动触发，不会影响正常事务的后台整理节奏。
+    /// 只在修复完成后主动触发，不会影响正常事务的后台整理节奏，
+    /// 同时会跳过日志文件的延迟提交，避免 quick repair 每文件批次额外等待默认的 1000ms。
+    /// 这里同样要作为 quick repair 的文件级 barrier 使用：
+    /// 如果当前表已经有后台 collect 在执行，就等待它结束并确认 waits 已经清空，
+    /// 然后才允许 quick repair 进入下一个 commit log 文件批次。
     pub(crate) async fn quick_flush_waits(&self) -> Result<(), KVTableTrError> {
         self.0.waits_size.store(0, Ordering::Relaxed);
 
-        match collect_waits(self, None).await {
-            Err((collect_time, statistics)) => {
-                Err(KVTableTrError::new_transaction_error(ErrorLevel::Normal,
-                                                          format!("Quick flush only writable table failed, table: {:?}, time: {:?}, statistics: {:?}",
-                                                                  self.name().as_str(),
-                                                                  collect_time,
-                                                                  statistics)))
-            },
-            Ok(_) => {
-                Ok(())
-            },
+        loop {
+            if self.0.collecting.load(Ordering::Acquire) {
+                self.0.rt.timeout(0).await;
+                continue;
+            }
+
+            let has_waits = {
+                let waits = self.0.waits.lock().await;
+                !waits.is_empty()
+            };
+
+            if !has_waits {
+                if !self.0.collecting.load(Ordering::Acquire) {
+                    return Ok(());
+                }
+
+                self.0.rt.timeout(0).await;
+                continue;
+            }
+
+            match collect_waits(self, None, true).await {
+                Err((collect_time, statistics)) => {
+                    return Err(KVTableTrError::new_transaction_error(ErrorLevel::Normal,
+                                                                     format!("Quick flush only writable table failed, table: {:?}, time: {:?}, statistics: {:?}",
+                                                                             self.name().as_str(),
+                                                                             collect_time,
+                                                                             statistics)));
+                },
+                Ok(_) => (),
+            }
         }
     }
 }
@@ -231,6 +261,7 @@ impl<
                     waits_limit,
                     wait_timeout,
                     collecting,
+                    timeout_collect_suspended: AtomicBool::new(false),
                     log_file,
                 };
 
@@ -262,8 +293,14 @@ impl<
                 let _ = table.0.rt.spawn(async move {
                     let table_ref = &table_copy;
                     loop {
+                        if table_copy.0.timeout_collect_suspended.load(Ordering::Acquire) {
+                            table_copy.0.rt.timeout(1).await;
+                            continue;
+                        }
+
                         match collect_waits(table_ref,
-                                            Some(table_copy.0.wait_timeout)).await {
+                                            Some(table_copy.0.wait_timeout),
+                                            false).await {
                             Err((collect_time, statistics)) => {
                                 error!("Collect only writable table failed, table: {:?}, time: {:?}, statistics: {:?}, reason: out of time",
                                     table_copy.name().as_str(),
@@ -300,6 +337,7 @@ struct InnerLogWriteTable<
     waits_limit:    usize,                                                                                                  //等待异步写日志文件的已提交的只写日志事务大小限制
     wait_timeout:   usize,                                                                                                  //等待异步写日志文件的超时时长，单位毫秒
     collecting:     AtomicBool,                                                                                             //是否正在整理等待异步写日志文件的已提交的只写日志事务列表
+    timeout_collect_suspended: AtomicBool,                                                                                  //是否暂时挂起后台 wait_timeout 周期整理，仅供 quick repair 使用
     log_file:       LogFile,                                                                                                //日志文件
 }
 
@@ -599,6 +637,7 @@ impl<
         async move {
             //移除事务在只写日志表的预提交表中的操作记录
             let transaction_uid = tr.get_transaction_uid().unwrap();
+            let is_quick_repair_commit = tr.get_source().as_str() == QUICK_REPAIR_DB_SOURCE;
 
             let actions = {
                 let mut table_prepare = tr
@@ -611,7 +650,9 @@ impl<
 
                 //更新只写日志表的根节点
                 if let Some(actions) = actions {
-                    {
+                    if !is_quick_repair_commit {
+                        // quick repair 在 prepare_repair 中已经把写集合顺序作用到全局根节点；
+                        // commit_repair 这里只保留提交确认与持久化登记，避免重复更新根节点。
                         let mut locked = tr.0.table.0.root.lock();
                         if !locked.ptr_eq(&tr.0.root_ref) {
                             //只写日志表的根节点在当前事务执行过程中已改变，
@@ -646,28 +687,33 @@ impl<
             if tr.is_require_persistence() {
                 //持久化的只写日志表事务，则异步将表的修改写入日志文件后，再确认提交成功
                 let table_copy = tr.0.table.clone();
-                let _ = self.0.table.0.rt.spawn(async move {
+                let commit_future = async move {
                     let mut size = 0;
+                    let mut actions_len = 0;
                     for (key, action) in &actions {
                         match action {
                             KVActionLog::Write(Some(value)) | KVActionLog::DirtyWrite(Some(value)) => {
                                 size += key.len() + value.len();
+                                actions_len += 1;
                             },
                             KVActionLog::Write(None) | KVActionLog::DirtyWrite(None) => {
                                 size += key.len();
+                                actions_len += 1;
                             },
                             KVActionLog::Read => (),
                         }
                     }
+
                     table_copy.0.waits.lock().await.push_back((tr, actions, confirm)); //注册待确认的已提交事务
 
                     let last_waits_size = table_copy.0.waits_size.fetch_add(size, Ordering::SeqCst); //更新待确认的已提交事务的大小计数
-                    if last_waits_size + size >= table_copy.0.waits_limit {
+                    if !is_quick_repair_commit && last_waits_size + size >= table_copy.0.waits_limit {
                         //如果当前已注册的待确认的已提交事务大小已达限制，则立即整理
                         table_copy.0.waits_size.store(0, Ordering::Relaxed); //重置待确认的已提交事务的大小计数
 
                         match collect_waits(&table_copy,
-                                            None).await {
+                                            None,
+                                            false).await {
                             Err((collect_time, statistics)) => {
                                 error!("Collect only writable table failed, table: {:?}, time: {:?}, statistics: {:?}, reason: out of size",
                                     table_copy.name().as_str(),
@@ -682,7 +728,13 @@ impl<
                             },
                         }
                     }
-                });
+                };
+
+                if is_quick_repair_commit {
+                    commit_future.await;
+                } else {
+                    let _ = self.0.table.0.rt.spawn(commit_future);
+                }
             }
 
             Ok(())
@@ -1133,6 +1185,29 @@ impl<
         //将事务的当前操作记录，写入表的预提交表
         self.0.table.0.prepare.lock().insert(transaction_uid, actions);
     }
+
+    // 预提交所有快速修复修改
+    // quick repair 只减少根节点锁的往返次数，保持和旧 repair 相同的动作回放与 prepare 登记语义。
+    pub(crate) fn prepare_quick_repair(&self, transaction_uid: Guid) {
+        let actions = mem::replace(&mut *self.0.actions.lock(), XHashMap::default());
+
+        {
+            let mut root = self.0.table.0.root.lock();
+            for (key, action) in &actions {
+                match action {
+                    KVActionLog::Write(Some(value)) | KVActionLog::DirtyWrite(Some(value)) => {
+                        root.upsert(key.clone(), value.clone(), false);
+                    },
+                    KVActionLog::Write(None) | KVActionLog::DirtyWrite(None) => {
+                        root.delete(key, false);
+                    },
+                    KVActionLog::Read => (),
+                }
+            }
+        }
+
+        self.0.table.0.prepare.lock().insert(transaction_uid, actions);
+    }
 }
 
 // 内部只写日志表事务
@@ -1261,11 +1336,16 @@ async fn collect_waits<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>,
 >(table: &LogWriteTable<C, Log>,
-  timeout: Option<usize>) -> Result<(Duration, (usize, usize, usize)), (Duration, (usize, usize, usize))> {
+  timeout: Option<usize>,
+  force_commit_immediately: bool) -> Result<(Duration, (usize, usize, usize)), (Duration, (usize, usize, usize))> {
     //等待指定的时间
     if let Some(timeout) = timeout {
         //需要等待指定时间后，再开始整理
         table.0.rt.timeout(timeout).await;
+
+        if table.0.timeout_collect_suspended.load(Ordering::Acquire) {
+            return Ok((Instant::now().elapsed(), (0, 0, 0)));
+        }
     }
 
     //检查是否正在异步整理，如果并未开始异步整理，则设置为正在异步整理，并继续异步整理
@@ -1328,13 +1408,31 @@ async fn collect_waits<
             waits.push_back((wait_tr, confirm));
         }
 
-        if let Err(e) = table
-            .0
-            .log_file
-            .delay_commit(log_uid,
-                          false,
-                          DEFAULT_LOG_FILE_COMMIT_DELAY_TIMEOUT)
-            .await {
+        quick_repair_profile_log(format!("log_write collect drained: table={:?}, force_commit_immediately={}, transactions={}, keys={}, bytes={}, log_uid={}",
+                                         table.name().as_str(),
+                                         force_commit_immediately,
+                                         trs_len,
+                                         keys_len,
+                                         bytes_len,
+                                         log_uid));
+
+        let commit_result = if force_commit_immediately {
+            table
+                .0
+                .log_file
+                .commit_owned(log_uid, true, false, None)
+                .await
+        } else {
+            table
+                .0
+                .log_file
+                .delay_commit(log_uid,
+                              false,
+                              DEFAULT_LOG_FILE_COMMIT_DELAY_TIMEOUT)
+                .await
+        };
+
+        if let Err(e) = commit_result {
             //写入日志文件失败，则立即中止本次整理
             table.0.collecting.store(false, Ordering::Release); //设置为已整理结束
             error!("Collect only writable table failed, table: {:?}, transactions: {}, keys: {}, bytes: {}, reason: {:?}",
@@ -1347,6 +1445,20 @@ async fn collect_waits<
             return Err((now.elapsed(), (trs_len, keys_len, bytes_len)));
         }
     }
+
+    let writable_file_size = table
+        .0
+        .log_file
+        .writable_path()
+        .and_then(|path| path.metadata().ok().map(|meta| meta.len()))
+        .unwrap_or(0);
+    quick_repair_profile_log(format!("log_write collect committed: table={:?}, transactions={}, keys={}, bytes={}, writable_size={}, file_size={}",
+                                     table.name().as_str(),
+                                     trs_len,
+                                     keys_len,
+                                     bytes_len,
+                                     table.0.log_file.writable_size(),
+                                     writable_file_size));
 
     //写入日志文件成功，则调用指定事务的确认提交回调，并继续写入下一个事务
     for (wait_tr, confirm) in waits {
