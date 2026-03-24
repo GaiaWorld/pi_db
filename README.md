@@ -314,6 +314,14 @@ where
 10. 文件级 flush 不等于文件级 confirm；quick repair 仍沿用原有 `confirm_replay -> finish_replay` 的统一确认流程，因此在“部分文件已 flush、整体尚未 `finish_replay`”时再次启动，恢复流程仍必须保持幂等。
 11. 如果某张表在 replay 过程中因为等待队列累计大小达到 `waits_limit` 而提前触发了整理，这属于表自身原有的阈值行为，不表示 quick repair 改成了逐事务 flush。
 12. 修复时会自动忽略所有带 `.bak` 的 `commit log` 文件；如果需要让既有样本参与修复，只能对“连续后缀”那一段物理日志文件去掉 `.bak`，不能跳着激活中间文件。
+13. `Repair db succeeded` 当前表示“数据 replay/flush 已完成且数据库可继续 startup 提供服务”，不等价于“所有历史 `commit log` 都已经立即补成 `.bak`”；如果 replay confirm 仍在后台追赶，`.bak` 可能会稍后补上，但这不会改变已提交事务的数据完整性、顺序性和幂等恢复语义。
+14. 为增强可观测性，修复过程中每当一个物理 `commit log` 文件真正完成 replay confirm 并被推进成 `.bak` 时，底层提交日志记录器会输出一条 `info` 日志，包含文件路径、事务日志数量、日志字节数和从进入 replay 到完成 `.bak` 推进的总耗时。
+15. 如需进一步区分“数据 replay/flush 已完成”和“replay confirm 仍在追赶”，可以把 `pi_db` / `pi_store` 的日志级别开到 `debug`。当前低频 debug 日志会覆盖这些关键节点：
+    - `try_repair` / `try_quick_repair` 入口与 `finish_replay` 返回
+    - 每个物理 `commit log` 文件批次的 replay 开始、flush 开始/结束
+    - 每个物理 `commit log` 文件 replay 完成但尚未推进 `.bak`
+    - `finish_replay` 开始/结束时的 buffered confirm / pending file 摘要
+16. 上述 debug 日志故意不打在逐事务、逐 key、逐次 `confirm_replay` 或 waits 入队等高频热路径上，避免在生产环境形成日志风暴；如果看到 `Repair db succeeded` / `Startup db succeeded` 之后仍持续出现“.bak promoted”日志，通常表示数据库已可提供服务，而 replay confirm 仍在后台正常追赶。
 
 ## 相关模块
 
@@ -336,3 +344,6 @@ where
 - 当前文件级 flush barrier 已固定为“按当前 DB 视图逐张串行 `quick_flush_waits`”，不再采用试验性的分表并发 flush。
 - 当前本地正式对比基准已确认：在 `MetaTab + Btree` 主导、`3` 个约 `32MB` 物理日志文件的近生产样本上，`try_quick_repair(depth=2)` 相对 `try_repair` 的端到端启动修复总时长约快 `3.674x`，且两者修复后的逻辑结果与最终磁盘状态完全一致。
 - 当前剩余主热点仍集中在 `BtreeOrdTab collect_waits(...)` 的 `apply + redb_commit`；在不改变 `try_repair`、不改变正常事务语义、并把改动限制在 `pi_db/pi_store` 内的前提下，内部可控优化空间已经明显收窄。
+- 当前线上已确认：startup 成功后历史 `commit log` 的 `.bak` 推进可能略晚于数据 replay/flush 完成；这更像是共享 replay confirm 收尾滞后，而不是 quick repair 数据修复失败。
+- 当前仓库已包含稳定复现测试 `test_repair_confirm_lag_only_delays_bak_promotion_after_startup`，用于验证“数据已修好但 `.bak` 稍后补上”的窗口，并支撑后续修复前后对照。
+- 当前还额外提供了低频 debug 修复日志，可直接配合 per-file `.bak` info 日志一起在线上判定：是“数据已修好、confirm 正在追赶”，还是某个具体修复阶段真的阻塞。

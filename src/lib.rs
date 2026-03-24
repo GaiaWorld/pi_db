@@ -508,7 +508,14 @@ impl<C: Clone + Send + 'static, Log: AsyncCommitLog<C = C, Cid = Guid>> KVDBComm
         if (self.0).4.fetch_sub(1, Ordering::SeqCst) <= 1 {
             //本次事务的所有子事务已确认提交，则异步的确认本次事务已提交，并立即返回成功
             let confirmer = self.clone();
+            let replay_confirm_delay_ms = std::env::var(TEST_REPLAY_CONFIRM_DELAY_MS_ENV)
+                .ok()
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .filter(|delay| *delay > 0);
             let _ = (self.0).0.spawn(async move {
+                if let Some(delay_ms) = replay_confirm_delay_ms {
+                    confirmer.0.0.timeout(delay_ms).await;
+                }
                 let last = COMMITED_LEN.fetch_add(1, Ordering::Relaxed);
                 //事务已确认提交
                 if let Err(e) = (confirmer.0)
@@ -532,6 +539,13 @@ impl<C: Clone + Send + 'static, Log: AsyncCommitLog<C = C, Cid = Guid>> KVDBComm
 }
 
 static COMMITED_LEN: AtomicUsize = AtomicUsize::new(0);
+
+///
+/// 仅用于测试：人为延迟 repair/quick repair 触发到底层 commit logger 的确认时机，
+/// 用于稳定复现“startup 已成功返回，但 .bak 归档稍后才补上”的窗口。
+/// 未设置时行为完全等同于原有实现。
+///
+const TEST_REPLAY_CONFIRM_DELAY_MS_ENV: &str = "PI_DB_TEST_REPLAY_CONFIRM_DELAY_MS";
 
 ///
 /// 键值对数据库事务错误

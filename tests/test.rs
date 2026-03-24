@@ -7467,6 +7467,7 @@ const QUICK_REPAIR_PAYLOAD_TABLE: &str = "repair_payload";
 const QUICK_REPAIR_LOG_ORD_PAYLOAD_TABLE: &str = "repair_log_ord_payload";
 const QUICK_REPAIR_TMP_ROOT: &str = "./tmp_quick_repair";
 const QUICK_REPAIR_TEST_ABORT_AFTER_FILE_FLUSHES_ENV: &str = "PI_DB_QUICK_REPAIR_TEST_ABORT_AFTER_FILE_FLUSHES";
+const QUICK_REPAIR_TEST_REPLAY_CONFIRM_DELAY_MS_ENV: &str = "PI_DB_TEST_REPLAY_CONFIRM_DELAY_MS";
 const QUICK_REPAIR_BTREE_DEF: TableDefinition<Binary, Binary> = TableDefinition::new("$default");
 
 #[derive(Debug, PartialEq, Eq)]
@@ -7537,6 +7538,29 @@ impl PairLoader for LatestLogTableLoader {
 }
 
 static QUICK_REPAIR_TEST_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+
+struct ScopedEnvVar {
+    key:      &'static str,
+    previous: Option<std::ffi::OsString>,
+}
+
+impl ScopedEnvVar {
+    fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+        let previous = std::env::var_os(key);
+        std::env::set_var(key, value);
+        ScopedEnvVar { key, previous }
+    }
+}
+
+impl Drop for ScopedEnvVar {
+    fn drop(&mut self) {
+        if let Some(previous) = self.previous.take() {
+            std::env::set_var(self.key, previous);
+        } else {
+            std::env::remove_var(self.key);
+        }
+    }
+}
 
 // quick repair 用例会创建真实数据库目录并拉起子进程制造未确认 commit log。
 // 默认测试线程并行执行时，这几条用例会互相争抢资源并放大超时风险，因此在进程内串行化。
@@ -7696,6 +7720,82 @@ fn test_try_repair_and_try_quick_repair_multi_file_fixture_are_consistent() {
 
     assert_eq!(try_repair_snapshot, try_quick_repair_snapshot);
     assert_eq!(try_quick_repair_snapshot, expected_quick_repair_multi_file_snapshot());
+}
+
+// 验证当前“startup 已成功返回，但 .bak 归档稍后才补上”的窗口，是否只是 replay confirm 收尾滞后：
+// 1. 先生成多文件真实 crash fixture；
+// 2. 通过测试专用环境变量人为延迟最终 commit_logger.confirm；
+// 3. 分别执行 try_repair 与 try_quick_repair；
+// 4. 断言 startup 返回时逻辑快照已正确，但活跃 commit log 仍大于 1；
+// 5. 再等待一小段时间，断言活跃 commit log 最终收敛到 1（仅剩当前可写文件）。
+// 注意：这里不在 startup 刚返回的窗口里立即读取 BTree 磁盘文件，避免把“确认滞后”与“表文件正在收尾”混在一起。
+#[test]
+fn test_repair_confirm_lag_only_delays_bak_promotion_after_startup() {
+    let _guard = quick_repair_test_guard();
+
+    if let Some(root) = quick_repair_child_root("quick_multi_file_confirm_lag_fixture") {
+        generate_quick_repair_multi_file_fixture(&root);
+        return;
+    }
+
+    let base_root = quick_repair_tmp_dir("multi_file_confirm_lag/source");
+    let try_repair_root = quick_repair_tmp_dir("multi_file_confirm_lag/try_repair");
+    let try_quick_repair_root = quick_repair_tmp_dir("multi_file_confirm_lag/try_quick_repair");
+
+    spawn_quick_repair_fixture("test_repair_confirm_lag_only_delays_bak_promotion_after_startup",
+                               "quick_multi_file_confirm_lag_fixture",
+                               &base_root);
+
+    assert!(count_active_commit_log_files(&base_root) > 1,
+            "multi-file confirm lag fixture should contain more than one active commit log file, root: {:?}",
+            base_root);
+
+    remove_dir_if_exists(&try_repair_root);
+    remove_dir_if_exists(&try_quick_repair_root);
+    copy_dir_all(&base_root, &try_repair_root);
+    copy_dir_all(&base_root, &try_quick_repair_root);
+
+    let expected_snapshot = expected_quick_repair_multi_file_snapshot();
+    let replay_confirm_delay_ms = 2000;
+    let settle_timeout_ms = 15000;
+
+    let (try_repair_snapshot,
+         try_repair_active_immediate,
+         try_repair_active_settled) =
+        startup_db_and_collect_quick_repair_bak_lag_state(&try_repair_root,
+                                                          DBStartupRepairMode::TryRepair,
+                                                          replay_confirm_delay_ms,
+                                                          settle_timeout_ms);
+
+    assert_eq!(try_repair_snapshot, expected_snapshot);
+    assert!(try_repair_active_immediate > 1,
+            "try_repair should still leave replayed commit logs active immediately after startup when confirm is artificially delayed, root: {:?}, active_immediate: {}",
+            try_repair_root,
+            try_repair_active_immediate);
+    assert_eq!(try_repair_active_settled, 1,
+               "try_repair should eventually promote old commit logs to .bak after delayed confirm catches up, root: {:?}, active_settled: {}",
+               try_repair_root,
+               try_repair_active_settled);
+
+    let (try_quick_repair_snapshot,
+         try_quick_repair_active_immediate,
+         try_quick_repair_active_settled) =
+        startup_db_and_collect_quick_repair_bak_lag_state(&try_quick_repair_root,
+                                                          DBStartupRepairMode::TryQuickRepair,
+                                                          replay_confirm_delay_ms,
+                                                          settle_timeout_ms);
+
+    assert_eq!(try_quick_repair_snapshot, expected_snapshot);
+    assert!(try_quick_repair_active_immediate > 1,
+            "try_quick_repair should still leave replayed commit logs active immediately after startup when confirm is artificially delayed, root: {:?}, active_immediate: {}",
+            try_quick_repair_root,
+            try_quick_repair_active_immediate);
+    assert_eq!(try_quick_repair_active_settled, 1,
+               "try_quick_repair should eventually promote old commit logs to .bak after delayed confirm catches up, root: {:?}, active_settled: {}",
+               try_quick_repair_root,
+               try_quick_repair_active_settled);
+
+    assert_eq!(try_repair_snapshot, try_quick_repair_snapshot);
 }
 
 // 验证 quick repair 在“部分文件已 flush，但整体尚未 finish_replay”后再次启动时仍保持幂等：
@@ -9318,6 +9418,71 @@ fn startup_db_and_collect_quick_repair_state_with_pipeline_depth(root: &std::pat
     drop(rt);
 
     (snapshot, load_quick_repair_disk_state(root))
+}
+
+// 以指定修复模式启动数据库，并专门观察“startup 已成功返回，但 replay confirm/.bak 归档仍在追赶”的窗口：
+// 1. 通过测试专用环境变量人为延迟最终 commit_logger.confirm；
+// 2. startup 返回后立刻采集逻辑视图与当前活跃 commit log 文件数；
+// 3. 再等待指定时间，确认 .bak 是否会最终补上。
+// 该 helper 用于验证当前问题是否只是 confirm 收尾滞后，而不是表数据修复本身不完整。
+fn startup_db_and_collect_quick_repair_bak_lag_state(root: &std::path::Path,
+                                                     repair_mode: DBStartupRepairMode,
+                                                     replay_confirm_delay_ms: usize,
+                                                     settle_timeout_ms: usize)
+    -> (QuickRepairSnapshot, usize, usize) {
+    let _env_guard = ScopedEnvVar::set(QUICK_REPAIR_TEST_REPLAY_CONFIRM_DELAY_MS_ENV,
+                                       replay_confirm_delay_ms.to_string());
+    let _handle = startup_global_time_loop(10);
+    let builder = MultiTaskRuntimeBuilder::default();
+    let rt = builder.build();
+    let rt_copy = rt.clone();
+    let root_copy = root.to_path_buf();
+    let (sender, receiver) = bounded(1);
+
+    let _ = rt.spawn(async move {
+        let db = startup_quick_repair_test_db(rt_copy.clone(), root_copy.clone(), repair_mode).await;
+
+        let mut tables = db.tables().await
+            .into_iter()
+            .map(|table| table.as_str().to_string())
+            .collect::<Vec<_>>();
+        tables.sort();
+
+        let tr = db.transaction(Atom::from("quick repair bak lag snapshot"), false, 500, 500).unwrap();
+        let snapshot = QuickRepairSnapshot {
+            tables,
+            log_ord: read_table_values(&tr, Atom::from(QUICK_REPAIR_LOG_ORD_TABLE)).await,
+            log_write: read_known_queries(&tr,
+                                          Atom::from(QUICK_REPAIR_LOG_WRITE_TABLE),
+                                          &[5, 6, 7]).await,
+            btree: read_table_values(&tr, Atom::from(QUICK_REPAIR_BTREE_TABLE)).await,
+            mem_ord: read_table_values(&tr, Atom::from(QUICK_REPAIR_MEM_TABLE)).await,
+        };
+
+        drop(tr);
+        rt_copy.timeout(0).await;
+
+        let immediate_active_logs = count_active_commit_log_files(&root_copy);
+
+        drop(db);
+        rt_copy.timeout(0).await;
+
+        let settle_begin = Instant::now();
+        let settled_active_logs = loop {
+            let active_logs = count_active_commit_log_files(&root_copy);
+            if active_logs <= 1 || settle_begin.elapsed() >= Duration::from_millis(settle_timeout_ms as u64) {
+                break active_logs;
+            }
+
+            rt_copy.timeout(50).await;
+        };
+
+        let _ = sender.send((snapshot,
+                             immediate_active_logs,
+                             settled_active_logs));
+    });
+
+    receiver.recv_timeout(Duration::from_secs(60)).unwrap()
 }
 
 // 对同一份 crash fixture 分别执行 TryRepair 和 TryQuickRepair，
