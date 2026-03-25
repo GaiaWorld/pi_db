@@ -15,7 +15,7 @@ use async_channel::{Sender, Receiver, bounded as async_bounded, unbounded};
 use dashmap::DashMap;
 use lazy_static::lazy_static;
 use bytes::BufMut;
-use log::{debug, info, error};
+use log::{info, error};
 #[cfg(target_os = "linux")]
 use libc::malloc_trim;
 #[cfg(feature = "trace")]
@@ -474,10 +474,10 @@ impl<
 
         //如果有未确认的提交日志，则尝试修复数据库表数据
         let repair_begin = Instant::now();
-        debug!("Database repair begin, mode: {:?}, tables: {}, accelerated_repair: {}",
-               repair_mode,
-               loaded_tables,
-               enable_accelerated_repair);
+        info!("Database repair begin, mode: {:?}, tables: {}, accelerated_repair: {}",
+              repair_mode,
+              loaded_tables,
+              enable_accelerated_repair);
         let repair_result = match repair_mode {
             DBStartupRepairMode::TryRepair => {
                 db_mgr.try_repair(enable_accelerated_repair).await
@@ -507,11 +507,11 @@ impl<
                                                      repair_begin.elapsed().as_millis(),
                                                      startup_begin.elapsed().as_millis()));
                 }
-                debug!("Database repair end, mode: {:?}, repaired_logs: {}, repaired_bytes: {}, elapsed_ms: {}",
-                       repair_mode,
-                       repaired_log_len,
-                       repaired_bytes_len,
-                       repair_begin.elapsed().as_millis());
+                info!("Database repair end, mode: {:?}, repaired_logs: {}, repaired_bytes: {}, elapsed_ms: {}",
+                      repair_mode,
+                      repaired_log_len,
+                      repaired_bytes_len,
+                      repair_begin.elapsed().as_millis());
             }
         }
 
@@ -970,7 +970,7 @@ impl<
     // 尝试幂等的重播未确认的提交日志，并修复数据库表数据
     // 注意如果在只有单个线程的运行时修复或并发修复，则可能会发生阻塞
     pub(crate) async fn try_repair(&self, enable_accelerated_repair: bool) -> IOResult<(usize, usize)> {
-        debug!("try_repair begin, accelerated_repair: {}", enable_accelerated_repair);
+        info!("try_repair begin, accelerated_repair: {}", enable_accelerated_repair);
         //构建重播回调
         let db_mgr = self.clone();
 
@@ -1130,15 +1130,15 @@ impl<
 
         //异步重播所有未确认的提交日志
         let replay_result = self.0.tr_mgr.replay_commit_log(replay_callback).await?;
-        debug!("try_repair replay finished, repaired_logs: {}, repaired_bytes: {}",
-               replay_result.0,
-               replay_result.1);
+        info!("try_repair replay finished, repaired_logs: {}, repaired_bytes: {}",
+              replay_result.0,
+              replay_result.1);
 
         //所有未确认的提交日志已完成重播，则立即返回数据库修复成功
         let _ = self.0.tr_mgr.finish_replay().await?; //通知事务管理器，已完成重播
-        debug!("try_repair finish_replay returned, repaired_logs: {}, repaired_bytes: {}",
-               replay_result.0,
-               replay_result.1);
+        info!("try_repair finish_replay returned, repaired_logs: {}, repaired_bytes: {}",
+              replay_result.0,
+              replay_result.1);
 
         // for table in tables.lock().await.keys() {
         //     if let Some(KVDBTable::BtreeOrdTab(tab)) = self.get_table(table).await {
@@ -1169,10 +1169,10 @@ impl<
         let profile = QuickRepairProfileState::from_env();
         let pipeline_depth = self.0.quick_repair_file_pipeline_depth;
         let ahead_limit = pipeline_depth.checked_sub(1).unwrap_or(1);
-        debug!("try_quick_repair begin, accelerated_repair: {}, pipeline_depth: {}, ahead_limit: {}",
-               enable_accelerated_repair,
-               pipeline_depth,
-               ahead_limit);
+        info!("try_quick_repair begin, accelerated_repair: {}, pipeline_depth: {}, ahead_limit: {}",
+              enable_accelerated_repair,
+              pipeline_depth,
+              ahead_limit);
         profile.log(format!("start try_quick_repair: pipeline_depth={}, ahead_limit={}",
                             pipeline_depth,
                             ahead_limit));
@@ -1284,10 +1284,10 @@ impl<
                 .await;
             let replay_loader_elapsed_ms = replay_begin.elapsed().as_millis();
             if let Ok((repaired_logs, repaired_bytes)) = &replay_result {
-                debug!("try_quick_repair replay loader finished, repaired_logs: {}, repaired_bytes: {}, replay_loader_elapsed_ms: {}",
-                       repaired_logs,
-                       repaired_bytes,
-                       replay_loader_elapsed_ms);
+                info!("try_quick_repair replay loader finished, repaired_logs: {}, repaired_bytes: {}, replay_loader_elapsed_ms: {}",
+                      repaired_logs,
+                      repaired_bytes,
+                      replay_loader_elapsed_ms);
             }
 
             drop(batch_sender);
@@ -1317,10 +1317,10 @@ impl<
                     let finish_replay_begin = Instant::now();
                     let _ = self.0.tr_mgr.finish_replay().await?;
                     let finish_replay_elapsed_ms = finish_replay_begin.elapsed().as_millis();
-                    debug!("try_quick_repair finish_replay returned, repaired_logs: {}, repaired_bytes: {}, finish_replay_elapsed_ms: {}",
-                           replay_result.0,
-                           replay_result.1,
-                           finish_replay_elapsed_ms);
+                    info!("try_quick_repair finish_replay returned, repaired_logs: {}, repaired_bytes: {}, finish_replay_elapsed_ms: {}",
+                          replay_result.0,
+                          replay_result.1,
+                          finish_replay_elapsed_ms);
                     profile.on_finish(replay_loader_elapsed_ms,
                                       finish_replay_elapsed_ms,
                                       replay_result.0,
@@ -1493,10 +1493,10 @@ impl<
         let mut prepare_btree_elapsed_us = 0;
         let mut commit_elapsed_us = 0;
 
-        debug!("Quick repair file batch replay begin, file_batch: {}, records: {}, payload_bytes: {}",
-               file_index,
-               record_count,
-               payload_bytes);
+        info!("Quick repair file batch replay begin, file_batch: {}, records: {}, payload_bytes: {}",
+              file_index,
+              record_count,
+              payload_bytes);
 
         for (index, record) in batch.records.into_iter().enumerate() {
             let record_stats = self.quick_repair_replay_record(enable_accelerated_repair,
@@ -1522,19 +1522,19 @@ impl<
         let replay_elapsed_ms = replay_begin.elapsed().as_millis();
         let flush_begin = Instant::now();
         let table_names = tables.keys().cloned().collect::<Vec<_>>();
-        debug!("Quick repair file batch flush begin, file_batch: {}, touched_tables: {}, table_names: {}",
-               file_index,
-               table_names.len(),
-               repair_debug_table_names(&table_names));
+        info!("Quick repair file batch flush begin, file_batch: {}, touched_tables: {}, table_names: {}",
+              file_index,
+              table_names.len(),
+              repair_debug_table_names(&table_names));
         let table_count = self.quick_collect_repaired_tables(file_index, tables, profile).await?;
         let flush_elapsed_ms = flush_begin.elapsed().as_millis();
-        debug!("Quick repair file batch flush end, file_batch: {}, records: {}, payload_bytes: {}, touched_tables: {}, replay_elapsed_ms: {}, flush_elapsed_ms: {}",
-               file_index,
-               record_count,
-               payload_bytes,
-               table_count,
-               replay_elapsed_ms,
-               flush_elapsed_ms);
+        info!("Quick repair file batch flush end, file_batch: {}, records: {}, payload_bytes: {}, touched_tables: {}, replay_elapsed_ms: {}, flush_elapsed_ms: {}",
+              file_index,
+              record_count,
+              payload_bytes,
+              table_count,
+              replay_elapsed_ms,
+              flush_elapsed_ms);
 
         Ok(QuickRepairFileBatchReplayStats {
             file_index,
