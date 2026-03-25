@@ -326,7 +326,12 @@ where
     - 每个物理 `commit log` 文件批次的 replay 开始、flush 开始/结束
     - 每个物理 `commit log` 文件 replay 完成但尚未推进 `.bak`
     - `finish_replay` 开始/结束时的 buffered confirm / pending file 摘要
-16. 上述修复关键日志故意不打在逐事务、逐 key、逐次 `confirm_replay` 或 waits 入队等高频热路径上，避免在生产环境形成日志风暴；如果看到 `Repair db succeeded` / `Startup db succeeded` 之后仍持续出现“.bak promoted”日志，通常表示数据库已可提供服务，而 replay confirm 仍在后台正常追赶。
+16. 上述修复关键日志故意不打在逐事务、逐 key、逐次 `confirm_replay` 或 waits 入队等高频热路径上，避免在生产环境形成日志风暴；如果看到 `Repair db succeeded` / `Startup db succeeded` 之后仍持续出现“.bak promoted”日志，通常表示数据库已可提供服务，而 replay confirm 仍在后台追赶。
+17. 如果出现以下组合现象：
+    - `finish_replay begin / end` 已经打印
+    - `drained_confirms` 很大
+    - 但长时间没有任何 `Replay commit log file confirmed and promoted to .bak`
+    那就不应再简单判断为“confirm 只是慢”，而更应怀疑 checkpoint / `only_reads` 队列的头阻塞或推进链路卡点。当前版本已经为此补充了低频 `info` 诊断日志，会在 replay checkpoint 归零和 `finish_replay` 返回后给出 `only_reads` 队头摘要。
 
 ## 相关模块
 
@@ -351,4 +356,4 @@ where
 - 当前剩余主热点仍集中在 `BtreeOrdTab collect_waits(...)` 的 `apply + redb_commit`；在不改变 `try_repair`、不改变正常事务语义、并把改动限制在 `pi_db/pi_store` 内的前提下，内部可控优化空间已经明显收窄。
 - 当前线上已确认：startup 成功后历史 `commit log` 的 `.bak` 推进可能略晚于数据 replay/flush 完成；这更像是共享 replay confirm 收尾滞后，而不是 quick repair 数据修复失败。
 - 当前仓库已包含稳定复现测试 `test_repair_confirm_lag_only_delays_bak_promotion_after_startup`，用于验证“数据已修好但 `.bak` 稍后补上”的窗口，并支撑后续修复前后对照。
-- 当前还额外提供了低频修复关键 `info` 日志，可直接配合 per-file `.bak` info 日志一起在线上判定：是“数据已修好、confirm 正在追赶”，还是某个具体修复阶段真的阻塞。
+- 当前还额外提供了低频修复关键 `info` 日志，可直接配合 per-file `.bak` info 日志一起在线上判定：是“数据已修好、confirm 正在追赶”，还是 checkpoint / `only_reads` 队列推进发生了头阻塞。
