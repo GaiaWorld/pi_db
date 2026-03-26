@@ -331,7 +331,15 @@ where
     - `finish_replay begin / end` 已经打印
     - `drained_confirms` 很大
     - 但长时间没有任何 `Replay commit log file confirmed and promoted to .bak`
-    那就不应再简单判断为“confirm 只是慢”，而更应怀疑 checkpoint / `only_reads` 队列的头阻塞或推进链路卡点。当前版本已经为此补充了低频 `info` 诊断日志，会在 replay checkpoint 归零和 `finish_replay` 返回后给出 `only_reads` 队头摘要。
+    那就不应再简单判断为“confirm 只是慢”，而更应怀疑 checkpoint / `only_reads` 队列的头阻塞或推进链路卡点。当前版本已经为此补充了低频 `info` 诊断日志，会在 replay checkpoint 归零和 `finish_replay` 返回后给出：
+    - `only_reads` 队头摘要
+    - replay 首个 `only_read` 文件入队日志
+    - 队头文件对应的 `head_counter_value`
+    - 如果出现“队头 bool 仍为 false，但 `head_remaining_check_points = 0`”的异常，还会额外输出 `stalled head detail`
+18. 当前已经在线上确认并修复过一种 `try_quick_repair` 专属的 `.bak` 卡死模式：如果 replay 文件 checkpoint 在 loader 解析完成时就提前推进，而不是在 worker 真正完成当前文件批次 `replay + flush` 后再推进，那么首个 replay 文件可能在进入 `only_reads` 队列时 `counter = 0`，导致后续事务整体被注册到下一个物理文件的 checkpoint 上，最终表现为：
+    - 首文件永远 `finished = false`
+    - 后续文件虽然都已完成确认，但被队头连续阻塞，`.bak` 一个都不推进
+    该问题只影响 `try_quick_repair` 的“按文件批次缓冲 + worker 延后 replay”流水线，不影响 `try_repair` 和正常事务路径。当前版本已经把 replay 文件 checkpoint 的推进改到 worker 真正完成当前文件批次 `replay + flush` 之后，并增加了多文件 `.bak` 最终收敛回归测试。
 
 ## 相关模块
 

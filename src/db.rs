@@ -1536,6 +1536,13 @@ impl<
               replay_elapsed_ms,
               flush_elapsed_ms);
 
+        if let Err(e) = self.0.tr_mgr.advance_replay_check_point().await {
+            return Err(Error::new(ErrorKind::Other,
+                                  format!("Quick repair advance replay check point failed, file_batch: {}, reason: {:?}",
+                                          file_index,
+                                          e)));
+        }
+
         Ok(QuickRepairFileBatchReplayStats {
             file_index,
             record_count,

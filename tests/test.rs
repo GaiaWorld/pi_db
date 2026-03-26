@@ -7798,6 +7798,51 @@ fn test_repair_confirm_lag_only_delays_bak_promotion_after_startup() {
     assert_eq!(try_repair_snapshot, try_quick_repair_snapshot);
 }
 
+// 验证多文件 quick repair 在没有人工延迟 replay confirm 的情况下，
+// 最终必须把历史活跃 commit log 推进成 `.bak`：
+// 1. 使用多物理 commit log 的真实 crash fixture；
+// 2. 执行 try_quick_repair；
+// 3. 允许 startup 刚返回时仍存在短暂活跃文件窗口；
+// 4. 但在一个很短的收敛窗口内，活跃 commit log 必须最终收敛到 1。
+// 该用例用于防止“首个 replay 文件没有正确注册到自己的 checkpoint，导致整段 `.bak` 永远卡死”的回归。
+#[test]
+fn test_try_quick_repair_multi_file_eventually_promotes_replayed_logs_to_bak() {
+    let _guard = quick_repair_test_guard();
+
+    if let Some(root) = quick_repair_child_root("quick_multi_file_bak_promotion_fixture") {
+        generate_quick_repair_multi_file_fixture(&root);
+        return;
+    }
+
+    let base_root = quick_repair_tmp_dir("multi_file_bak_promotion/source");
+    let try_quick_repair_root = quick_repair_tmp_dir("multi_file_bak_promotion/try_quick_repair");
+
+    spawn_quick_repair_fixture("test_try_quick_repair_multi_file_eventually_promotes_replayed_logs_to_bak",
+                               "quick_multi_file_bak_promotion_fixture",
+                               &base_root);
+
+    assert!(count_active_commit_log_files(&base_root) > 1,
+            "multi-file bak promotion fixture should contain more than one active commit log file, root: {:?}",
+            base_root);
+
+    remove_dir_if_exists(&try_quick_repair_root);
+    copy_dir_all(&base_root, &try_quick_repair_root);
+
+    let (snapshot,
+         _active_immediate,
+         active_settled) =
+        startup_db_and_collect_quick_repair_bak_lag_state(&try_quick_repair_root,
+                                                          DBStartupRepairMode::TryQuickRepair,
+                                                          0,
+                                                          5000);
+
+    assert_eq!(snapshot, expected_quick_repair_multi_file_snapshot());
+    assert_eq!(active_settled, 1,
+               "try_quick_repair should eventually promote replayed multi-file commit logs to .bak, root: {:?}, active_settled: {}",
+               try_quick_repair_root,
+               active_settled);
+}
+
 // 验证 quick repair 在“部分文件已 flush，但整体尚未 finish_replay”后再次启动时仍保持幂等：
 // 1. 先生成多物理 commit log 文件的真实 crash fixture；
 // 2. 子进程首次 quick repair 在成功 flush 指定数量的文件后直接退出，不执行 finish_replay；
