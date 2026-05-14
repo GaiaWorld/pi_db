@@ -108,7 +108,7 @@ pi_sinfo = "~0.5"
 - `KVDBManagerBuilder::new(rt, tr_mgr, path)`
   创建数据库构建器。`path` 是数据库根目录；提交日志目录通常放在相邻的 `.commit_log` 目录。
 - `startup(enable_accelerated_repair)`
-  按默认修复模式启动数据库。当前默认走 `TryQuickRepair`。
+  按默认修复模式启动数据库。当前默认走 `TryRepair`。
 - `startup_by_repair(enable_accelerated_repair, repair_mode)`
   显式选择启动修复模式，适合做兼容性验证和性能对比。
 - `startup_with_listener(...)`
@@ -121,7 +121,7 @@ pi_sinfo = "~0.5"
 - `TryRepair`
   旧修复流程，兼容多年线上逻辑，适合作为基线校验。
 - `TryQuickRepair`
-  新修复流程，默认启用；只快速恢复持久化表，不参与内存表恢复，并在 replay 结束后立即 flush 持久化表。
+  新修复流程，可通过 `startup_by_repair` 或 `startup_with_listener_by_repair` 显式启用；只快速恢复持久化表，不参与内存表恢复，并在 replay 结束后立即 flush 持久化表。
   返回值中的第一个 `usize` 表示本次启动修复批次实际重放的未确认 `commit log` 条数，也就是这次批次修复的事务数；第二个 `usize` 表示这次批次重放的提交日志总字节数。
 
 ### 数据库管理器
@@ -305,7 +305,7 @@ where
 1. `pi_db` 依赖异步运行时；如果在测试或独立工具里自行构建运行时，建议先启动全局时间循环。
 2. `MemOrdTab` 是纯内存表，进程重启后数据会丢失，因此 quick repair 不会尝试恢复内存表内容。
 3. 事务提交必须遵循 `prepare_modified -> commit_modified` 的顺序；只拿到 `prepare_output` 但没有执行提交时，启动恢复会依赖提交日志补齐提交。
-4. `TryQuickRepair` 默认启用，但它并没有改变正常事务路径的提交流程，只是在启动恢复阶段减少逐 key 普通写路径的开销。
+4. 默认启动入口当前使用 `TryRepair`；`TryQuickRepair` 需要显式启用，并且不会改变正常事务路径的提交流程，只是在启动恢复阶段减少逐 key 普通写路径的开销。
 5. `LogTableInspector` 返回的是物理日志顺序，不是最终最新值；用它做断言时必须自行合并。
 6. 如果需要对大表做主动整理，应先调用 `ready_collect_table`，再调用 `collect_table`。
 7. quick repair 集成测试的临时目录现在统一放在 `./tmp_quick_repair/` 下；如需清理，可执行 `bash tools/cleanup_quick_repair_dirs.sh current`，如需连历史散落目录一起清理，可执行 `bash tools/cleanup_quick_repair_dirs.sh all`。
@@ -354,8 +354,8 @@ where
 
 ## 当前修复相关状态
 
-- 默认启动入口当前走 `TryQuickRepair`。
-- `TryRepair` 仍完整保留，可用于可靠性基线对比。
+- 默认启动入口当前走 `TryRepair`。
+- `TryQuickRepair` 仍完整保留，可通过显式修复模式用于性能对比或灰度验证。
 - quick repair 会跳过内存表，只修复持久化表。
 - quick repair replay 完成后会对本次触达的持久化表执行一次立即 flush，避免继续等待默认后台整理周期。
 - 一次 quick repair 启动修复批次处理多少事务，取决于本次启动时扫描到多少条未确认 `commit log`；不是固定数量。

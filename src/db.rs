@@ -213,6 +213,21 @@ pub enum DBStartupRepairMode {
     TryQuickRepair, //快速修复流程，只装载持久化表动作，并在 replay 后立即 flush 受影响的持久化表
 }
 
+///
+/// 数据库默认启动修复模式。
+///
+const DEFAULT_STARTUP_REPAIR_MODE: DBStartupRepairMode = DBStartupRepairMode::TryRepair;
+
+#[cfg(test)]
+mod db_startup_repair_mode_tests {
+    use super::*;
+
+    #[test]
+    fn default_startup_repair_mode_is_try_repair() {
+        assert_eq!(DEFAULT_STARTUP_REPAIR_MODE, DBStartupRepairMode::TryRepair);
+    }
+}
+
 /*
 * 键值对数据库管理器构建器同步方法
 */
@@ -258,11 +273,11 @@ impl<
     Log: AsyncCommitLog<C = C, Cid = Guid>,
 > KVDBManagerBuilder<C, Log> {
     /// 异步启动键值对数据库，并返回键值对数据库的管理器
-    /// 默认使用 `TryQuickRepair`，启动时如果发现未确认的提交日志，会优先走快速修复路径。
+    /// 默认使用 `TryRepair`，启动时如果发现未确认的提交日志，会走兼容旧流程的修复路径。
     pub async fn startup(self, enable_accelerated_repair: bool) -> IOResult<KVDBManager<C, Log>> {
         self
             .startup_by_repair(enable_accelerated_repair,
-                               DBStartupRepairMode::TryQuickRepair)
+                               DEFAULT_STARTUP_REPAIR_MODE)
             .await
     }
 
@@ -279,7 +294,7 @@ impl<
     }
 
     /// 异步启动指定监听器的键值对数据库，并返回键值对数据库的管理器
-    /// 默认使用 `TryQuickRepair`，同时保留数据库事件监听能力。
+    /// 默认使用 `TryRepair`，同时保留数据库事件监听能力。
     pub async fn startup_with_listener<F>(
         self,
         enable_accelerated_repair: bool,
@@ -289,7 +304,7 @@ impl<
     {
         self
             .startup_with_listener_by_repair(enable_accelerated_repair,
-                                             DBStartupRepairMode::TryQuickRepair,
+                                             DEFAULT_STARTUP_REPAIR_MODE,
                                              db_event_listener)
             .await
     }
