@@ -1,40 +1,35 @@
-use std::convert::TryInto;
 use std::fmt::Debug;
-use std::io::{Error, ErrorKind, Result};
+use std::convert::TryInto;
 use std::path::{Path, PathBuf};
-use std::sync::{
-    atomic::{AtomicIsize, Ordering},
-    Arc,
-};
+use std::io::{Error, Result, ErrorKind};
+use std::sync::{Arc,
+                atomic::{AtomicIsize, Ordering}};
 
-use crossbeam_channel::{bounded, Receiver, Sender};
+use crossbeam_channel::{Sender, Receiver, bounded};
 
-use pi_async_rt::rt::{multi_thread::MultiTaskRuntime, AsyncRuntime};
-use pi_async_transaction::AsyncCommitLog;
 use pi_atom::Atom;
+use pi_async_rt::rt::{AsyncRuntime, multi_thread::MultiTaskRuntime};
+use pi_async_transaction::AsyncCommitLog;
+use pi_store::{commit_logger::{CommitLoggerExt, CommitLogger},
+               log_store::log_file::{PairLoader, LogMethod, LogFile}};
 use pi_guid::Guid;
-use pi_store::{
-    commit_logger::{CommitLogger, CommitLoggerExt},
-    log_store::log_file::{LogFile, LogMethod, PairLoader},
-};
 
-use crate::{
-    db::{binary_to_table, DEFAULT_DB_TABLES_META_DIR},
-    tables::{meta_table::MetaTable, KVTable},
-    KVTableMeta,
-};
+use crate::{KVTableMeta,
+            db::{DEFAULT_DB_TABLES_META_DIR, binary_to_table},
+            tables::{KVTable,
+                     meta_table::MetaTable}};
 
 ///
 /// 提交日志侦听器
 ///
 pub struct CommitLogInspector {
-    rt: MultiTaskRuntime<()>,       //运行时
-    logger: CommitLogger,           //提交日志
-    status: Arc<AtomicIsize>,       //侦听状态
-    request_sender: Sender<()>,     //请求发送器
-    request_receiver: Receiver<()>, //请求接收器
-    response_sender: Sender<Option<(Guid, Guid, Atom, bool, Vec<u8>, Vec<u8>)>>, //响应发送器
-    response_receiver: Receiver<Option<(Guid, Guid, Atom, bool, Vec<u8>, Vec<u8>)>>, //响应接收器
+    rt:                 MultiTaskRuntime<()>,                                           //运行时
+    logger:             CommitLogger,                                                   //提交日志
+    status:             Arc<AtomicIsize>,                                               //侦听状态
+    request_sender:     Sender<()>,                                                     //请求发送器
+    request_receiver:   Receiver<()>,                                                   //请求接收器
+    response_sender:    Sender<Option<(Guid, Guid, Atom, bool, Vec<u8>, Vec<u8>)>>,     //响应发送器
+    response_receiver:  Receiver<Option<(Guid, Guid, Atom, bool, Vec<u8>, Vec<u8>)>>,   //响应接收器
 }
 
 unsafe impl Send for CommitLogInspector {}
@@ -59,18 +54,15 @@ impl CommitLogInspector {
 
     /// 开始侦听
     pub fn begin(&self) -> bool {
-        match self
-            .status
-            .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
-        {
+        match self.status.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed) {
             Err(_) => {
                 //不允许正在侦听时，开始侦听
                 return false;
-            }
+            },
             Ok(_) => {
                 //侦听未开始，则开始侦听
                 ()
-            }
+            },
         }
 
         let request_receiver = self.request_receiver.clone();
@@ -89,10 +81,7 @@ impl CommitLogInspector {
             while offset < bytes_len {
                 //获取表名、操作的键值对数量和新的日志缓冲区偏移
                 let (table, kvs_len, new_offset) =
-                    <MetaTable<usize, CommitLogger> as KVTable>::get_init_table_prepare_output(
-                        &prepare_output,
-                        offset,
-                    );
+                    <MetaTable<usize, CommitLogger> as KVTable>::get_init_table_prepare_output(&prepare_output, offset);
 
                 //获取操作的表键值列表和新的日志缓冲区偏移
                 let (writes, new_offset)
@@ -108,14 +97,8 @@ impl CommitLogInspector {
                             let table_name = match binary_to_table(&write.key) {
                                 Err(e) => {
                                     //反序列化表名失败
-                                    return Err(Error::new(
-                                        ErrorKind::Other,
-                                        format!(
-                                            "From binary to table name failed, reason: {:?}",
-                                            e
-                                        ),
-                                    ));
-                                }
+                                    return Err(Error::new(ErrorKind::Other, format!("From binary to table name failed, reason: {:?}", e)));
+                                },
                                 Ok(table_name) => {
                                     //反序列化表名成功
                                     table_name
@@ -124,14 +107,12 @@ impl CommitLogInspector {
                             let table_meta = KVTableMeta::from(value);
 
                             //响应元信息表的插入日志
-                            let _ = response_sender.send(Some((
-                                transaciton_uid.clone(),
-                                commit_uid.clone(),
-                                meta_table_name.clone(),
-                                true,
-                                table_name.as_str().as_bytes().to_vec(),
-                                format!("{:?}", table_meta).as_bytes().to_vec(),
-                            )));
+                            let _ = response_sender.send(Some((transaciton_uid.clone(),
+                                                               commit_uid.clone(),
+                                                               meta_table_name.clone(),
+                                                               true,
+                                                               table_name.as_str().as_bytes().to_vec(),
+                                                               format!("{:?}", table_meta).as_bytes().to_vec())));
                         } else {
                             //无值，则删除表
                             pause(&request_receiver)?;
@@ -139,14 +120,12 @@ impl CommitLogInspector {
                             let table_name = Atom::from(write.key.as_ref());
 
                             //响应元信息表的删除日志
-                            let _ = response_sender.send(Some((
-                                transaciton_uid.clone(),
-                                commit_uid.clone(),
-                                meta_table_name.clone(),
-                                false,
-                                table_name.as_str().as_bytes().to_vec(),
-                                vec![0],
-                            )));
+                            let _ = response_sender.send(Some((transaciton_uid.clone(),
+                                                               commit_uid.clone(),
+                                                               meta_table_name.clone(),
+                                                               false,
+                                                               table_name.as_str().as_bytes().to_vec(),
+                                                               vec![0])));
                         }
                     }
                 } else {
@@ -157,26 +136,22 @@ impl CommitLogInspector {
                             pause(&request_receiver)?;
 
                             //响应用户表的插入日志
-                            let _ = response_sender.send(Some((
-                                transaciton_uid.clone(),
-                                commit_uid.clone(),
-                                write.table,
-                                true,
-                                write.key.as_ref().to_vec(),
-                                write.value.unwrap().as_ref().to_vec(),
-                            )));
+                            let _ = response_sender.send(Some((transaciton_uid.clone(),
+                                                               commit_uid.clone(),
+                                                               write.table,
+                                                               true,
+                                                               write.key.as_ref().to_vec(),
+                                                               write.value.unwrap().as_ref().to_vec())));
                         } else {
                             //无值，则执行删除操作
                             pause(&request_receiver)?;
 
-                            let _ = response_sender.send(Some((
-                                transaciton_uid.clone(),
-                                commit_uid.clone(),
-                                write.table,
-                                false,
-                                write.key.as_ref().to_vec(),
-                                vec![0],
-                            )));
+                            let _ = response_sender.send(Some((transaciton_uid.clone(),
+                                                               commit_uid.clone(),
+                                                               write.table,
+                                                               false,
+                                                               write.key.as_ref().to_vec(),
+                                                               vec![0])));
                         }
                     }
                 }
@@ -196,15 +171,18 @@ impl CommitLogInspector {
             let _ = logger.start_replay(Arc::new(inspect_callback)).await;
 
             //侦听已结束
-            let _ = status.compare_exchange(1, 0, Ordering::Acquire, Ordering::Relaxed);
+            let _ = status.compare_exchange(1,
+                                            0,
+                                            Ordering::Acquire,
+                                            Ordering::Relaxed);
             match request_receiver.recv() {
                 Err(e) => {
                     panic!("Inspect next failed, reason: {:?}", e);
-                }
+                },
                 Ok(_) => {
                     //响应侦听已结束
                     let _ = response_sender.send(None);
-                }
+                },
             }
         });
 
@@ -228,50 +206,41 @@ impl CommitLogInspector {
             Err(_) => {
                 //侦听响应错误，则立即返回侦听结束
                 None
-            }
+            },
             Ok(result) => {
                 //侦听响应成功
                 if let Some((tid, cid, table, method, key, value)) = result {
-                    Some((
-                        tid.0.to_string(),
-                        cid.0.to_string(),
-                        table.as_str().to_string(),
-                        method,
-                        key,
-                        value,
-                    ))
+                    Some((tid.0.to_string(), cid.0.to_string(), table.as_str().to_string(), method, key, value))
                 } else {
                     None
                 }
-            }
+            },
         }
     }
 
     /// 注册回调，并开始侦听
-    pub fn begin_with_callback(
-        &self,
-        callback: impl Fn(Option<(Guid, Guid, String, LogMethod, u64, Vec<u8>, Vec<u8>)>)
-            + Send
-            + Sync
-            + 'static,
-    ) -> bool {
-        match self
-            .status
-            .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
-        {
+    pub fn begin_with_callback(&self,
+                               callback: impl Fn(Option<(Guid, Guid, String, LogMethod, u64, Vec<u8>, Vec<u8>)>) + Send + Sync + 'static)
+        -> bool
+    {
+        match self.status.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed) {
             Err(_) => {
                 //不允许正在侦听时，开始侦听
                 return false;
-            }
+            },
             Ok(_) => {
                 //侦听未开始，则开始侦听
                 ()
-            }
+            },
         }
 
-        let inspect_callback =
-            move |response: Option<(Guid, LogMethod, u64, Vec<u8>)>| -> Result<()> {
-                let (commit_uid, method, time, prepare_output) = if let Some(response) = response {
+        let inspect_callback = move |response: Option<(Guid, LogMethod, u64, Vec<u8>)>| -> Result<()>
+            {
+                let (commit_uid,
+                    method,
+                    time,
+                    prepare_output) = if let Some(response) = response
+                {
                     response
                 } else {
                     //侦听已完成
@@ -291,10 +260,7 @@ impl CommitLogInspector {
                 while offset < bytes_len {
                     //获取表名、操作的键值对数量和新的日志缓冲区偏移
                     let (table, kvs_len, new_offset) =
-                        <MetaTable<usize, CommitLogger> as KVTable>::get_init_table_prepare_output(
-                            &prepare_output,
-                            offset,
-                        );
+                        <MetaTable<usize, CommitLogger> as KVTable>::get_init_table_prepare_output(&prepare_output, offset);
 
                     //获取操作的表键值列表和新的日志缓冲区偏移
                     let (writes, new_offset)
@@ -308,14 +274,10 @@ impl CommitLogInspector {
                                 let table_name = match binary_to_table(&write.key) {
                                     Err(e) => {
                                         //反序列化表名失败
-                                        return Err(Error::new(
-                                            ErrorKind::Other,
-                                            format!(
-                                                "From binary to table name failed, reason: {:?}",
-                                                e
-                                            ),
-                                        ));
-                                    }
+                                        return Err(Error::new(ErrorKind::Other,
+                                                              format!("From binary to table name failed, reason: {:?}",
+                                                                      e)));
+                                    },
                                     Ok(table_name) => {
                                         //反序列化表名成功
                                         table_name
@@ -324,30 +286,26 @@ impl CommitLogInspector {
                                 let table_meta = KVTableMeta::from(value);
 
                                 //回调元信息表的插入日志
-                                let response = Some((
-                                    transaciton_uid.clone(),
-                                    commit_uid.clone(),
-                                    meta_table_name.as_str().to_string(),
-                                    method,
-                                    time,
-                                    table_name.as_str().as_bytes().to_vec(),
-                                    format!("{:?}", table_meta).as_bytes().to_vec(),
-                                ));
+                                let response = Some((transaciton_uid.clone(),
+                                                     commit_uid.clone(),
+                                                     meta_table_name.as_str().to_string(),
+                                                     method,
+                                                     time,
+                                                     table_name.as_str().as_bytes().to_vec(),
+                                                     format!("{:?}", table_meta).as_bytes().to_vec()));
                                 callback(response);
                             } else {
                                 //无值，则删除表
                                 let table_name = Atom::from(write.key.as_ref());
 
                                 //回调元信息表的删除日志
-                                let response = Some((
-                                    transaciton_uid.clone(),
-                                    commit_uid.clone(),
-                                    meta_table_name.as_str().to_string(),
-                                    method,
-                                    time,
-                                    table_name.as_str().as_bytes().to_vec(),
-                                    vec![0],
-                                ));
+                                let response = Some((transaciton_uid.clone(),
+                                                     commit_uid.clone(),
+                                                     meta_table_name.as_str().to_string(),
+                                                     method,
+                                                     time,
+                                                     table_name.as_str().as_bytes().to_vec(),
+                                                     vec![0]));
                                 callback(response);
                             }
                         }
@@ -356,27 +314,23 @@ impl CommitLogInspector {
                         for write in writes {
                             if write.exist_value() {
                                 //有值则回调用户表的插入日志
-                                let response = Some((
-                                    transaciton_uid.clone(),
-                                    commit_uid.clone(),
-                                    write.table.as_str().to_string(),
-                                    method,
-                                    time,
-                                    write.key.as_ref().to_vec(),
-                                    write.value.unwrap().as_ref().to_vec(),
-                                ));
+                                let response = Some((transaciton_uid.clone(),
+                                                     commit_uid.clone(),
+                                                     write.table.as_str().to_string(),
+                                                     method,
+                                                     time,
+                                                     write.key.as_ref().to_vec(),
+                                                     write.value.unwrap().as_ref().to_vec()));
                                 callback(response);
                             } else {
                                 //无值，则回调用户表的删除日志
-                                let response = Some((
-                                    transaciton_uid.clone(),
-                                    commit_uid.clone(),
-                                    write.table.as_str().to_string(),
-                                    method,
-                                    time,
-                                    write.key.as_ref().to_vec(),
-                                    vec![0],
-                                ));
+                                let response = Some((transaciton_uid.clone(),
+                                                     commit_uid.clone(),
+                                                     write.table.as_str().to_string(),
+                                                     method,
+                                                     time,
+                                                     write.key.as_ref().to_vec(),
+                                                     vec![0]));
                                 callback(response);
                             }
                         }
@@ -395,7 +349,10 @@ impl CommitLogInspector {
             let _ = logger.start_replay_ext(Arc::new(inspect_callback)).await;
 
             //侦听已结束
-            let _ = status.compare_exchange(1, 0, Ordering::Acquire, Ordering::Relaxed);
+            let _ = status.compare_exchange(1,
+                                            0,
+                                            Ordering::Acquire,
+                                            Ordering::Relaxed);
         });
 
         true
@@ -406,13 +363,13 @@ impl CommitLogInspector {
 /// 日志表侦听器
 ///
 pub struct LogTableInspector {
-    rt: MultiTaskRuntime<()>,                                          //运行时
-    log_file: LogFile,                                                 //日志文件
-    status: Arc<AtomicIsize>,                                          //侦听状态
-    request_sender: Sender<()>,                                        //请求发送器
-    request_receiver: Receiver<()>,                                    //请求接收器
-    response_sender: Sender<Option<(String, bool, Vec<u8>, Vec<u8>)>>, //响应发送器
-    response_receiver: Receiver<Option<(String, bool, Vec<u8>, Vec<u8>)>>, //响应接收器
+    rt:                 MultiTaskRuntime<()>,                               //运行时
+    log_file:           LogFile,                                            //日志文件
+    status:             Arc<AtomicIsize>,                                   //侦听状态
+    request_sender:     Sender<()>,                                         //请求发送器
+    request_receiver:   Receiver<()>,                                       //请求接收器
+    response_sender:    Sender<Option<(String, bool, Vec<u8>, Vec<u8>)>>,   //响应发送器
+    response_receiver:  Receiver<Option<(String, bool, Vec<u8>, Vec<u8>)>>, //响应接收器
 }
 
 unsafe impl Send for LogTableInspector {}
@@ -420,30 +377,21 @@ unsafe impl Sync for LogTableInspector {}
 
 impl LogTableInspector {
     /// 构建日志表侦听器
-    pub fn new<P: AsRef<Path> + Debug + Clone + Send + Sync + 'static>(
-        rt: MultiTaskRuntime<()>,
-        table_path: P,
-    ) -> Result<Self> {
+    pub fn new<P: AsRef<Path> + Debug + Clone + Send + Sync + 'static>(rt: MultiTaskRuntime<()>,
+                                                                       table_path: P) -> Result<Self> {
         let rt_copy = rt.clone();
         let table_path_copy = table_path.clone();
         let (sender, receiver) = bounded(1);
         let _ = rt.spawn(async move {
-            match LogFile::open(
-                rt_copy,
-                table_path_copy,
-                2 * 1024 * 1024,
-                512 * 1024 * 1024,
-                None,
-            )
-            .await
-            {
+            match LogFile::open(rt_copy,
+                                table_path_copy,
+                                2 * 1024 * 1024,
+                                512 * 1024 * 1024,
+                                None).await {
                 Err(e) => {
                     //打开日志文件失败，则立即抛出异常
-                    let _ = sender.send(Err(format!(
-                        "Open log ordered table failed, reason: {:?}",
-                        e
-                    )));
-                }
+                    let _ = sender.send(Err(format!("Open log ordered table failed, reason: {:?}", e)));
+                },
                 Ok(log_file) => {
                     let _ = sender.send(Ok(log_file));
                 }
@@ -452,26 +400,18 @@ impl LogTableInspector {
 
         let log_file = match receiver.recv() {
             Err(e) => {
-                return Err(Error::new(
-                    ErrorKind::Other,
-                    format!(
-                        "Create LogTableInspector failed, path: {:?}, reason: {:?}",
-                        e, table_path
-                    ),
-                ));
-            }
-            Ok(result) => match result {
-                Err(e) => {
-                    return Err(Error::new(
-                        ErrorKind::Other,
-                        format!(
-                            "Create LogTableInspector failed, path: {:?}, reason: {:?}",
-                            e, table_path
-                        ),
-                    ));
-                }
-                Ok(log_file) => log_file,
+                return Err(Error::new(ErrorKind::Other, format!("Create LogTableInspector failed, path: {:?}, reason: {:?}", e, table_path)));
             },
+            Ok(result) => {
+                match result {
+                    Err(e) => {
+                        return Err(Error::new(ErrorKind::Other, format!("Create LogTableInspector failed, path: {:?}, reason: {:?}", e, table_path)));
+                    },
+                    Ok(log_file) => {
+                        log_file
+                    }
+                }
+            }
         };
 
         let (request_sender, request_receiver) = bounded(1);
@@ -490,18 +430,15 @@ impl LogTableInspector {
 
     /// 开始侦听
     pub fn begin(&self) -> bool {
-        match self
-            .status
-            .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
-        {
+        match self.status.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed) {
             Err(_) => {
                 //不允许正在侦听时，开始侦听
                 return false;
-            }
+            },
             Ok(_) => {
                 //侦听未开始，则开始侦听
                 ()
-            }
+            },
         }
 
         let log_file = self.log_file.clone();
@@ -514,25 +451,29 @@ impl LogTableInspector {
                 response_sender: response_sender.clone(),
             };
 
-            if let Err(e) = log_file.load(&mut loader, None, 8192, true).await {
+            if let Err(e) = log_file.load(&mut loader,
+                                          None,
+                                          8192,
+                                          true).await {
                 //加载指定的日志文件失败，则立即抛出异常
-                panic!(
-                    "Load log ordered table failed, path: {:?}, reason: {:?}",
-                    log_file.path(),
-                    e
-                );
+                panic!("Load log ordered table failed, path: {:?}, reason: {:?}",
+                       log_file.path(),
+                       e);
             }
 
             //侦听已结束
-            let _ = status.compare_exchange(1, 0, Ordering::Acquire, Ordering::Relaxed);
+            let _ = status.compare_exchange(1,
+                                            0,
+                                            Ordering::Acquire,
+                                            Ordering::Relaxed);
             match request_receiver.recv() {
                 Err(_e) => {
                     let _ = response_sender.send(None);
-                }
+                },
                 Ok(_) => {
                     //响应侦听已结束
                     let _ = response_sender.send(None);
-                }
+                },
             }
         });
 
@@ -556,7 +497,7 @@ impl LogTableInspector {
             Err(_) => {
                 //侦听响应错误，则立即返回侦听结束
                 None
-            }
+            },
             Ok(result) => {
                 //侦听响应成功
                 if let Some((file, method, key, value)) = result {
@@ -564,15 +505,15 @@ impl LogTableInspector {
                 } else {
                     None
                 }
-            }
+            },
         }
     }
 }
 
 // 日志表的加载器
 struct LogTableLoader {
-    request_receiver: Receiver<()>, //请求接收器
-    response_sender: Sender<Option<(String, bool, Vec<u8>, Vec<u8>)>>, //响应发送器
+    request_receiver:   Receiver<()>,                                       //请求接收器
+    response_sender:    Sender<Option<(String, bool, Vec<u8>, Vec<u8>)>>,   //响应发送器
 }
 
 impl PairLoader for LogTableLoader {
@@ -580,13 +521,11 @@ impl PairLoader for LogTableLoader {
         true
     }
 
-    fn load(
-        &mut self,
-        log_file: Option<&PathBuf>,
-        _method: LogMethod,
-        key: Vec<u8>,
-        value: Option<Vec<u8>>,
-    ) {
+    fn load(&mut self,
+            log_file: Option<&PathBuf>,
+            _method: LogMethod,
+            key: Vec<u8>,
+            value: Option<Vec<u8>>) {
         if let Some(value) = value {
             //插入或更新指定关键字的值
             if let Err(_) = pause(&self.request_receiver) {
@@ -600,7 +539,10 @@ impl PairLoader for LogTableLoader {
             };
 
             //响应日志表的插入日志
-            let _ = self.response_sender.send(Some((path, true, key, value)));
+            let _ = self.response_sender.send(Some((path,
+                                                    true,
+                                                    key,
+                                                    value)));
         } else {
             if let Err(_) = pause(&self.request_receiver) {
                 let _ = self.response_sender.send(None);
@@ -613,7 +555,10 @@ impl PairLoader for LogTableLoader {
             };
 
             //响应日志表的删除日志
-            let _ = self.response_sender.send(Some((path, false, key, vec![0])));
+            let _ = self.response_sender.send(Some((path,
+                                                    false,
+                                                    key,
+                                                    vec![0])));
         }
     }
 }
@@ -622,13 +567,12 @@ impl PairLoader for LogTableLoader {
 #[inline]
 fn pause(receiver: &Receiver<()>) -> Result<()> {
     match receiver.recv() {
-        Err(e) => Err(Error::new(
-            ErrorKind::ConnectionAborted,
-            format!("Inspect next failed, reason: {:?}", e),
-        )),
+        Err(e) => {
+            Err(Error::new(ErrorKind::ConnectionAborted, format!("Inspect next failed, reason: {:?}", e)))
+        },
         Ok(_) => {
             //接收到侦听下一个日志的请求
             Ok(())
-        }
+        },
     }
 }

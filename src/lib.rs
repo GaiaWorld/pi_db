@@ -4,29 +4,29 @@
 #![feature(unboxed_closures)]
 #![feature(min_specialization)]
 
-use std::cmp::Ordering as CmpOrdering;
+use std::ops::Deref;
 use std::fmt::Debug;
 use std::hash::Hash;
-use std::ops::Deref;
-use std::sync::{
-    atomic::{AtomicUsize, Ordering},
-    Arc,
-};
+use std::cmp::Ordering as CmpOrdering;
+use std::sync::{Arc,
+                atomic::{AtomicUsize, Ordering}};
 
+use futures::{future::BoxFuture,
+              stream::BoxStream};
 use bytes::{Buf, BufMut};
-use futures::{future::BoxFuture, stream::BoxStream};
 use log::warn;
 
-use pi_async_rt::rt::{multi_thread::MultiTaskRuntime, AsyncRuntime};
-use pi_async_transaction::{AsyncCommitLog, ErrorLevel, TransactionError};
-use pi_bon::{Decode, Encode, ReadBonErr, ReadBuffer, WriteBuffer};
+use pi_bon::{WriteBuffer, ReadBuffer, Encode, Decode, ReadBonErr};
+use pi_sinfo::EnumType;
+use pi_async_rt::rt::{AsyncRuntime,
+                      multi_thread::MultiTaskRuntime};
+use pi_async_transaction::{AsyncCommitLog, TransactionError, ErrorLevel};
 use pi_guid::Guid;
 use pi_ordmap::asbtree::TreeByteSize;
-use pi_sinfo::EnumType;
 
 pub mod db;
-pub mod inspector;
 pub mod tables;
+pub mod inspector;
 pub mod utils;
 
 ///
@@ -91,16 +91,14 @@ impl From<KVTableMeta> for Binary {
 
 impl Ord for Binary {
     fn cmp(&self, other: &Binary) -> CmpOrdering {
-        self.partial_cmp(other).expect(&format!(
-            "Can't compare two binaries, {:?}, {:?}",
-            self, other
-        ))
+        self.partial_cmp(other).expect(&format!("Can't compare two binaries, {:?}, {:?}", self, other))
     }
 }
 
 impl PartialOrd for Binary {
     fn partial_cmp(&self, other: &Binary) -> Option<CmpOrdering> {
-        ReadBuffer::new(self.0.as_slice(), 0).partial_cmp(&ReadBuffer::new(other.0.as_slice(), 0))
+        ReadBuffer::new(self.0.as_slice(), 0)
+            .partial_cmp(&ReadBuffer::new(other.0.as_slice(), 0))
     }
 }
 
@@ -108,9 +106,9 @@ impl Eq for Binary {}
 
 impl PartialEq for Binary {
     fn eq(&self, other: &Binary) -> bool {
-        match self.partial_cmp(other) {
+        match self.partial_cmp(other){
             Some(CmpOrdering::Equal) => true,
-            _ => false,
+            _ => false
         }
     }
 }
@@ -163,79 +161,57 @@ impl Binary {
 /// 抽象的键值对操作
 ///
 pub trait KVAction: Send + Sync + 'static {
-    type Key: AsRef<[u8]>
-        + Deref<Target = [u8]>
-        + Hash
-        + PartialEq
-        + Eq
-        + PartialOrd
-        + Ord
-        + Clone
-        + Send
-        + 'static;
+    type Key: AsRef<[u8]> + Deref<Target = [u8]> + Hash + PartialEq + Eq + PartialOrd + Ord + Clone + Send + 'static;
     type Value: AsRef<[u8]> + Deref<Target = [u8]> + Default + Clone + Send + 'static;
     type Error: Debug + 'static;
 
     /// 异步查询指定关键字的值，可能会查询到旧值
-    fn dirty_query(
-        &self,
-        key: <Self as KVAction>::Key,
-    ) -> BoxFuture<Option<<Self as KVAction>::Value>>;
+    fn dirty_query(&self, key: <Self as KVAction>::Key)
+        -> BoxFuture<Option<<Self as KVAction>::Value>>;
 
     /// 异步查询指定关键字的值
-    fn query(&self, key: <Self as KVAction>::Key) -> BoxFuture<Option<<Self as KVAction>::Value>>;
+    fn query(&self, key: <Self as KVAction>::Key)
+        -> BoxFuture<Option<<Self as KVAction>::Value>>;
 
     /// 异步插入或更新指定关键字的值，插入或更新可能会被覆蓋
-    fn dirty_upsert(
-        &self,
-        key: <Self as KVAction>::Key,
-        value: <Self as KVAction>::Value,
-    ) -> BoxFuture<Result<(), <Self as KVAction>::Error>>;
+    fn dirty_upsert(&self,
+                    key: <Self as KVAction>::Key,
+                    value: <Self as KVAction>::Value)
+        -> BoxFuture<Result<(), <Self as KVAction>::Error>>;
 
     /// 异步插入或更新指定关键字的值
-    fn upsert(
-        &self,
-        key: <Self as KVAction>::Key,
-        value: <Self as KVAction>::Value,
-    ) -> BoxFuture<Result<(), <Self as KVAction>::Error>>;
+    fn upsert(&self,
+              key: <Self as KVAction>::Key,
+              value: <Self as KVAction>::Value)
+        -> BoxFuture<Result<(), <Self as KVAction>::Error>>;
 
     /// 异步删除指定关键值的值，并返回删除值，删除可能会被覆蓋
-    fn dirty_delete(
-        &self,
-        key: <Self as KVAction>::Key,
-    ) -> BoxFuture<Result<Option<<Self as KVAction>::Value>, <Self as KVAction>::Error>>;
+    fn dirty_delete(&self, key: <Self as KVAction>::Key)
+        -> BoxFuture<Result<Option<<Self as KVAction>::Value>, <Self as KVAction>::Error>>;
 
     /// 异步删除指定关键值的值，并返回删除值
-    fn delete(
-        &self,
-        key: <Self as KVAction>::Key,
-    ) -> BoxFuture<Result<Option<<Self as KVAction>::Value>, <Self as KVAction>::Error>>;
+    fn delete(&self, key: <Self as KVAction>::Key)
+        -> BoxFuture<Result<Option<<Self as KVAction>::Value>, <Self as KVAction>::Error>>;
 
     /// 获取从指定关键字开始，从前向后或从后向前的关键字异步流
-    fn keys<'a>(
-        &self,
-        key: Option<<Self as KVAction>::Key>,
-        descending: bool,
-    ) -> BoxStream<'a, <Self as KVAction>::Key>;
+    fn keys<'a>(&self,
+                key: Option<<Self as KVAction>::Key>,
+                descending: bool)
+        -> BoxStream<'a, <Self as KVAction>::Key>;
 
     /// 获取从指定关键字开始，从前向后或从后向前的键值对异步流
-    fn values<'a>(
-        &self,
-        key: Option<<Self as KVAction>::Key>,
-        descending: bool,
-    ) -> BoxStream<'a, (<Self as KVAction>::Key, <Self as KVAction>::Value)>;
+    fn values<'a>(&self,
+                  key: Option<<Self as KVAction>::Key>,
+                  descending: bool)
+        -> BoxStream<'a, (<Self as KVAction>::Key, <Self as KVAction>::Value)>;
 
     /// 锁住指定关键字
-    fn lock_key(
-        &self,
-        key: <Self as KVAction>::Key,
-    ) -> BoxFuture<Result<(), <Self as KVAction>::Error>>;
+    fn lock_key(&self, key: <Self as KVAction>::Key)
+        -> BoxFuture<Result<(), <Self as KVAction>::Error>>;
 
     /// 解锁指定关键字
-    fn unlock_key(
-        &self,
-        key: <Self as KVAction>::Key,
-    ) -> BoxFuture<Result<(), <Self as KVAction>::Error>>;
+    fn unlock_key(&self, key: <Self as KVAction>::Key)
+        -> BoxFuture<Result<(), <Self as KVAction>::Error>>;
 }
 
 ///
@@ -243,10 +219,10 @@ pub trait KVAction: Send + Sync + 'static {
 ///
 #[derive(Debug, Clone, PartialEq)]
 pub enum KVDBTableType {
-    MemOrdTab = 1, //有序内存表
-    LogOrdTab,     //有序日志表
-    LogWTab,       //只写日志表
-    BtreeOrdTab,   //有序B树表
+    MemOrdTab = 1,  //有序内存表
+    LogOrdTab,      //有序日志表
+    LogWTab,        //只写日志表
+    BtreeOrdTab,    //有序B树表
 }
 
 impl From<u8> for KVDBTableType {
@@ -256,10 +232,7 @@ impl From<u8> for KVDBTableType {
             2 => KVDBTableType::LogOrdTab,
             3 => KVDBTableType::LogWTab,
             4 => KVDBTableType::BtreeOrdTab,
-            _ => panic!(
-                "From u8 to KVDBTableType failed, src: {}, reason: invalid src",
-                src
-            ),
+            _ => panic!("From u8 to KVDBTableType failed, src: {}, reason: invalid src", src),
         }
     }
 }
@@ -269,10 +242,10 @@ impl From<u8> for KVDBTableType {
 ///
 #[derive(Debug, Clone, PartialEq)]
 pub struct KVTableMeta {
-    table_type: KVDBTableType, //表类型
-    persistence: bool,         //是否持久化
-    key: EnumType,             //关键字类型
-    value: EnumType,           //值类型
+    table_type:     KVDBTableType,  //表类型
+    persistence:    bool,           //是否持久化
+    key:            EnumType,       //关键字类型
+    value:          EnumType,       //值类型
 }
 
 impl From<Binary> for KVTableMeta {
@@ -320,12 +293,10 @@ impl From<Binary> for KVTableMeta {
 
 impl KVTableMeta {
     /// 构建一个键值对表的元信息
-    pub fn new(
-        table_type: KVDBTableType,
-        persistence: bool,
-        key: EnumType,
-        value: EnumType,
-    ) -> Self {
+    pub fn new(table_type: KVDBTableType,
+               persistence: bool,
+               key: EnumType,
+               value: EnumType) -> Self {
         KVTableMeta {
             table_type,
             persistence,
@@ -335,11 +306,9 @@ impl KVTableMeta {
     }
 
     /// 构建一个兼容旧的元信息的键值对表的元信息
-    pub fn with_compatibled(
-        table_type: KVDBTableType,
-        persistence: bool,
-        bin: &[u8],
-    ) -> Result<Self, ReadBonErr> {
+    pub fn with_compatibled(table_type: KVDBTableType,
+                            persistence: bool,
+                            bin: &[u8]) -> Result<Self, ReadBonErr> {
         let mut buffer = ReadBuffer::new(bin, 0);
         let key = EnumType::decode(&mut buffer)?;
         let value = EnumType::decode(&mut buffer)?;
@@ -389,8 +358,8 @@ impl Default for TableTrQos {
 ///
 #[derive(Debug, Clone)]
 pub enum KVActionLog {
-    Read,                       //读操作，读操作记录不允许覆盖写操作记录
-    Write(Option<Binary>), //写操作，为None则表示删除，否则主键不存在则为插入，主键存在则为更新，写操作记录会覆盖读操作记录
+    Read,				        //读操作，读操作记录不允许覆盖写操作记录
+    Write(Option<Binary>),	    //写操作，为None则表示删除，否则主键不存在则为插入，主键存在则为更新，写操作记录会覆盖读操作记录
     DirtyWrite(Option<Binary>), //脏写操作，为None则表示删除，否则主键不存在则为插入，主键存在则为更新，脏写操作记录不会覆盖读操作记录
 }
 
@@ -410,56 +379,54 @@ impl KVActionLog {
 /// 键值对数据库事务的提交确认器
 ///
 #[derive(Clone)]
-pub struct KVDBCommitConfirm<C: Clone + Send + 'static, Log: AsyncCommitLog<C = C, Cid = Guid>>(
-    Arc<(
-        MultiTaskRuntime<()>, //异步运行时
-        Log,                  //提交日志记录器
-        Guid,                 //事务唯一id
-        Option<Guid>,         //提交唯一id，只有需要持久化的事务，才分配提交唯一id
-        AtomicUsize,          //事务提交确认的计数
-    )>,
-);
+pub struct KVDBCommitConfirm<
+    C: Clone + Send + 'static,
+    Log: AsyncCommitLog<C = C, Cid = Guid>,
+>(Arc<(
+    MultiTaskRuntime<()>,   //异步运行时
+    Log,                    //提交日志记录器
+    Guid,                   //事务唯一id
+    Option<Guid>,           //提交唯一id，只有需要持久化的事务，才分配提交唯一id
+    AtomicUsize,            //事务提交确认的计数
+)>);
 
-unsafe impl<C: Clone + Send + 'static, Log: AsyncCommitLog<C = C, Cid = Guid>> Send
-    for KVDBCommitConfirm<C, Log>
-{
-}
-unsafe impl<C: Clone + Send + 'static, Log: AsyncCommitLog<C = C, Cid = Guid>> Sync
-    for KVDBCommitConfirm<C, Log>
-{
-}
+unsafe impl<
+    C: Clone + Send + 'static,
+    Log: AsyncCommitLog<C = C, Cid = Guid>,
+> Send for KVDBCommitConfirm<C, Log> {}
+unsafe impl<
+    C: Clone + Send + 'static,
+    Log: AsyncCommitLog<C = C, Cid = Guid>,
+> Sync for KVDBCommitConfirm<C, Log> {}
 
-impl<C: Clone + Send + 'static, Log: AsyncCommitLog<C = C, Cid = Guid>>
-    FnOnce<(Guid, Guid, Result<(), KVTableTrError>)> for KVDBCommitConfirm<C, Log>
-{
+impl<
+    C: Clone + Send + 'static,
+    Log: AsyncCommitLog<C = C, Cid = Guid>,
+> FnOnce<(Guid, Guid, Result<(), KVTableTrError>)> for KVDBCommitConfirm<C, Log> {
     type Output = Result<(), KVTableTrError>;
 
-    extern "rust-call" fn call_once(
-        self,
-        args: (Guid, Guid, Result<(), KVTableTrError>),
-    ) -> Self::Output {
+    extern "rust-call" fn call_once(self, args: (Guid, Guid, Result<(), KVTableTrError>))
+                                    -> Self::Output {
         self.call(args)
     }
 }
 
-impl<C: Clone + Send + 'static, Log: AsyncCommitLog<C = C, Cid = Guid>>
-    FnMut<(Guid, Guid, Result<(), KVTableTrError>)> for KVDBCommitConfirm<C, Log>
-{
-    extern "rust-call" fn call_mut(
-        &mut self,
-        args: (Guid, Guid, Result<(), KVTableTrError>),
-    ) -> Self::Output {
+impl<
+    C: Clone + Send + 'static,
+    Log: AsyncCommitLog<C = C, Cid = Guid>,
+> FnMut<(Guid, Guid, Result<(), KVTableTrError>)> for KVDBCommitConfirm<C, Log> {
+    extern "rust-call" fn call_mut(&mut self, args: (Guid, Guid, Result<(), KVTableTrError>))
+                                   -> Self::Output {
         self.call(args)
     }
 }
 
-impl<C: Clone + Send + 'static, Log: AsyncCommitLog<C = C, Cid = Guid>>
-    Fn<(Guid, Guid, Result<(), KVTableTrError>)> for KVDBCommitConfirm<C, Log>
-{
-    extern "rust-call" fn call(
-        &self,
-        args: (Guid, Guid, Result<(), KVTableTrError>),
-    ) -> Self::Output {
+impl<
+    C: Clone + Send + 'static,
+    Log: AsyncCommitLog<C = C, Cid = Guid>,
+> Fn<(Guid, Guid, Result<(), KVTableTrError>)> for KVDBCommitConfirm<C, Log> {
+    extern "rust-call" fn call(&self, args: (Guid, Guid, Result<(), KVTableTrError>))
+                               -> Self::Output {
         if let Err(e) = args.2 {
             //键值对数据库事务的子事务的异步提交错误
             if let ErrorLevel::Fatal = &e.level() {
@@ -472,15 +439,16 @@ impl<C: Clone + Send + 'static, Log: AsyncCommitLog<C = C, Cid = Guid>>
     }
 }
 
-impl<C: Clone + Send + 'static, Log: AsyncCommitLog<C = C, Cid = Guid>> KVDBCommitConfirm<C, Log> {
+impl<
+    C: Clone + Send + 'static,
+    Log: AsyncCommitLog<C = C, Cid = Guid>,
+> KVDBCommitConfirm<C, Log> {
     /// 构建一个键值对数据库事务的提交确认器
-    pub fn new(
-        rt: MultiTaskRuntime<()>,
-        commit_logger: Log,
-        tid: Guid,
-        cid: Option<Guid>,
-        count: usize,
-    ) -> Self {
+    pub fn new(rt: MultiTaskRuntime<()>,
+               commit_logger: Log,
+               tid: Guid,
+               cid: Option<Guid>,
+               count: usize) -> Self {
         KVDBCommitConfirm(Arc::new((
             rt,
             commit_logger,
@@ -508,14 +476,7 @@ impl<C: Clone + Send + 'static, Log: AsyncCommitLog<C = C, Cid = Guid>> KVDBComm
         if (self.0).4.fetch_sub(1, Ordering::SeqCst) <= 1 {
             //本次事务的所有子事务已确认提交，则异步的确认本次事务已提交，并立即返回成功
             let confirmer = self.clone();
-            let replay_confirm_delay_ms = std::env::var(TEST_REPLAY_CONFIRM_DELAY_MS_ENV)
-                .ok()
-                .and_then(|value| value.trim().parse::<usize>().ok())
-                .filter(|delay| *delay > 0);
             let _ = (self.0).0.spawn(async move {
-                if let Some(delay_ms) = replay_confirm_delay_ms {
-                    confirmer.0.0.timeout(delay_ms).await;
-                }
                 let last = COMMITED_LEN.fetch_add(1, Ordering::Relaxed);
                 //事务已确认提交
                 if let Err(e) = (confirmer.0)
@@ -541,13 +502,6 @@ impl<C: Clone + Send + 'static, Log: AsyncCommitLog<C = C, Cid = Guid>> KVDBComm
 static COMMITED_LEN: AtomicUsize = AtomicUsize::new(0);
 
 ///
-/// 仅用于测试：人为延迟 repair/quick repair 触发到底层 commit logger 的确认时机，
-/// 用于稳定复现“startup 已成功返回，但 .bak 归档稍后才补上”的窗口。
-/// 未设置时行为完全等同于原有实现。
-///
-const TEST_REPLAY_CONFIRM_DELAY_MS_ENV: &str = "PI_DB_TEST_REPLAY_CONFIRM_DELAY_MS";
-
-///
 /// 键值对数据库事务错误
 ///
 #[derive(Debug)]
@@ -561,8 +515,7 @@ unsafe impl Sync for KVTableTrError {}
 
 impl TransactionError for KVTableTrError {
     fn new_transaction_error<E>(level: ErrorLevel, reason: E) -> Self
-    where
-        E: Debug + Sized + 'static,
+        where E: Debug + Sized + 'static
     {
         KVTableTrError::Common(
             level,
@@ -574,7 +527,10 @@ impl TransactionError for KVTableTrError {
 impl KVTableTrError {
     /// 构建一个预提交冲突错误
     pub fn new_conflicts_error(table: Atom, key: Binary) -> Self {
-        KVTableTrError::Conflicts(table.as_ref().into(), Binary::from_slice(key))
+        KVTableTrError::Conflicts(
+            table.as_ref().into(),
+            Binary::from_slice(key),
+        )
     }
 
     /// 判断是否是普通错误
@@ -617,12 +573,10 @@ impl KVTableTrError {
 use std::sync::OnceLock;
 static TRANSACTION_DEBUG_LOGGER: OnceLock<TransactionDebugLogger> = OnceLock::new();
 
-pub fn init_transaction_debug_logger<P: AsRef<Path>>(
-    rt: MultiTaskRuntime<()>,
-    path: P,
-    interval: usize,
-    timeout: usize,
-) {
+pub fn init_transaction_debug_logger<P: AsRef<Path>>(rt: MultiTaskRuntime<()>,
+                                                     path: P,
+                                                     interval: usize,
+                                                     timeout:  usize) {
     let logger = TransactionDebugLogger::new(rt, path);
     if let Ok(_) = TRANSACTION_DEBUG_LOGGER.set(logger.clone()) {
         logger.startup(interval, timeout);
@@ -630,23 +584,25 @@ pub fn init_transaction_debug_logger<P: AsRef<Path>>(
 }
 
 pub fn transaction_debug_logger<'a>() -> &'a TransactionDebugLogger {
-    TRANSACTION_DEBUG_LOGGER.get().unwrap()
+    TRANSACTION_DEBUG_LOGGER
+        .get()
+        .unwrap()
 }
 
-use pi_async_transaction::manager_2pc::Transaction2PcStatus;
 use pi_atom::Atom;
+use pi_async_transaction::manager_2pc::Transaction2PcStatus;
 pub enum TransactionDebugEvent {
-    Begin(Guid, Transaction2PcStatus, bool, bool, usize), //事务开始
-    Commit(Guid, Guid, Transaction2PcStatus, Atom, usize, usize), //事务提交
-    CommitConfirm(Guid, Guid, Atom, bool, bool),          //事务提交确认
-    End(Guid, Guid),                                      //事务结束
+    Begin(Guid, Transaction2PcStatus, bool, bool, usize),           //事务开始
+    Commit(Guid, Guid, Transaction2PcStatus, Atom, usize, usize),   //事务提交
+    CommitConfirm(Guid, Guid, Atom, bool, bool),                    //事务提交确认
+    End(Guid, Guid),                                                //事务结束
 }
 
-use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
-use dashmap::{mapref::entry::Entry, DashMap};
-use pi_store::log_store::log_file::{LogFile, LogMethod};
 use std::path::Path;
 use std::time::Instant;
+use crossbeam_channel::{Sender, Receiver, unbounded, bounded};
+use dashmap::{DashMap, mapref::entry::Entry};
+use pi_store::log_store::log_file::{LogFile, LogMethod};
 
 pub struct TransactionDebugLogger(Arc<InnerTransactionDebugLogger>);
 
@@ -660,14 +616,20 @@ impl Clone for TransactionDebugLogger {
 }
 
 impl TransactionDebugLogger {
-    pub fn new<P: AsRef<Path>>(rt: MultiTaskRuntime<()>, path: P) -> Self {
+    pub fn new<P: AsRef<Path>>(rt: MultiTaskRuntime<()>,
+                               path: P) -> Self {
         let (sender, receiver) = unbounded();
         let times = DashMap::new();
         let rt_copy = rt.clone();
         let (s, r) = bounded(1);
         let path = path.as_ref().to_path_buf();
         rt.spawn(async move {
-            let log = LogFile::open(rt_copy.clone(), path, 8096, 128 * 1024 * 1024, None)
+            let log = LogFile
+            ::open(rt_copy.clone(),
+                   path,
+                   8096,
+                   128 * 1024 * 1024,
+                   None)
                 .await
                 .unwrap();
             s.send(log);
@@ -686,10 +648,14 @@ impl TransactionDebugLogger {
     }
 
     pub fn log(&self, event: TransactionDebugEvent) {
-        self.0.sender.send(event);
+        self.0
+            .sender
+            .send(event);
     }
 
-    pub fn startup(self, mut interval: usize, mut timeout: usize) {
+    pub fn startup(self,
+                   mut interval: usize,
+                   mut timeout: usize) {
         if interval < 1000 {
             interval = 1000;
         }
@@ -836,9 +802,9 @@ impl TransactionDebugLogger {
 }
 
 struct InnerTransactionDebugLogger {
-    rt: MultiTaskRuntime<()>,                  //运行时
-    sender: Sender<TransactionDebugEvent>,     //事务事件发送器
-    receiver: Receiver<TransactionDebugEvent>, //事务事件接收器
-    times: DashMap<Guid, Instant>,             //事务时间表
-    log: LogFile,                              //日志文件
+    rt:         MultiTaskRuntime<()>,               //运行时
+    sender:     Sender<TransactionDebugEvent>,      //事务事件发送器
+    receiver:   Receiver<TransactionDebugEvent>,    //事务事件接收器
+    times:      DashMap<Guid, Instant>,             //事务时间表
+    log:        LogFile,                            //日志文件
 }

@@ -35,7 +35,7 @@ use pi_store::log_store::log_file::{PairLoader,
                                     LogFile};
 
 use crate::{Binary, KVAction, TableTrQos, KVActionLog, KVDBCommitConfirm, KVTableTrError, TransactionDebugEvent, transaction_debug_logger,
-            db::{KVDBTransaction, KVDBChildTrList, QUICK_REPAIR_DB_SOURCE, quick_repair_profile_log, quick_repair_profile_log_enabled},
+            db::{KVDBTransaction, KVDBChildTrList},
             tables::KVTable,
             utils::KVDBEvent,
             KVDBTableType};
@@ -173,60 +173,6 @@ impl<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>,
 > LogOrderedTable<C, Log> {
-    /// 仅供 quick repair 使用：
-    /// 暂时挂起原有后台 `wait_timeout` 周期整理，避免它与文件级 quick flush 并发竞争。
-    /// 这不会影响 waits_limit 触发的即时整理，也不会改变正常事务或 try_repair 的行为。
-    pub(crate) fn set_timeout_collect_suspended(&self, suspended: bool) {
-        self.0.timeout_collect_suspended.store(suspended, Ordering::Release);
-    }
-
-    /// 仅供 quick repair 使用的一次性 flush。
-    /// 这里不会改变正常写入路径的默认整理周期，
-    /// 但会跳过日志文件的延迟提交，避免 quick repair 每文件批次额外等待默认的 1000ms。
-    /// 同时这里要作为 quick repair 的文件级 barrier 使用：
-    /// 如果当前表已经有后台 collect 在执行，就等待它结束并确认 waits 已经清空，
-    /// 然后才允许 quick repair 进入下一个 commit log 文件批次。
-    pub(crate) async fn quick_flush_waits(&self) -> Result<(), KVTableTrError> {
-        self.0.waits_size.store(0, Ordering::Relaxed);
-
-        loop {
-            if self.0.collecting.load(Ordering::Acquire) {
-                self.0.rt.timeout(0).await;
-                continue;
-            }
-
-            let has_waits = {
-                let waits = self.0.waits.lock().await;
-                !waits.is_empty()
-            };
-
-            if !has_waits {
-                if !self.0.collecting.load(Ordering::Acquire) {
-                    return Ok(());
-                }
-
-                self.0.rt.timeout(0).await;
-                continue;
-            }
-
-            match collect_waits(self, None, true).await {
-                Err((collect_time, statistics)) => {
-                    return Err(KVTableTrError::new_transaction_error(ErrorLevel::Normal,
-                                                                     format!("Quick flush log ordered table failed, table: {:?}, time: {:?}, statistics: {:?}",
-                                                                             self.name().as_str(),
-                                                                             collect_time,
-                                                                             statistics)));
-                },
-                Ok(_) => (),
-            }
-        }
-    }
-}
-
-impl<
-    C: Clone + Send + 'static,
-    Log: AsyncCommitLog<C = C, Cid = Guid>,
-> LogOrderedTable<C, Log> {
     /// 构建一个有序日志表
     pub async fn new<P: AsRef<Path>>(rt: MultiTaskRuntime<()>,
                                      path: P,
@@ -270,7 +216,6 @@ impl<
                     waits_limit,
                     wait_timeout,
                     collecting,
-                    timeout_collect_suspended: AtomicBool::new(false),
                     log_file,
                     notifier,
                 };
@@ -303,14 +248,8 @@ impl<
                 let _ = table.0.rt.spawn(async move {
                     let table_ref = &table_copy;
                     loop {
-                        if table_copy.0.timeout_collect_suspended.load(Ordering::Acquire) {
-                            table_copy.0.rt.timeout(1).await;
-                            continue;
-                        }
-
                         match collect_waits(table_ref,
-                                            Some(table_copy.0.wait_timeout),
-                                            false).await {
+                                            Some(table_copy.0.wait_timeout)).await {
                             Err((collect_time, statistics)) => {
                                 error!("Collect log ordered table failed, table: {:?}, time: {:?}, statistics: {:?}, reason: out of time",
                                     table_copy.name().as_str(),
@@ -356,8 +295,6 @@ struct InnerLogOrderedTable<
     wait_timeout:   usize,
     //是否正在整理等待异步写日志文件的已提交的有序日志事务列表
     collecting:     AtomicBool,
-    //是否暂时挂起后台 wait_timeout 周期整理，仅供 quick repair 使用
-    timeout_collect_suspended: AtomicBool,
     //日志文件
     log_file:       LogFile,
     //表事件通知器
@@ -698,23 +635,20 @@ impl<
         async move {
             //移除事务在有序日志表的预提交表中的操作记录
             let transaction_uid = tr.get_transaction_uid().unwrap();
-            let is_quick_repair_commit = tr.get_source().as_str() == QUICK_REPAIR_DB_SOURCE;
 
             //从有序日志表的预提交表中移除当前事务的操作记录
             let actions = {
-                if is_quick_repair_commit {
-                    tr.0.quick_prepared_actions.lock().take().unwrap_or_default()
-                } else {
-                    let mut table_prepare = tr
-                        .0
-                        .table
-                        .0
-                        .prepare
-                        .lock();
-                    let actions = table_prepare.get(&transaction_uid); //获取有序日志表，本次事务预提交成功的相关操作记录
+                let mut table_prepare = tr
+                    .0
+                    .table
+                    .0
+                    .prepare
+                    .lock();
+                let actions = table_prepare.get(&transaction_uid); //获取有序日志表，本次事务预提交成功的相关操作记录
 
-                    //更新有序日志表的根节点
-                    if let Some(actions) = actions {
+                //更新有序日志表的根节点
+                if let Some(actions) = actions {
+                    {
                         let mut locked = tr.0.table.0.root.lock();
                         if !locked.ptr_eq(&tr.0.root_ref) {
                             //有序日志表的根节点在当前事务执行过程中已改变，
@@ -737,19 +671,19 @@ impl<
                             //有序日志表的根节点在当前事务执行过程中未改变，则用本次事务修改并提交成功的根节点替换有序日志表的根节点
                             *locked = tr.0.root_mut.lock().clone();
                         }
-
-                        //有序日志表提交完成后，从有序日志表的预提交表中移除当前事务的操作记录
-                        table_prepare.remove(&transaction_uid).unwrap()
-                    } else {
-                        XHashMap::default()
                     }
+
+                    //有序日志表提交完成后，从有序日志表的预提交表中移除当前事务的操作记录
+                    table_prepare.remove(&transaction_uid).unwrap()
+                } else {
+                    XHashMap::default()
                 }
             };
 
             if tr.is_require_persistence() {
                 //持久化的有序日志表事务，则异步将表的修改写入日志文件后，再确认提交成功
                 let table_copy = tr.0.table.clone();
-                let commit_future = async move {
+                let _ = self.0.table.0.rt.spawn(async move {
                     let mut size = 0;
                     for (key, action) in &actions {
                         match action {
@@ -782,13 +716,12 @@ impl<
                     table_copy.0.waits.lock().await.push_back((tr, actions, confirm)); //注册待确认的已提交事务
 
                     let last_waits_size = table_copy.0.waits_size.fetch_add(size, Ordering::SeqCst); //更新待确认的已提交事务的大小计数
-                    if !is_quick_repair_commit && last_waits_size + size >= table_copy.0.waits_limit {
+                    if last_waits_size + size >= table_copy.0.waits_limit {
                         //如果当前已注册的待确认的已提交事务大小已达限制，则立即整理
                         table_copy.0.waits_size.store(0, Ordering::Relaxed); //重置待确认的已提交事务的大小计数
 
                         match collect_waits(&table_copy,
-                                            None,
-                                            false).await {
+                                            None).await {
                             Err((collect_time, statistics)) => {
                                 error!("Collect log ordered table failed, table: {:?}, time: {:?}, statistics: {:?}, reason: out of size",
                                     table_copy.name().as_str(),
@@ -803,13 +736,7 @@ impl<
                             },
                         }
                     }
-                };
-
-                if is_quick_repair_commit {
-                    commit_future.await;
-                } else {
-                    let _ = self.0.table.0.rt.spawn(commit_future);
-                }
+                });
             }
 
             Ok(())
@@ -1080,20 +1007,9 @@ impl<
             root_ref,
             table,
             actions: SpinLock::new(XHashMap::default()),
-            quick_prepared_actions: SpinLock::new(None),
         };
 
         LogOrdTabTr(Arc::new(inner))
-    }
-
-    /// 快速装载有序日志表的 repair 动作。
-    /// 这些动作先挂到事务本地 `actions`，后续仍要通过 `prepare_repair` 和 `commit_repair` 完成恢复。
-    pub(crate) fn quick_repair_writes(&self,
-                                      writes: Vec<(Binary, Option<Binary>)>) {
-        let mut actions = self.0.actions.lock();
-        for (key, value) in writes {
-            let _ = actions.insert(key, KVActionLog::DirtyWrite(value));
-        }
     }
 
     // 检查有序日志表的预提交表的读写冲突
@@ -1346,17 +1262,6 @@ impl<
         //将事务的当前操作记录，写入表的预提交表
         self.0.table.0.prepare.lock().insert(transaction_uid, actions);
     }
-
-    // 预提交所有快速修复修改
-    // quick repair 下不再逐事务把动作写入全局根节点：
-    // 1. replay 过程中没有读依赖；
-    // 2. 当前文件批次的动作最终都会通过 waits -> quick_flush 顺序落盘；
-    // 3. quick_flush 成功后会统一把本文件批次的动作写回内存根节点。
-    // 因此这里仅保留动作，供 commit_repair 继续登记 waits，避免高频事务反复锁住全局根节点。
-    pub(crate) fn prepare_quick_repair(&self, _transaction_uid: Guid) {
-        let actions = mem::replace(&mut *self.0.actions.lock(), XHashMap::default());
-        *self.0.quick_prepared_actions.lock() = Some(actions);
-    }
 }
 
 // 内部有序日志表事务
@@ -1376,7 +1281,6 @@ struct InnerLogOrdTabTr<
     root_ref:           OrdMap<Tree<Binary, Binary>>,                                               //有序日志表的根节点的只读复制
     table:              LogOrderedTable<C, Log>,                                                    //事务对应的有序日志表
     actions:            SpinLock<XHashMap<Binary, KVActionLog>>,                                    //事务内操作记录
-    quick_prepared_actions: SpinLock<Option<XHashMap<Binary, KVActionLog>>>,                       //仅供 quick repair 复用的已预提交操作
 }
 
 // 有序日志表的加载器
@@ -1486,17 +1390,11 @@ async fn collect_waits<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>,
 >(table: &LogOrderedTable<C, Log>,
-  timeout: Option<usize>,
-  force_commit_immediately: bool) -> Result<(Duration, (usize, usize, usize)), (Duration, (usize, usize, usize))> {
-    let profile_enabled = quick_repair_profile_log_enabled();
+  timeout: Option<usize>) -> Result<(Duration, (usize, usize, usize)), (Duration, (usize, usize, usize))> {
     //等待指定的时间
     if let Some(timeout) = timeout {
         //需要等待指定时间后，再开始整理
         table.0.rt.timeout(timeout).await;
-
-        if table.0.timeout_collect_suspended.load(Ordering::Acquire) {
-            return Ok((Instant::now().elapsed(), (0, 0, 0)));
-        }
     }
 
     //检查是否正在异步整理，如果并未开始异步整理，则设置为正在异步整理，并继续异步整理
@@ -1514,9 +1412,6 @@ async fn collect_waits<
     let mut trs_len = 0;
     let mut keys_len = 0;
     let mut bytes_len = 0;
-    let mut quick_repair_trs_len = 0usize;
-    let mut quick_repair_keys_len = 0usize;
-    let mut root_apply_elapsed_ms = 0u128;
 
     let now = Instant::now();
     {
@@ -1528,7 +1423,6 @@ async fn collect_waits<
             .await;
 
         while let Some((wait_tr, actions, confirm)) = locked.pop_front() {
-            let is_quick_repair_wait = wait_tr.get_source().as_str() == QUICK_REPAIR_DB_SOURCE;
             for (key, actions) in actions.iter() {
                 match actions {
                     KVActionLog::Write(None) | KVActionLog::DirtyWrite(None) => {
@@ -1542,9 +1436,6 @@ async fn collect_waits<
 
                         keys_len += 1;
                         bytes_len += key.len();
-                        if is_quick_repair_wait {
-                            quick_repair_keys_len += 1;
-                        }
                     },
                     KVActionLog::Write(Some(value)) | KVActionLog::DirtyWrite(Some(value)) => {
                         //插入或更新了有序日志表中指定关键字的值
@@ -1557,38 +1448,22 @@ async fn collect_waits<
 
                         keys_len += 1;
                         bytes_len += key.len() + value.len();
-                        if is_quick_repair_wait {
-                            quick_repair_keys_len += 1;
-                        }
                     },
                     KVActionLog::Read => (), //忽略读操作
                 }
             }
 
             trs_len += 1;
-            if is_quick_repair_wait {
-                quick_repair_trs_len += 1;
-            }
-            waits.push_back((wait_tr, actions, confirm));
+            waits.push_back((wait_tr, confirm));
         }
 
-        let commit_result = if force_commit_immediately {
-            table
-                .0
-                .log_file
-                .commit_owned(log_uid, true, false, None)
-                .await
-        } else {
-            table
-                .0
-                .log_file
-                .delay_commit(log_uid,
-                              false,
-                              DEFAULT_LOG_FILE_COMMIT_DELAY_TIMEOUT)
-                .await
-        };
-
-        if let Err(e) = commit_result {
+        if let Err(e) = table
+            .0
+            .log_file
+            .delay_commit(log_uid,
+                          false,
+                          DEFAULT_LOG_FILE_COMMIT_DELAY_TIMEOUT)
+            .await {
             //写入日志文件失败，则立即中止本次整理
             table.0.collecting.store(false, Ordering::Release); //设置为已整理结束
             error!("Collect log ordered table failed, table: {:?}, transactions: {}, keys: {}, bytes: {}, reason: {:?}",
@@ -1602,52 +1477,10 @@ async fn collect_waits<
         }
     }
 
-    // quick repair 下，LogOrdTab 的动作在 prepare/commit 阶段不会立即写回全局 root。
-    // 只有在日志文件真正提交成功后，才按 waits 的 FIFO 顺序统一更新内存 root，
-    // 这样才能同时保证：
-    // 1. 同表事务顺序与文件内出现顺序一致；
-    // 2. 修复后的数据库在本次启动内立刻可见最终结果；
-    // 3. 普通事务路径和 try_repair 语义不受影响。
-    if quick_repair_trs_len > 0 {
-        let root_apply_begin = Instant::now();
-        let root_apply_mode = try_apply_quick_repair_root_from_order(table, &waits);
-        if root_apply_mode.is_none() {
-            let mut root = table.0.root.lock();
-            for (wait_tr, actions, _) in waits.iter() {
-                if wait_tr.get_source().as_str() != QUICK_REPAIR_DB_SOURCE {
-                    continue;
-                }
-
-                for (key, action) in actions.iter() {
-                    match action {
-                        KVActionLog::Write(None) | KVActionLog::DirtyWrite(None) => {
-                            let _ = root.delete(key, false);
-                        },
-                        KVActionLog::Write(Some(value)) | KVActionLog::DirtyWrite(Some(value)) => {
-                            let _ = root.upsert(key.clone(), value.clone(), false);
-                        },
-                        KVActionLog::Read => (),
-                    }
-                }
-            }
-        }
-        root_apply_elapsed_ms = root_apply_begin.elapsed().as_millis();
-
-        if profile_enabled {
-            quick_repair_profile_log(format!("log_ord collect applied root: table={:?}, force_commit_immediately={}, quick_repair_transactions={}, quick_repair_keys={}, root_apply_elapsed_ms={}, root_apply_mode={}",
-                                             table.name().as_str(),
-                                             force_commit_immediately,
-                                             quick_repair_trs_len,
-                                             quick_repair_keys_len,
-                                             root_apply_elapsed_ms,
-                                             root_apply_mode.unwrap_or("upsert")));
-        }
-    }
-
     //写入日志文件成功，则调用指定事务的确认提交回调，并继续写入下一个事务
     if let Some(notifier) = table.0.notifier.as_ref() {
         //指定了监听器
-        for (wait_tr, _actions, confirm) in waits {
+        for (wait_tr, confirm) in waits {
             //跟踪提交
             #[cfg(feature = "log_table_debug")]
             {
@@ -1685,7 +1518,7 @@ async fn collect_waits<
         }
     } else {
         //未指定监听器
-        for (wait_tr, _actions, confirm) in waits {
+        for (wait_tr, confirm) in waits {
             //跟踪提交
             #[cfg(feature = "log_table_debug")]
             {
@@ -1711,60 +1544,7 @@ async fn collect_waits<
     }
     table.0.collecting.store(false, Ordering::Release); //设置为已整理结束
 
-    if profile_enabled && quick_repair_trs_len > 0 {
-        quick_repair_profile_log(format!("log_ord collect finished: table={:?}, force_commit_immediately={}, transactions={}, keys={}, bytes={}, root_apply_elapsed_ms={}, total_elapsed_ms={}",
-                                         table.name().as_str(),
-                                         force_commit_immediately,
-                                         trs_len,
-                                         keys_len,
-                                         bytes_len,
-                                         root_apply_elapsed_ms,
-                                         now.elapsed().as_millis()));
-    }
-
     Ok((now.elapsed(), (trs_len, keys_len, bytes_len)))
-}
-
-fn try_apply_quick_repair_root_from_order<
-    C: Clone + Send + 'static,
-    Log: AsyncCommitLog<C = C, Cid = Guid>,
->(table: &LogOrderedTable<C, Log>,
-  waits: &VecDeque<(LogOrdTabTr<C, Log>, XHashMap<Binary, KVActionLog>, <LogOrdTabTr<C, Log> as Transaction2Pc>::CommitConfirm)>) -> Option<&'static str> {
-    let mut final_actions = XHashMap::default();
-    for (wait_tr, actions, _) in waits.iter() {
-        if wait_tr.get_source().as_str() != QUICK_REPAIR_DB_SOURCE {
-            return None;
-        }
-
-        for (key, action) in actions.iter() {
-            match action {
-                KVActionLog::Write(None) | KVActionLog::DirtyWrite(None) => {
-                    let _ = final_actions.insert(key.clone(), None);
-                },
-                KVActionLog::Write(Some(value)) | KVActionLog::DirtyWrite(Some(value)) => {
-                    let _ = final_actions.insert(key.clone(), Some(value.clone()));
-                },
-                KVActionLog::Read => (),
-            }
-        }
-    }
-
-    let mut root = table.0.root.lock();
-    if root.is_empty() {
-        let mut final_actions = final_actions.into_iter().collect::<Vec<_>>();
-        final_actions.sort_unstable_by(|left, right| left.0.cmp(&right.0));
-        let mut entries = Vec::with_capacity(final_actions.len());
-        for (key, value) in final_actions {
-            if let Some(value) = value {
-                entries.push(Entry::new(key, value));
-            }
-        }
-
-        *root = OrdMap::new(<Tree<Binary, Binary> as ImOrdMap>::from_order(entries));
-        return Some("from_order");
-    }
-
-    None
 }
 
 
