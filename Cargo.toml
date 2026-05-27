@@ -1,6 +1,6 @@
 [package]
 name = "pi_db"
-version = "0.17.3"
+version = "0.17.5"
 authors = ["vmos <vmosone007@gmail.com>"]
 edition = "2021"
 description = "Full cache based database，support transaction"

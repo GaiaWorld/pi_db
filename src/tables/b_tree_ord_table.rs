@@ -448,6 +448,7 @@ impl<
                 let cache = Mutex::new(OrdMap::new(None));
                 let cache_flags = Mutex::new(XHashMap::default());
                 let prepare = Mutex::new(XHashMap::default());
+                let prepare_diags = Mutex::new(XHashMap::default());
                 let waits = AsyncMutex::new(VecDeque::new());
                 let waits_size = AtomicUsize::new(0);
                 let collecting = AtomicBool::new(false);
@@ -459,6 +460,7 @@ impl<
                     cache,
                     cache_flags,
                     prepare,
+                    prepare_diags,
                     rt,
                     enable_compact: AtomicBool::new(enable_compact),
                     waits,
@@ -515,6 +517,14 @@ impl<
     }
 }
 
+struct BtreePrepareDiag {
+    source:            Atom,
+    inserted_at:       Instant,
+    actions_len:       usize,
+    conflict_count:    usize,
+    last_conflict_at:  Option<Instant>,
+}
+
 // 内部有序B树数据表
 struct InnerBtreeOrderedTable<
     C: Clone + Send + 'static,
@@ -532,6 +542,8 @@ struct InnerBtreeOrderedTable<
     cache_flags:                Mutex<XHashMap<Binary, Guid>>,
     //有序B树表的预提交表
     prepare:                    Mutex<XHashMap<Guid, XHashMap<Binary, KVActionLog>>>,
+    //有序B树表的预提交诊断表，仅用于冲突排查。
+    prepare_diags:              Mutex<XHashMap<Guid, BtreePrepareDiag>>,
     //异步运行时
     rt:                         MultiTaskRuntime<()>,
     //是否允许对有序B树表进行整理压缩
@@ -608,7 +620,23 @@ impl<
 
         async move {
             let transaction_uid = tr.get_transaction_uid().unwrap();
-            let _ = tr.0.table.0.prepare.lock().remove(&transaction_uid);
+            let removed = {
+                let mut prepare = tr.0.table.0.prepare.lock();
+                let removed = prepare.remove(&transaction_uid);
+                let prepare_len = prepare.len();
+                let actions_len = removed
+                    .as_ref()
+                    .map(|actions| actions.len())
+                    .unwrap_or(0);
+                if removed.is_some() {
+                    tr.log_prepare_hold_end(&transaction_uid,
+                                            "rollback",
+                                            actions_len,
+                                            prepare_len);
+                }
+                removed
+            };
+            drop(removed);
 
             Ok(())
         }.boxed()
@@ -753,7 +781,13 @@ impl<
                     let actions = mem::replace(&mut *tr.0.actions.lock(), XHashMap::default());
 
                     //将事务的当前操作记录，写入表的预提交表
-                    prepare_locked.insert(tr.get_transaction_uid().unwrap(), actions);
+                    let transaction_uid = tr.get_transaction_uid().unwrap();
+                    let actions_len = actions.len();
+                    prepare_locked.insert(transaction_uid.clone(), actions);
+                    tr.log_prepare_hold_begin(&transaction_uid,
+                                              actions_len,
+                                              prepare_locked.len(),
+                                              "prepare");
                 }
 
                 Ok(write_buf)
@@ -831,7 +865,13 @@ impl<
                     let actions = mem::replace(&mut *tr.0.actions.lock(), XHashMap::default());
 
                     //将事务的当前操作记录，写入表的预提交表
-                    prepare_locked.insert(tr.get_transaction_uid().unwrap(), actions);
+                    let transaction_uid = tr.get_transaction_uid().unwrap();
+                    let actions_len = actions.len();
+                    prepare_locked.insert(transaction_uid.clone(), actions);
+                    tr.log_prepare_hold_begin(&transaction_uid,
+                                              actions_len,
+                                              prepare_locked.len(),
+                                              "prepare_conflicts");
                 }
 
                 Ok(write_buf)
@@ -942,6 +982,7 @@ impl<
 
                         //有序B树表提交完成后，从有序B树表的预提交表中移除当前事务的操作记录
                         let removed_actions = table_prepare.remove(&transaction_uid).unwrap();
+                        let prepare_len = table_prepare.len();
                         eprintln!(
                             "pi_db btree_commit_prepare_remove_done table={} source={} transaction_uid={:?} commit_uid={:?} actions_len={}",
                             tr.0.table.name().as_str(),
@@ -950,6 +991,10 @@ impl<
                             commit_uid,
                             removed_actions.len(),
                         );
+                        tr.log_prepare_hold_end(&transaction_uid,
+                                                "commit",
+                                                removed_actions.len(),
+                                                prepare_len);
                         removed_actions
                     } else {
                         XHashMap::default()
@@ -1662,6 +1707,69 @@ impl<
         Ok(())
     }
 
+    fn log_prepare_hold_begin(&self,
+                              transaction_uid: &Guid,
+                              actions_len: usize,
+                              prepare_len: usize,
+                              reason: &str) {
+        self.0.table.0.prepare_diags.lock().insert(transaction_uid.clone(),
+                                                   BtreePrepareDiag {
+                                                       source: self.get_source(),
+                                                       inserted_at: Instant::now(),
+                                                       actions_len,
+                                                       conflict_count: 0,
+                                                       last_conflict_at: None,
+                                                   });
+        eprintln!(
+            "pi_db btree_prepare_hold_begin table={} source={} transaction_uid={:?} prepare_uid={:?} actions_len={} prepare_len={} reason={}",
+            self.0.table.name().as_str(),
+            self.0.source.as_str(),
+            transaction_uid,
+            self.get_prepare_uid(),
+            actions_len,
+            prepare_len,
+            reason,
+        );
+    }
+
+    fn log_prepare_hold_end(&self,
+                            transaction_uid: &Guid,
+                            reason: &str,
+                            actions_len: usize,
+                            prepare_len: usize) {
+        let diag = self.0.table.0.prepare_diags.lock().remove(transaction_uid);
+        match diag {
+            Some(diag) => {
+                eprintln!(
+                    "pi_db btree_prepare_hold_end table={} source={} owner_source={} transaction_uid={:?} prepare_uid={:?} actions_len={} diag_actions_len={} hold_ms={} conflict_count={} prepare_len={} reason={}",
+                    self.0.table.name().as_str(),
+                    self.0.source.as_str(),
+                    diag.source.as_str(),
+                    transaction_uid,
+                    self.get_prepare_uid(),
+                    actions_len,
+                    diag.actions_len,
+                    diag.inserted_at.elapsed().as_millis(),
+                    diag.conflict_count,
+                    prepare_len,
+                    reason,
+                );
+            },
+            None => {
+                eprintln!(
+                    "pi_db btree_prepare_hold_end table={} source={} transaction_uid={:?} prepare_uid={:?} actions_len={} hold_ms=unknown conflict_count=unknown prepare_len={} reason={} diag_missing=true",
+                    self.0.table.name().as_str(),
+                    self.0.source.as_str(),
+                    transaction_uid,
+                    self.get_prepare_uid(),
+                    actions_len,
+                    prepare_len,
+                    reason,
+                );
+            },
+        }
+    }
+
     #[inline]
     fn prepare_action_kind(action: &KVActionLog) -> &'static str {
         match action {
@@ -1692,14 +1800,36 @@ impl<
         key.hash(&mut hasher);
         let key_hash = hasher.finish();
         let mut owners = Vec::new();
+        let now = Instant::now();
+        let mut prepare_diags = self.0.table.0.prepare_diags.lock();
 
         for (guid, actions) in prepare.iter() {
             if let Some(owner_action) = actions.get(key) {
                 if Self::is_prepare_action_conflicted(owner_action, action) {
-                    owners.push(format!("{:?}:action={}:actions_len={}",
-                                        guid,
-                                        Self::prepare_action_kind(owner_action),
-                                        actions.len()));
+                    let owner = if let Some(diag) = prepare_diags.get_mut(guid) {
+                        diag.conflict_count += 1;
+                        let gap_ms = diag
+                            .last_conflict_at
+                            .map(|last| now.duration_since(last).as_millis());
+                        diag.last_conflict_at = Some(now);
+                        format!("{:?}:source={}:action={}:actions_len={}:diag_actions_len={}:prepare_age_ms={}:conflict_count={}:last_conflict_gap_ms={}",
+                                guid,
+                                diag.source.as_str(),
+                                Self::prepare_action_kind(owner_action),
+                                actions.len(),
+                                diag.actions_len,
+                                diag.inserted_at.elapsed().as_millis(),
+                                diag.conflict_count,
+                                gap_ms
+                                    .map(|value| value.to_string())
+                                    .unwrap_or_else(|| "none".to_string()))
+                    } else {
+                        format!("{:?}:source=unknown:action={}:actions_len={}:diag_actions_len=unknown:prepare_age_ms=unknown:conflict_count=unknown:last_conflict_gap_ms=unknown:diag_missing=true",
+                                guid,
+                                Self::prepare_action_kind(owner_action),
+                                actions.len())
+                    };
+                    owners.push(owner);
                 }
             }
         }
@@ -2061,7 +2191,13 @@ impl<
         }
 
         //将事务的当前操作记录，写入表的预提交表
-        self.0.table.0.prepare.lock().insert(transaction_uid, actions);
+        let actions_len = actions.len();
+        let mut prepare = self.0.table.0.prepare.lock();
+        prepare.insert(transaction_uid.clone(), actions);
+        self.log_prepare_hold_begin(&transaction_uid,
+                                    actions_len,
+                                    prepare.len(),
+                                    "repair");
     }
 
     // 预提交所有快速修复修改
