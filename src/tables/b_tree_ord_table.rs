@@ -1,6 +1,7 @@
 use std::{mem, thread};
 use std::path::{Path, PathBuf};
-use std::collections::{VecDeque, HashMap, BTreeMap, hash_map::Entry as HashMapEntry};
+use std::collections::{VecDeque, HashMap, BTreeMap, hash_map::{DefaultHasher, Entry as HashMapEntry}};
+use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use std::sync::{Arc,
@@ -1661,6 +1662,63 @@ impl<
         Ok(())
     }
 
+    #[inline]
+    fn prepare_action_kind(action: &KVActionLog) -> &'static str {
+        match action {
+            KVActionLog::Read => "read",
+            KVActionLog::Write(Some(_)) => "write_some",
+            KVActionLog::Write(None) => "write_none",
+            KVActionLog::DirtyWrite(Some(_)) => "dirty_write_some",
+            KVActionLog::DirtyWrite(None) => "dirty_write_none",
+        }
+    }
+
+    #[inline]
+    fn is_prepare_action_conflicted(owner_action: &KVActionLog,
+                                    current_action: &KVActionLog) -> bool {
+        match owner_action {
+            KVActionLog::Read => matches!(current_action, KVActionLog::Write(_)),
+            KVActionLog::DirtyWrite(_) => false,
+            KVActionLog::Write(_) => !matches!(current_action, KVActionLog::DirtyWrite(_)),
+        }
+    }
+
+    fn log_prepare_conflict_result_hit(&self,
+                                       prepare: &XHashMap<Guid, XHashMap<Binary, KVActionLog>>,
+                                       key: &Binary,
+                                       action: &KVActionLog,
+                                       reason: &str) {
+        let mut hasher = DefaultHasher::new();
+        key.hash(&mut hasher);
+        let key_hash = hasher.finish();
+        let mut owners = Vec::new();
+
+        for (guid, actions) in prepare.iter() {
+            if let Some(owner_action) = actions.get(key) {
+                if Self::is_prepare_action_conflicted(owner_action, action) {
+                    owners.push(format!("{:?}:action={}:actions_len={}",
+                                        guid,
+                                        Self::prepare_action_kind(owner_action),
+                                        actions.len()));
+                }
+            }
+        }
+
+        eprintln!(
+            "pi_db btree_prepare_conflict table={} source={} transaction_uid={:?} prepare_uid={:?} key_hash={} key_len={} current_action={} reason={} owner_count={} owners=[{}]",
+            self.0.table.name().as_str(),
+            self.0.source.as_str(),
+            self.get_transaction_uid(),
+            self.get_prepare_uid(),
+            key_hash,
+            key.as_ref().len(),
+            Self::prepare_action_kind(action),
+            reason,
+            owners.len(),
+            owners.join(","),
+        );
+    }
+
     // 检查有序B树表的预提交表的读写冲突
     fn check_prepare_conflict_result(&self,
                                      prepare: &mut XHashMap<Guid, XHashMap<Binary, KVActionLog>>,
@@ -1678,6 +1736,10 @@ impl<
                         },
                         KVActionLog::Write(_) => {
                             //本地预提交事务对相同的关键字执行了写操作，则存在读写冲突
+                            self.log_prepare_conflict_result_hit(prepare,
+                                                                 key,
+                                                                 action,
+                                                                 "require_write_key_but_reading_now");
                             return Err(<Self as Transaction2Pc>::PrepareError::new_conflicts_error(self.0.table.name().clone(),
                                                                                                    key.clone()));
                         },
@@ -1695,6 +1757,10 @@ impl<
                         },
                         _ => {
                             //有序B树表的预提交表中的一个预提交事务与本地预提交事务操作了相同的关键字，且是写操作，则存在读写冲突
+                            self.log_prepare_conflict_result_hit(prepare,
+                                                                 key,
+                                                                 action,
+                                                                 "writing_now");
                             return Err(<Self as Transaction2Pc>::PrepareError::new_conflicts_error(self.0.table.name().clone(),
                                                                                                    key.clone()));
                         },
