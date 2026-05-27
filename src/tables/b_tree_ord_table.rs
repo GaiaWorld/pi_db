@@ -850,7 +850,15 @@ impl<
         async move {
             //移除事务在有序B树表的预提交表中的操作记录
             let transaction_uid = tr.get_transaction_uid().unwrap();
+            let commit_uid = tr.get_commit_uid();
             let is_quick_repair_commit = tr.get_source().as_str() == QUICK_REPAIR_DB_SOURCE;
+            eprintln!(
+                "pi_db btree_commit_enter table={} source={} transaction_uid={:?} commit_uid={:?} actions_len=unknown",
+                tr.0.table.name().as_str(),
+                tr.get_source().as_str(),
+                transaction_uid,
+                commit_uid,
+            );
 
             //从有序B树表的预提交表中移除当前事务的操作记录
             let actions = {
@@ -864,9 +872,26 @@ impl<
                         .prepare
                         .lock();
                     let actions = table_prepare.get(&transaction_uid); //获取有序B树表，本次事务预提交成功的相关操作记录
+                    let actions_len = actions.map(|actions| actions.len()).unwrap_or(0);
+                    eprintln!(
+                        "pi_db btree_commit_prepare_hit table={} source={} transaction_uid={:?} commit_uid={:?} actions_len={}",
+                        tr.0.table.name().as_str(),
+                        tr.get_source().as_str(),
+                        transaction_uid,
+                        commit_uid,
+                        actions_len,
+                    );
 
                     //更新有序B树表的临时缓存的根节点
                     if let Some(actions) = actions {
+                        eprintln!(
+                            "pi_db btree_commit_cache_merge_begin table={} source={} transaction_uid={:?} commit_uid={:?} actions_len={}",
+                            tr.0.table.name().as_str(),
+                            tr.get_source().as_str(),
+                            transaction_uid,
+                            commit_uid,
+                            actions_len,
+                        );
                         let mut cache_flags = tr
                             .0
                             .table
@@ -915,7 +940,16 @@ impl<
                         }
 
                         //有序B树表提交完成后，从有序B树表的预提交表中移除当前事务的操作记录
-                        table_prepare.remove(&transaction_uid).unwrap()
+                        let removed_actions = table_prepare.remove(&transaction_uid).unwrap();
+                        eprintln!(
+                            "pi_db btree_commit_prepare_remove_done table={} source={} transaction_uid={:?} commit_uid={:?} actions_len={}",
+                            tr.0.table.name().as_str(),
+                            tr.get_source().as_str(),
+                            transaction_uid,
+                            commit_uid,
+                            removed_actions.len(),
+                        );
+                        removed_actions
                     } else {
                         XHashMap::default()
                     }
@@ -926,6 +960,7 @@ impl<
                 //持久化的有序B树表事务，则异步将表的修改写入B树文件后，再确认提交成功
                 let table_copy = tr.0.table.clone();
                 let commit_future = async move {
+                    let actions_len = actions.len();
                     let mut size = 0;
                     for (key, action) in &actions {
                         match action {
@@ -940,12 +975,22 @@ impl<
                     }
 
                     //注册待确认的已提交事务
+                    let source = tr.get_source();
                     table_copy
                         .0
                         .waits
                         .lock()
                         .await
                         .push_back((tr, actions, confirm));
+                    eprintln!(
+                        "pi_db btree_commit_waits_push_done table={} source={} transaction_uid={:?} commit_uid={:?} actions_len={} bytes={}",
+                        table_copy.name().as_str(),
+                        source.as_str(),
+                        transaction_uid,
+                        commit_uid,
+                        actions_len,
+                        size,
+                    );
 
                     let last_waits_size = table_copy.0.waits_size.fetch_add(size, Ordering::SeqCst); //更新待确认的已提交事务的大小计数
                     if !is_quick_repair_commit && last_waits_size + size >= table_copy.0.waits_limit {
