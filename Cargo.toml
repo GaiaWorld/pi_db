@@ -1,6 +1,6 @@
 [package]
 name = "pi_db"
-version = "0.17.6"
+version = "0.18.0"
 authors = ["vmos <vmosone007@gmail.com>"]
 edition = "2021"
 description = "Full cache based database，support transaction"
@@ -22,16 +22,16 @@ async-channel = "~2.5"
 async-stream = "~0.3"
 bytes = "~1.11"
 dashmap = "~6.1"
-pi_atom = "~0.6"
+pi_atom = "~0.7"
 log = "~0.4"
-pi-async-rt = "~0.3"
-pi_async_file = "~0.8"
-pi_async_transaction = { version = "~0.11", path = "../pi_async_transaction" }
-pi_store = { version = "~0.10", path = "../pi_store" }
+pi-async-rt = "~0.5"
+pi_async_file = "~0.9"
+pi_async_transaction = { version = "~0.12" }
+pi_store = "~0.11"
 pi_guid = "~0.1"
 pi_bon = "~0.3"
-pi_sinfo = "~0.5"
-pi_ordmap = "~0.3.2"
+pi_sinfo = "~0.6"
+pi_ordmap = "~0.5"
 pi_hash = "~0.1"
 redb = "~2.6"
 opentelemetry = { version = "~0.30", optional = true }
