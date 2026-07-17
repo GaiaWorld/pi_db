@@ -1,3 +1,9 @@
+//! 根提交日志与单个日志表的同步拉取式诊断读取器。
+//!
+//! inspector 在 `MultiTaskRuntime` 上异步 replay，但 `new`/`next` 通过有界通道同步等待；它们
+//! 是运维与离线诊断工具，不应放在数据库事务热路径或不能阻塞的 runtime owner 线程中。
+//! 解析器信任日志由当前 `pi_db` 版本生成，不能把任意不可信字节作为输入。
+
 use std::fmt::Debug;
 use std::convert::TryInto;
 use std::path::{Path, PathBuf};
@@ -19,9 +25,12 @@ use crate::{KVTableMeta,
             tables::{KVTable,
                      meta_table::MetaTable}};
 
+/// 逐项检查根提交日志中的事务表动作。
 ///
-/// 提交日志侦听器
-///
+/// [`Self::begin`] 与 [`Self::next`] 组成单消费者 pull 协议；
+/// [`Self::begin_with_callback`] 是互斥的 callback 协议。实例用原子状态禁止两种协议同时
+///启动，但不保证多个线程并发调用 `next` 时响应归属稳定，因此每次检查只应有一个消费者。
+/// inspector 不修改 WAL 的确认、`.bak`、repair 或数据库数据状态。
 pub struct CommitLogInspector {
     rt:                 MultiTaskRuntime<()>,                                           //运行时
     logger:             CommitLogger,                                                   //提交日志
@@ -32,11 +41,18 @@ pub struct CommitLogInspector {
     response_receiver:  Receiver<Option<(Guid, Guid, Atom, bool, Vec<u8>, Vec<u8>)>>,   //响应接收器
 }
 
+// SAFETY: runtime、CommitLogger、channel 和 AtomicIsize 均提供跨线程同步；外层没有裸指针或
+// 可变引用。业务层仍须遵守单消费者 `next` 协议。
 unsafe impl Send for CommitLogInspector {}
+// SAFETY: `&self` 访问只经线程安全句柄和原子状态；并发调用是否有稳定响应归属是协议问题，
+// 不会形成内存数据竞争。
 unsafe impl Sync for CommitLogInspector {}
 
 impl CommitLogInspector {
-    /// 构建提交日志侦听器
+    /// 构造一个尚未开始 replay 的根提交日志 inspector。
+    ///
+    /// O(1)，只 clone logger/runtime 并创建容量为 1 的请求/响应通道，不读取文件。logger 和
+    /// runtime 必须在后续整个检查期间保持可用；共享句柄由本实例持有。
     pub fn new(rt: MultiTaskRuntime<()>, logger: CommitLogger) -> Self {
         let (request_sender, request_receiver) = bounded(1);
         let (response_sender, response_receiver) = bounded(1);
@@ -52,7 +68,12 @@ impl CommitLogInspector {
         }
     }
 
-    /// 开始侦听
+    /// 启动 pull 模式 replay。
+    ///
+    /// 返回 `false` 表示本实例已有进行中的 pull 或 callback replay；返回 `true` 仅表示状态已
+    /// 切换且任务已提交，不表示 WAL 已成功打开、解析或读取。每个动作都会等待一次
+    /// [`Self::next`] 请求，消费者停止调用会让 replay 任务停在通道等待处。底层 replay 错误
+    /// 当前不会通过本 API 返回；截断或格式不匹配的 prepare buffer 可能 panic。
     pub fn begin(&self) -> bool {
         match self.status.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed) {
             Err(_) => {
@@ -189,7 +210,14 @@ impl CommitLogInspector {
         true
     }
 
-    //继续侦听下一条提交日志，并返回提交日志的信息，如果侦听结束，则返回None
+    /// 同步请求并返回下一条根提交日志动作。
+    ///
+    /// tuple 依次为 `(tid, cid, table, is_upsert, key, value)`；两个 ID 以十进制字符串返回。
+    /// `is_upsert = false` 表示 delete，此时 `value` 是当前诊断格式使用的 `[0]` 占位，不是
+    /// 被删除的旧值。Meta 的 Key/Value 会转换为表名和调试形式的表元数据。
+    ///
+    /// 未开始、replay 已结束或通道失败时返回 `None`；无法从 `None` 区分这些原因。活动期会
+    /// 阻塞当前 OS 线程直到 runtime 产生响应，只允许单消费者按顺序调用。
     pub fn next(&self) -> Option<(String, String, String, bool, Vec<u8>, Vec<u8>)> {
         if self.status.load(Ordering::Relaxed) == 0 {
             //侦听已完成，则立即返回侦听结束
@@ -218,7 +246,13 @@ impl CommitLogInspector {
         }
     }
 
-    /// 注册回调，并开始侦听
+    /// 启动 callback 模式 replay。
+    ///
+    /// callback 在 runtime replay 任务中同步执行；每条记录依次收到
+    /// `(tid, cid, table, method, timestamp, key, value)`，结束时收到一次 `None`。长时间阻塞、
+    /// panic 或重入 callback 会直接影响 replay 任务，调用方必须自行把重工作转交其它执行器。
+    /// 返回 `false` 表示已有检查正在进行；`true` 只表示任务已提交，底层 replay 错误当前不
+    /// 向调用方回传。本模式不与 [`Self::next`] 联用。
     pub fn begin_with_callback(&self,
                                callback: impl Fn(Option<(Guid, Guid, String, LogMethod, u64, Vec<u8>, Vec<u8>)>) + Send + Sync + 'static)
         -> bool
@@ -359,9 +393,10 @@ impl CommitLogInspector {
     }
 }
 
+/// 逐项检查单个 LogOrdered/日志格式表目录的 pull 式读取器。
 ///
-/// 日志表侦听器
-///
+/// 该工具读取日志记录而不修改表，不建立事务快照，也不提供数据库查询语义。调用方必须按
+/// `new -> begin -> next* -> None` 使用，并保持单消费者。
 pub struct LogTableInspector {
     rt:                 MultiTaskRuntime<()>,                               //运行时
     log_file:           LogFile,                                            //日志文件
@@ -372,11 +407,18 @@ pub struct LogTableInspector {
     response_receiver:  Receiver<Option<(String, bool, Vec<u8>, Vec<u8>)>>, //响应接收器
 }
 
+// SAFETY: 所有字段均为线程安全 runtime/LogFile/channel/atomic 句柄；移动 inspector 不移动
+// 自引用数据。单消费者是响应归属约束，不是内存安全前提。
 unsafe impl Send for LogTableInspector {}
+// SAFETY: 共享访问只通过 LogFile、channel 和 AtomicIsize 的同步 API，不暴露内部可变引用。
 unsafe impl Sync for LogTableInspector {}
 
 impl LogTableInspector {
-    /// 构建日志表侦听器
+    /// 打开指定表目录并构造尚未开始加载的 inspector。
+    ///
+    /// 文件打开在 `rt` 上异步执行，但本函数同步等待有界通道，因此可能阻塞当前 OS 线程。
+    /// 打开或通道失败返回 `io::ErrorKind::Other`；成功不表示日志内容已完整校验。不要在无法
+    /// 继续调度打开任务的 runtime owner 线程中调用。
     pub fn new<P: AsRef<Path> + Debug + Clone + Send + Sync + 'static>(rt: MultiTaskRuntime<()>,
                                                                        table_path: P) -> Result<Self> {
         let rt_copy = rt.clone();
@@ -428,7 +470,11 @@ impl LogTableInspector {
         })
     }
 
-    /// 开始侦听
+    /// 启动表日志 pull 加载。
+    ///
+    /// 已有加载任务时返回 `false`；否则切换状态、提交异步 load 并返回 `true`。`true` 不代表
+    /// load 已成功，底层加载错误会在 runtime 任务中 panic。每条记录都等待一次
+    /// [`Self::next`] 请求；停止消费会使任务停在通道等待处。
     pub fn begin(&self) -> bool {
         match self.status.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed) {
             Err(_) => {
@@ -480,7 +526,11 @@ impl LogTableInspector {
         true
     }
 
-    //继续侦听下一条日志，并返回日志的信息，如果侦听结束，则返回None
+    /// 同步请求并返回下一条表日志记录。
+    ///
+    /// tuple 为 `(log_file, is_upsert, key, value)`；delete 记录的 `is_upsert` 为 `false`，
+    /// `value` 是 `[0]` 占位而非旧值。未开始、已结束或通道错误均返回 `None`，活动期会阻塞
+    /// 当前 OS 线程等待 runtime 响应。多个线程不得并发消费同一实例。
     pub fn next(&self) -> Option<(String, bool, Vec<u8>, Vec<u8>)> {
         if self.status.load(Ordering::Relaxed) == 0 {
             //侦听已完成，则立即返回侦听结束

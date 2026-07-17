@@ -12,29 +12,38 @@ use pi_async_transaction::{AsyncTransaction,
                            TransactionTree};
 
 use crate::{Binary,
-            KVAction};
+            KVAction,
+            MAX_TABLE_NAME_BYTES};
 
+mod ordmap_snapshot;
+
+/// 数据库表注册信息及持久化元数据表。
 pub mod meta_table;
+/// 基于 COW 有序 Map 的内存表。
 pub mod mem_ord_table;
+/// 以日志文件保存数据的可查询有序表。
 pub mod log_ord_table;
+/// 只写日志表；当前不属于允许外部使用的表类型。
 pub mod log_write_table;
 // pub mod b_tree_ord_table_old;
+/// 以事务内 COW 缓存和 redb 数据文件组成的 Btree 表。
 pub mod b_tree_ord_table;
 
+/// 五类键值表共同遵守的表级契约。
 ///
-/// 默认的数据库表名最大长度，64KB
-///
-const DEFAULT_DB_TABLE_NAME_MAX_LEN: usize = 0xffff;
-
-///
-/// 抽象的键值对表
-///
+/// trait 同时定义表属性、子事务构造、整理入口以及根 WAL 中表片段的编码/解码格式。事务
+/// manager 通过关联的 `Tr` 把表事务挂入根事务树；应用层应通过 `KVDBManager`/
+/// `KVDBTransaction` 使用这些能力，而不是直接构造表或表事务。默认 WAL helper 信任输入是
+/// 当前库生成的完整缓冲区，畸形或截断数据可能 panic，不能作为不可信网络解码器使用。
 pub trait KVTable: Send + Sync + 'static {
+    /// 表名句柄；当前内置实现使用 `Atom`，名称须满足全库表名边界。
     type Name: AsRef<str> + Debug + Clone + Send + 'static;
+    /// 与该表绑定的事务树节点，必须同时实现动作、生命周期、顺序和 2PC 契约。
     type Tr: KVAction + TransactionTree + SequenceTransaction + UnitTransaction + Transaction2Pc + AsyncTransaction;
+    /// 表构造、整理或持久化操作返回的错误类型。
     type Error: Debug + Send + 'static;
 
-    /// 获取表名，表名最长为64KB
+    /// 获取表名；UTF-8 编码长度必须位于 `1..=MAX_TABLE_NAME_BYTES`
     fn name(&self) -> <Self as KVTable>::Name;
 
     /// 获取表所在目录的路径
@@ -74,8 +83,9 @@ pub trait KVTable: Send + Sync + 'static {
         let table_name = self.name().as_ref().to_string();
         let bytes = table_name.as_bytes();
         let bytes_len = bytes.len();
-        if bytes_len == 0 || bytes_len > DEFAULT_DB_TABLE_NAME_MAX_LEN {
-            //无效的表名长度，则立即抛出异常
+        if bytes_len == 0 || bytes_len > MAX_TABLE_NAME_BYTES {
+            // DDL/启动入口必须先拒绝非法名称；这里是防止内部构造绕过公开边界后截断 u16
+            // 长度并生成不可恢复 WAL 的最后一道不变量检查。
             panic!("Init table prepare output failed, table_name: {:?}, reason: invalid table name length", table_name.as_str());
         }
 
@@ -163,21 +173,31 @@ pub trait KVTable: Send + Sync + 'static {
     }
 }
 
+/// 版本批量事务与根事务分发表动作时使用的表/Key/Value 三元组。
 ///
-/// 表键值
-///
+/// `value = Some` 表示 upsert，`value = None` 表示 delete。它不是带版本号的快照，也不验证
+/// 表是否存在、Key 编码是否合法或 Value 是否为空；这些边界由数据库入口和协议层负责。
+/// clone 会克隆 `Atom` 并增加 `Binary` 的共享引用计数，不复制二进制 payload。
 #[derive(Debug, Clone)]
 pub struct TableKV {
-    pub table:  Atom,           //表名
-    pub key:    Binary,         //关键字
-    pub value:  Option<Binary>, //值
+    /// 目标表名。
+    pub table:  Atom,
+    /// 目标 Key 的表类型编码。
+    pub key:    Binary,
+    /// `Some` 为写入值，`None` 为逻辑删除。
+    pub value:  Option<Binary>,
 }
 
+// SAFETY: `Atom` 和 `Binary` 都是线程安全共享 owner，`Option<Binary>` 不增加额外内部可变性；
+// 移动三元组不会创建可变别名。合法表名/编码属于协议正确性，不属于内存安全前提。
 unsafe impl Send for TableKV {}
+// SAFETY: 所有字段仅通过共享不可变引用公开，底层引用计数对象可安全跨线程共享。
 unsafe impl Sync for TableKV {}
 
 impl TableKV {
-    /// 构建一个表键值
+    /// 构造一个尚未校验的表动作。
+    ///
+    /// O(1)，不执行表查找、锁、I/O 或版本登记；调用方仍须通过合法事务入口提交。
     pub fn new(table: Atom,
                key: Binary,
                value: Option<Binary>) -> Self {
@@ -188,9 +208,10 @@ impl TableKV {
         }
     }
 
-    /// 判断是否有值
+    /// 判断该动作是否携带 upsert 值。
+    ///
+    /// 返回 `false` 表示 delete tombstone，而不是“写入空二进制”。O(1)、纯只读。
     pub fn exist_value(&self) -> bool {
         self.value.is_some()
     }
 }
-

@@ -1,6 +1,25 @@
+//! 数据库启动、表注册、管理入口与根事务树装配。
+//!
+//! 本模块位于公开数据库 API 与 `pi_async_transaction`/`pi_store` 之间：
+//!
+//! - [`crate::db::KVDBManagerBuilder`] 创建目录、加载内部 Meta 表和用户表，然后始终通过内部
+//!   `try_repair` 重放未确认的根前导日志；
+//! - [`crate::db::KVDBManager`] 共享 runtime、两阶段事务管理器、根 WAL logger、表注册表和事件通道；
+//! - [`crate::db::KVDBTransaction`] 是公开事务句柄，应用层只能把
+//!   [`crate::db::KVDBTransaction::RootTr`] 当作
+//!   动作和生命周期入口，其余 variant 是事务树内部子节点；
+//! - [`crate::db::RootTransaction`] 按首次触表顺序持有子事务，并把 prepare、根 WAL、子表发布和最终
+//!   确认串成两阶段提交闭环。
+//!
+//! 当前 `close`、只读事务写入、timeout 和 prepare token 仍按实现事实记录，并不是最终或
+//! 最佳设计。稳定事务/确认协议见 `docs/SEMANTIC_CONTRACTS.md#contract-transaction`，管理器
+//! 当前契约由 `tests/manager_contract.rs` 验证，根生命周期由
+//! `tests/root_transaction_lifecycle.rs` 验证。
+
 use std::mem::swap;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use std::convert::TryInto;
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::collections::{VecDeque, HashMap, BTreeMap};
 use std::io::{Error, Result as IOResult, ErrorKind};
@@ -30,7 +49,7 @@ use pi_guid::Guid;
 use pi_async_rt::{lock::spin_lock::SpinLock,
                   rt::{AsyncRuntime, AsyncValue,
                        multi_thread::MultiTaskRuntime}};
-use pi_async_transaction::{AsyncTransaction, Transaction2Pc, UnitTransaction, SequenceTransaction, TransactionTree, AsyncCommitLog, ErrorLevel, TransactionError,
+use pi_async_transaction::{AsyncTransaction, Transaction2Pc, Transaction2PcAllConflicts, UnitTransaction, SequenceTransaction, TransactionTree, AsyncCommitLog, ErrorLevel, TransactionError,
                            manager_2pc::{Transaction2PcStatus, Transaction2PcManager}};
 use pi_async_file::file::create_dir;
 use pi_hash::XHashMap;
@@ -42,6 +61,16 @@ use crate::{Binary,
             TableTrQos,
             KVDBCommitConfirm,
             KVTableTrError,
+            MAX_TABLE_NAME_BYTES,
+            TableKey,
+            TableKeyVersion,
+            Version,
+            key_version::{KeyVersionConfig,
+                          KeyVersionRegistry,
+                          KeyVersions,
+                          PrepareMode,
+                          TableVersionContext,
+            VersionReceipt},
             tables::{KVTable,
                      TableKV,
                      meta_table::{MetaTable,
@@ -101,6 +130,9 @@ const STARTUP_DB_SOURCE: &str = "Startup db";
 ///
 const REPAIR_DB_SOURCE: &str = "Repair db";
 
+const DEFAULT_KEY_VERSION_TTL: Duration = Duration::from_secs(60 * 60);
+const DEFAULT_KEY_VERSION_TTL_POLL_INTERVAL: Duration = Duration::from_secs(3 * 60);
+
 // 表缓存大小仪表
 #[cfg(feature = "trace")]
 static TABLE_CACHE_SIZE_METER: OnceLock<Meter> = OnceLock::new();
@@ -118,9 +150,15 @@ pub(crate) async fn get_table_cache_size_meter<'a, R>(rt: R) -> &'a Meter
     TABLE_CACHE_SIZE_METER.get_or_init(|| global::meter("table_cache_size"))
 }
 
+/// 键值对数据库管理器的一次性构建器。
 ///
-/// 键值对数据库管理器构建器
+/// 构建器拥有多线程 runtime、[`Transaction2PcManager`] 和三个词法路径；[`Self::new`] 不做
+/// I/O，真正的目录创建、表加载、根 WAL 修复和后台任务启动发生在 [`Self::startup`] 或
+/// [`Self::startup_with_listener`]。启动方法消费 `self`，同一构建器不能重复启动。
 ///
+/// 该类型本身不提供配置持久化：LogOrdered/Btree 首次创建时的运行参数不会写入 Meta，重启
+/// 使用固定默认值。启动不是事务原子操作，失败前已经创建的目录、文件或后台资源可能保留。
+/// 真实入口和边界由 `tests/manager_contract.rs` 及恢复专项验证。
 pub struct KVDBManagerBuilder<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>,
@@ -130,6 +168,8 @@ pub struct KVDBManagerBuilder<
     db_path:            PathBuf,                            //数据库的表文件所在目录
     tables_meta_path:   PathBuf,                            //数据库的元信息表文件所在目录
     tables_path:        PathBuf,                            //数据库表文件所在目录
+    key_version_ttl:    Duration,                           //Key 版本记录的生存时长
+    key_version_ttl_poll_interval: Duration,                //Key 版本 TTL 固定轮询间隔
 }
 
 /*
@@ -139,7 +179,15 @@ impl<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>,
 > KVDBManagerBuilder<C, Log> {
-    /// 构建键值对数据库管理器构建器
+    /// 保存 runtime、事务管理器和数据库根路径，构造数据库启动计划。
+    ///
+    /// `rt` 必须是可继续接收任务的多线程 runtime；启动、表 collector、事件监听和最终 WAL
+    /// 确认都会克隆并长期使用它。`tr_mgr` 的 commit logger 决定根 WAL 的真实位置，它可以与
+    /// `path` 分离。`path` 只按 [`AsRef<Path>`] 复制，不会 canonicalize、创建、校验权限或
+    /// 检查路径逃逸；相对路径仍相对于后续进程工作目录解释。
+    ///
+    /// 本函数为 O(p) 时间和空间，p 为路径长度；除分配和所有权转移外无副作用，不持锁、
+    /// 不执行 I/O，也不会启动任务。
     pub fn new<P: AsRef<Path>>(rt: MultiTaskRuntime<()>,
                                tr_mgr: Transaction2PcManager<C, Log>,
                                path: P) -> Self {
@@ -153,7 +201,31 @@ impl<
             db_path,
             tables_meta_path,
             tables_path,
+            key_version_ttl: DEFAULT_KEY_VERSION_TTL,
+            key_version_ttl_poll_interval: DEFAULT_KEY_VERSION_TTL_POLL_INTERVAL,
         }
+    }
+
+    /// 设置 Key 版本记录的 TTL。
+    ///
+    /// 默认一小时；`Duration::ZERO` 关闭自动淘汰且不会创建后台 TTL 任务。配置只影响版本
+    /// 证据的内存生命周期，不删除表数据，也不改变 WAL 和数据文件持久化语义。
+    /// 最小单位是 1ms：非零 sub-ms 值按 1ms 处理，其余不足 1ms 的小数直接忽略。历史
+    /// `BUG-KV-TTL-001` 已通过 deadline 基准向上取整修复；版本不得早于量化后的有效 TTL
+    /// 淘汰，证据和边界见 `docs/KEY_VERSION_TTL_EARLY_EXPIRY_BUG.md`。
+    pub fn key_version_ttl(mut self, ttl: Duration) -> Self {
+        self.key_version_ttl = ttl;
+        self
+    }
+
+    /// 设置 Key 版本 TTL 的固定轮询间隔。
+    ///
+    /// 默认三分钟。TTL 开启时 ZERO 属于非法启动配置；TTL 关闭时该值不生效。
+    /// 间隔同样使用 1ms 最小单位并忽略其余小数；这一量化属于配置语义，不是
+    /// `BUG-KV-TTL-001`。
+    pub fn key_version_ttl_poll_interval(mut self, interval: Duration) -> Self {
+        self.key_version_ttl_poll_interval = interval;
+        self
     }
 }
 
@@ -164,14 +236,42 @@ impl<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>,
 > KVDBManagerBuilder<C, Log> {
-    /// 异步启动键值对数据库，并返回键值对数据库的管理器
+    /// 启动不带事件回调的数据库。
+    ///
+    /// `enable_accelerated_repair` 只传给 Btree 打开/恢复相关路径；无论它为 `false` 还是
+    /// `true`，启动都会执行完整的内部 `try_repair` 根 WAL 扫描，而不是切换成另一套
+    /// `try_quick_repair` 前导日志协议。该开关不改变 Meta、Memory、LogOrdered 或 LogWrite
+    /// 的逻辑数据语义。
+    ///
+    /// 成功返回共享的 [`KVDBManager`]。未安装 listener，因此
+    /// [`KVDBManager::report_transaction_info`] 会返回 `ConnectionAborted`。错误保留底层目录、
+    /// 表加载或恢复原因，但启动不具备 rollback/cancellation 原子性，失败前已产生的文件系统
+    /// 副作用不会由本 API 撤销。
+    ///
+    /// 运行时间为 O(t + w)，t 为 Meta 中用户表数，w 为待扫描/重放 WAL 字节数，并包含真实
+    /// 异步文件 I/O、同步锁和表引擎打开成本。单 worker runtime 上的 repair 可能阻塞，见
+    /// `FIND-REPAIR-001`。
     pub async fn startup(self, enable_accelerated_repair: bool) -> IOResult<KVDBManager<C, Log>> {
         self
             .startup_with_listener::<fn(&KVDBManager<C, Log>, &Transaction2PcManager<C, Log>, &mut Vec<KVDBEvent<Guid>>)>(enable_accelerated_repair, None)
             .await
     }
 
-    /// 异步启动指定监听器的键值对数据库，并返回键值对数据库的管理器
+    /// 启动数据库，并可选安装批量事件回调。
+    ///
+    /// 启动顺序是：确保 Meta/用户表目录存在，打开内部 Meta 表，按 Meta 快照批量加载用户表，
+    /// 调用内部 `try_repair` 修复未确认根 WAL，最后启动 listener 任务并把数据库标为可用。
+    /// `enable_accelerated_repair` 的语义与 [`Self::startup`] 相同。
+    ///
+    /// `db_event_listener=None` 不创建事件通道。传入 `Some` 时，回调被保存到一个长期 runtime
+    /// 任务中，并以 `FnMut(&KVDBManager, &Transaction2PcManager, &mut Vec<KVDBEvent>)` 形式同步、
+    /// 串行调用。回调必须在返回前 `drain` 或 `clear` 已处理元素；框架不会清空 Vec。回调阻塞
+    /// 会占用 worker，panic 会终止监听任务；通道无界，生产速度长期超过消费速度会增长内存。
+    /// 回调可以读取共享 manager，但重入异步维护/DDL 时必须自行避免锁顺序问题。
+    ///
+    /// 返回、错误、副作用、取消安全和复杂度与 [`Self::startup`] 相同。启动过程会分配表注册表、
+    /// channel 和表对象并执行文件 I/O；不是幂等的“探测”操作，也不保证多个进程或 manager
+    /// 可以同时打开同一路径。真实 listener 契约由 `tests/manager_contract.rs` 验证。
     pub async fn startup_with_listener<F>(
         self,
         enable_accelerated_repair: bool,
@@ -179,6 +279,9 @@ impl<
     ) -> IOResult<KVDBManager<C, Log>>
     where F: FnMut(&KVDBManager<C, Log>, &Transaction2PcManager<C, Log>, &mut Vec<KVDBEvent<Guid>>) + Send + Sync + 'static
     {
+        // TTL 配置必须先于目录、文件、channel 和表对象创建完成校验，保证 InvalidInput 零副作用。
+        let key_version_config = KeyVersionConfig::new(self.key_version_ttl,
+                                                       self.key_version_ttl_poll_interval)?;
         if !self.tables_meta_path.exists() {
             //指定路径的元信息表目录不存在，则创建
             let _ = create_dir(self.rt.clone(), self.tables_meta_path.clone()).await?;
@@ -196,6 +299,7 @@ impl<
         let tables_meta_path = self.tables_meta_path;
         let tables_path = self.tables_path;
         let tables = Arc::new(RwLock::new(XHashMap::default()));
+        let (key_versions, key_version_ttl_receiver) = KeyVersionRegistry::new(key_version_config);
         let status = AtomicU64::new(DB_INITING_STATUS);
         let (notifier, listener) = if db_event_listener.is_some() {
             let (notifier, listener) = unbounded();
@@ -210,6 +314,7 @@ impl<
             tables_meta_path,
             tables_path,
             tables,
+            key_versions,
             status,
             listener,
             notifier,
@@ -230,7 +335,11 @@ impl<
                            16 * 1024 * 1024,
                            60 * 1000,
                            db_mgr.0.notifier.clone()).await;
-        db_mgr.0.tables.write().await.insert(meta_table_name.clone(), KVDBTable::MetaTab(meta_table));
+        let meta_versions = db_mgr.0.key_versions.create_table_versions();
+        db_mgr.0.key_versions.install(meta_table_name.clone(), meta_versions.clone());
+        db_mgr.0.tables.write().await.insert(meta_table_name.clone(),
+                                             RegisteredTable::new(KVDBTable::MetaTab(meta_table),
+                                                                  meta_versions));
 
         //根据元信息表的元信息，加载其它表，加载操作使用的事务，不需要预提交和提交
         let mut tr = db_mgr
@@ -263,6 +372,10 @@ impl<
                     table_name
                 }
             };
+
+            validate_table_name(&table_name,
+                                ErrorKind::InvalidData,
+                                "load table metadata")?;
 
             if table_name == meta_table_name {
                 //忽略元信息表
@@ -320,6 +433,8 @@ impl<
         info!("Load db succeeded, tables: {:?}, time: {:?}",
             db_mgr.table_size().await,
             now.elapsed());
+        drop(meta_iterator);
+        drop(tr);
 
         //如果有未确认的提交日志，则尝试修复数据库表数据
         let now = Instant::now();
@@ -339,6 +454,10 @@ impl<
                 }
             }
         }
+
+        // repair 期间产生的版本只服务内部恢复，不得暴露给启动后的外部缓存。
+        db_mgr.0.key_versions.clear_records();
+        db_mgr.0.key_versions.start_ttl_task(db_mgr.0.rt.clone(), key_version_ttl_receiver);
 
         if let Some(mut handle) = db_event_listener {
             //指定了数据库事件监听器
@@ -420,18 +539,31 @@ impl<
     }
 }
 
+/// 已启动数据库的共享管理句柄。
 ///
-/// 键值对数据库管理器
+/// clone 只增加内部 [`Arc`] 强引用，所有 clone 共享表注册表、关闭状态、事务管理器、根 WAL、
+/// listener 通道和 runtime。句柄被 drop 不等于数据库关闭：表 collector、listener 和 runtime
+/// 任务可能继续持有 manager/table 引用；[`Self::close`] 也只是立即禁止新事务的软关闭标记，
+/// 不等待数据文件、WAL 确认、后台任务或文件句柄释放。完整边界见
+/// `docs/SEMANTIC_CONTRACTS.md#q-close-001` 和 `FIND-LIFE-001`。
 ///
+/// 管理器允许跨线程共享；各表注册变更通过异步 `RwLock`，状态通过原子变量，事务和 logger
+/// 的并发安全依赖各自公开契约。真实管理 API 矩阵见 `tests/manager_contract.rs`。
 pub struct KVDBManager<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>,
 >(Arc<InnerKVDBManager<C, Log>>);
 
+// SAFETY: manager 只移动一个 Arc。Inner 中 registry 使用 async RwLock，状态使用 AtomicU64，
+// channel/runtime/Transaction2PcManager/AsyncCommitLog 均由其类型契约提供跨线程同步；路径在
+// 构造后只读。C 不以裸值直接存入 manager，而只出现在已要求 Send 的事务依赖类型中。
 unsafe impl<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>,
 > Send for KVDBManager<C, Log> {}
+// SAFETY: 所有通过共享 manager 访问的可变状态都位于上述同步原语或依赖类型之后；公开路径
+// 借用只读，Arc clone/drop 使用原子引用计数。该 impl 不赋予 listener 回调重入安全，调用方
+// 仍须遵守 FIND-ASYNC-001 记录的锁顺序边界。
 unsafe impl<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>,
@@ -453,23 +585,47 @@ impl<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>
 > KVDBManager<C, Log> {
-    /// 获取键值对数据库所在目录的路径
+    /// 借用构建器保存的数据库根路径。
+    ///
+    /// 返回值与 `self` 生命周期相同，是构建时路径的词法副本，不保证 canonical、存在、可写，
+    /// 也不表示 commit logger 的 WAL 路径。O(1)、纯只读、无分配、无锁和无 I/O；所有 clone
+    /// 返回相同路径内容。
     pub fn db_path(&self) -> &Path {
         &self.0.db_path
     }
 
-    /// 获取键值对数据库的元信息表所在目录的路径
+    /// 借用内部 Meta 表目录。
+    ///
+    /// 路径固定为 `db_path/.tables_meta`，启动成功时应已存在；它是 Meta 表数据目录，不是
+    /// 根 WAL 目录。返回借用不转移所有权，O(1)、无锁、无分配和无 I/O。
     pub fn tables_meta_path(&self) -> &Path {
         &self.0.tables_meta_path
     }
 
-    /// 获取键值对数据库的表所在目录的路径
+    /// 借用持久化用户表的父目录。
+    ///
+    /// 路径固定为 `db_path/.tables`。Memory 表即使 `persistence=true` 也没有该目录下的数据
+    /// 文件；该标志只使动作进入根 WAL。返回借用为 O(1)、只读、无锁、无分配和无 I/O。
     pub fn tables_path(&self) -> &Path {
         &self.0.tables_path
     }
 
-    /// 创建一个键值对数据库的根事务
-    /// 根事务是否需要持久化，根据根事务的所有子事务中，是否有执行了写操作且需要持久化的子事务确定，如果有这种子事务存在，则根事务也需要持久化
+    /// 创建尚未注册到两阶段管理器的根事务句柄。
+    ///
+    /// `source` 被事务持有并用于 UID/统计/事件；`is_writable` 决定 prepare/commit 主路径，
+    /// 但当前动作 API 没有统一拒绝只读写入，只读写可能先返回成功、随后在 prepare 快路中
+    /// 被静默丢弃。这是 `FIND-TR-001` 的当前实现事实，不是最终或最佳只读契约。
+    /// `prepare_timeout` 和 `commit_timeout` 仅保存并传给子事务，当前没有计时、取消或错误路径，
+    /// 见 `FIND-TIMEOUT-001`；`0` 也不会被本函数拒绝。
+    ///
+    /// 数据库状态为初始化中或已初始化时返回 `Some(RootTr)`；调用 [`Self::close`] 后返回
+    /// `None`。创建本身不会分配事务 UID、注册 active transaction 或写 WAL，这些发生在
+    /// [`KVDBTransaction::prepare_modified`]。在 close 前已经创建的句柄当前仍可继续 prepare/
+    /// commit，这是软关闭边界而不是 graceful shutdown 保证。
+    ///
+    /// 根事务是否需要持久化由实际触达且需要持久化的写子事务决定。函数为摊销 O(1)，会分配
+    /// Arc 和空的子事务 map/list，不执行文件 I/O、不 await；句柄反向持有 manager clone，因而
+    /// 会延长数据库对象生命周期，但没有从 manager 指回该事务的环，直到 prepare 注册为止。
     pub fn transaction(&self,
                        source: Atom,
                        is_writable: bool,
@@ -500,14 +656,22 @@ impl<
             childs_map,
             childs,
             db_mgr,
+            version_context: SpinLock::new(None),
         };
 
         Some(KVDBTransaction::RootTr(RootTransaction(Arc::new(inner))))
     }
 
+    /// 请求当前进程的 glibc allocator 归还可释放页。
     ///
-    /// 在整理数据表后清理内存缓冲区
+    /// 仅 Linux 提供，直接调用 `malloc_trim(0)`；`true` 表示 allocator 报告释放了内存，
+    /// `false` 不表示没有可回收对象。该操作作用于整个进程而非单个数据库，可能同步扫描
+    /// allocator 并阻塞调用线程，非纯函数、非确定性，也不保证降低 RSS。
     ///
+    /// # Safety
+    ///
+    /// FFI 参数 `0` 是 glibc 允许的 pad 值，调用不传入 Rust 指针。进程所用 allocator 必须
+    /// 与链接到的 libc 实现兼容；本 API 不应在时延敏感热路径频繁调用。
     #[cfg(target_os = "linux")]
     pub fn cleanup_buffer_after_collect_table(&self) -> bool {
         match unsafe { malloc_trim(0) } {
@@ -516,9 +680,17 @@ impl<
         }
     }
 
+    /// 设置共享 manager 的软关闭状态并立即禁止创建新事务。
     ///
-    /// 关闭数据库，立即禁止创建数据库事务
+    /// 若两阶段管理器当前没有已注册事务，状态直接设为 Closed；否则设为 Closing。所有 clone
+    /// 立即观察同一关闭结果，重复调用不会重新开放数据库。调用无返回值，不等待活跃事务、
+    /// 子表异步持久化、根 WAL 确认、collector/listener 退出或文件句柄释放，也不取消 close 前
+    /// 已创建但尚未 prepare 的事务句柄。最后一个 active transaction 完成后当前没有自动把
+    /// Closing 推进为 Closed；再次调用本方法才会重写状态。
     ///
+    /// 这是 `Q-CLOSE-001` / `FIND-CLOSE-001` 记录的当前实现，不是最终或最佳 shutdown API。
+    /// 操作为 O(1)，读取事务 registry 长度并原子写状态，不执行文件 I/O、不 await、不调用
+    /// 用户回调。真实边界由 `tests/manager_contract.rs` 验证。
     pub fn close(&self) {
         if self.0.tr_mgr.transaction_len() == 0 {
             //如果当前事务管理器没有任何正在执行的事务，则设置数据库状态为已关闭
@@ -537,26 +709,89 @@ impl<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>
 > KVDBManager<C, Log> {
-    /// 获取指定名称的表
+    /// 读取一个 Key 的当前逻辑值及同一 publication 窗口中的公开版本。
+    ///
+    /// 该入口不创建事务、不获取 prepare 锁，也不写 WAL 或数据文件。版本命中时只读取记录；
+    /// 缺席时会分配独立 Guid 并登记首次观察和 TTL，因此它不是纯函数。LogWrite 的逻辑值固定
+    /// 为 `None`；Btree 的真实点读错误返回可恢复 `Common(Normal)`，绝不伪装成 Key 不存在。
+    ///
+    /// 表名长度须为 1..=4096 字节，Key 长度须为 1..=u16::MAX。返回版本必须与值成对缓存，
+    /// 并且只能进入 `prepare_with_version -> commit_with_version` 独立协议；禁止与普通事务 API
+    /// 混用。完整契约见 `docs/KEY_VERSION_PUBLICATION_DESIGN.md#key-version-public-api` 和
+    /// `docs/PI_DB_SERVER_KEY_VERSION_API_HANDOFF.md#pi-db-server-query-with-version`。
+    pub async fn query_with_version(&self,
+                                    table: Atom,
+                                    key: Binary)
+        -> Result<(Option<Binary>, Version), KVTableTrError> {
+        validate_version_table_key(&table, &key, "query with version")?;
+        let registered = {
+            self.0
+                .tables
+                .read()
+                .await
+                .get(&table)
+                .cloned()
+        }.ok_or_else(|| {
+            KVTableTrError::new_transaction_error(
+                ErrorLevel::Normal,
+                format!("Query with version failed, table: {:?}, reason: table not found",
+                        table.as_str()))
+        })?;
+
+        let _publication = registered.versions.publication().read().await;
+        let value = match &registered.table {
+            KVDBTable::MetaTab(table) => table.query_committed(&key),
+            KVDBTable::MemOrdTab(table) => table.query_committed(&key),
+            KVDBTable::LogOrdTab(table) => table.query_committed(&key),
+            KVDBTable::LogWTab(_) => None,
+            KVDBTable::BtreeOrdTab(table) => table
+                .query_committed(&key)
+                .map_err(|e| KVTableTrError::new_transaction_error(ErrorLevel::Normal, e))?,
+        };
+        let version = registered
+            .versions
+            .first_observation(key,
+                               value.is_some(),
+                               || self.0.tr_mgr.alloc_transaction_uid());
+
+        Ok((value, version))
+    }
+
+    /// 克隆指定名称的内部表句柄。
+    ///
+    /// 这是 crate 内模块间接口；`table_name` 只在 await 期间借用。存在时返回共享表 clone，
+    /// 不存在或已经从 registry 移除时返回 `None`。返回句柄可继续延长表生命周期，因此 registry
+    /// 删除不等于立即释放文件、collector 或内存。平均 O(1)，短暂获取异步 registry 读锁，
+    /// 不执行表 I/O。
     pub(crate) async fn get_table(&self, table_name: &Atom) -> Option<KVDBTable<C, Log>> {
         if let Some(table) = self.0.tables.read().await.get(table_name) {
-            Some(table.clone())
+            Some(table.table.clone())
         } else {
             None
         }
     }
 
-    /// 异步判断指定名称的表是否存在
+    /// 判断表名当前是否注册。
+    ///
+    /// `table_name` 不会被保存；内部 `.tables_meta` 也计为存在。结果是调用时 registry 状态，
+    /// 不是事务快照，返回后可立即因 DDL 改变。平均 O(1)，获取一次异步读锁，无文件 I/O。
     pub async fn is_exist(&self, table_name: &Atom) -> bool {
         self.0.tables.read().await.contains_key(table_name)
     }
 
-    /// 异步获取键值对数据库的表数量
+    /// 返回当前 registry 条目数。
+    ///
+    /// 数量包含内部 `.tables_meta`，不只包含用户表；是瞬时值而非跨调用稳定快照。平均 O(1)，
+    /// 获取一次异步读锁，无分配和文件 I/O。
     pub async fn table_size(&self) -> usize {
         self.0.tables.read().await.len()
     }
 
-    /// 异步获取键值对数据库的所有表的名称列表
+    /// 克隆当前 registry 中全部表名。
+    ///
+    /// 返回列表包含内部 `.tables_meta`，顺序来自 hash map，未排序且不稳定。每个 [`Atom`] clone
+    /// 保持名称有效，但不保持表仍注册；调用方需要稳定顺序时必须自行排序。O(n) 时间和 O(n)
+    /// 新空间，迭代期间持异步 registry 读锁，不执行文件 I/O。
     pub async fn tables(&self) -> Vec<Atom> {
         let mut table_names = Vec::new();
         for key in self.0.tables.read().await.keys() {
@@ -566,9 +801,18 @@ impl<
         table_names
     }
 
-    /// 异步获取指定名称的数据表所在目录的路径，返回空表示指定名称的表不存在
+    /// 返回指定表实现报告的数据位置词法副本。
+    ///
+    /// 缺表返回 `None`。Meta、LogOrdered 和 LogWrite 返回各自日志目录；Btree 返回 redb 数据
+    /// 文件 `tables_path/<table>/table.dat`，不是其父目录；Memory 无论 `persistence` 为何都返回
+    /// `None`，因为它没有存储引擎数据文件。`None` 因此不能单独区分“缺表”和“已存在
+    /// Memory 表”，应与 [`Self::is_exist`] 联合判断。调用方不得把不同表 variant 的返回路径
+    /// 统一当作目录执行操作。
+    ///
+    /// 返回路径不保证 canonical、当前存在或可访问。平均 O(1) 查找加 O(p) 路径复制，短暂持
+    /// registry 读锁，不访问文件系统。
     pub async fn table_path(&self, table_name: &Atom) -> Option<PathBuf> {
-        match self.0.tables.read().await.get(table_name) {
+        match self.0.tables.read().await.get(table_name).map(|registered| &registered.table) {
             None => None,
             Some(KVDBTable::MetaTab(table)) => {
                 if let Some(path) = table.path() {
@@ -608,9 +852,14 @@ impl<
         }
     }
 
-    /// 异步判断指定名称的数据表是否可持久化，返回空表示指定名称的表不存在
+    /// 查询表的持久化标志。
+    ///
+    /// 缺表返回 `None`；存在时返回 `Some`。Meta、LogOrdered、LogWrite、Btree 当前总为
+    /// `Some(true)`；Memory 返回建表元信息中的标志。Memory 的 `true` 仅表示动作进入根 WAL，
+    /// 不会创建数据文件。结果是表实例属性，不表示当前事务已有待持久化动作或最终确认完成。
+    /// 平均 O(1)，短暂持 registry 读锁，无分配和文件 I/O。
     pub async fn is_persistent_table(&self, table_name: &Atom) -> Option<bool> {
-        match self.0.tables.read().await.get(table_name) {
+        match self.0.tables.read().await.get(table_name).map(|registered| &registered.table) {
             None => None,
             Some(KVDBTable::MetaTab(table)) => {
                 Some(table.is_persistent())
@@ -630,9 +879,13 @@ impl<
         }
     }
 
-    /// 异步判断指定名称的数据表是否有序，返回空表示指定名称的表不存在
+    /// 查询表是否报告为有序表。
+    ///
+    /// 缺表返回 `None`。当前五种内部/用户表都返回 `Some(true)`，包括只写语义的 LogWrite；
+    /// 该布尔值不能推导某表支持 query/delete/stream 的完整能力。平均 O(1)，短暂持 registry
+    /// 读锁，无分配和文件 I/O。
     pub async fn is_ordered_table(&self, table_name: &Atom) -> Option<bool> {
-        match self.0.tables.read().await.get(table_name) {
+        match self.0.tables.read().await.get(table_name).map(|registered| &registered.table) {
             None => None,
             Some(KVDBTable::MetaTab(table)) => {
                 Some(table.is_ordered())
@@ -652,9 +905,18 @@ impl<
         }
     }
 
-    /// 异步获取指定名称的数据表的记录数，返回空表示指定名称的表不存在
+    /// 获取表实现当前报告的记录数。
+    ///
+    /// 缺表返回 `None`。Meta/Memory/LogOrdered/LogWrite 从当前内存根读取；Btree 同步打开 redb
+    /// read transaction，再把只写 cache 粗略叠加到持久基线。Btree 当前会把 begin_read、
+    /// open_table 或 `table.len()` 错误折叠为 `Some(0)`，且 tombstone/overlay 计数语义仍有
+    /// `FIND-TABLE-002` 风险；因此该值不是可用于诊断存储健康的无损 Result。
+    ///
+    /// 调用持 registry 异步读锁并进入表内同步锁；Btree 还可能在 runtime worker 上执行同步
+    /// 文件支持读取，复杂度约 O(c log d)，c 为 cache key 数、d 为 redb 记录数。其它表通常
+    /// 为 O(1)。结果是调用时观察值，不与外部事务建立原子快照。
     pub async fn table_record_size(&self, table_name: &Atom) -> Option<usize> {
-        match self.0.tables.read().await.get(table_name) {
+        match self.0.tables.read().await.get(table_name).map(|registered| &registered.table) {
             None => None,
             Some(KVDBTable::MetaTab(table)) => {
                 Some(table.len())
@@ -674,9 +936,16 @@ impl<
         }
     }
 
-    /// 异步获取指定名称的数据表的缓存字节大小，返回空表示指定名称的表不存在
+    /// 获取表实现当前报告的内存缓存 payload 字节数。
+    ///
+    /// 缺表返回 `None`；存在空表通常返回 `Some(0)`。该值由表内 COW root/cache 的
+    /// `full_bytes_size` 提供，不包含 Arc、树节点、allocator、文件缓存、redb 页面缓存、WAL
+    /// 文件或后台任务开销，不能当作进程 RSS。Btree 只统计只写 cache，不统计 redb 数据。
+    ///
+    /// 调用短暂持 registry 异步读锁和表内同步锁，通常 O(1)、无文件 I/O；并发写入后返回值
+    /// 只代表本次读取时刻，不是事务快照。
     pub async fn table_cache_size(&self, table_name: &Atom) -> Option<u64> {
-        match self.0.tables.read().await.get(table_name) {
+        match self.0.tables.read().await.get(table_name).map(|registered| &registered.table) {
             None => None,
             Some(KVDBTable::MetaTab(table)) => {
                 Some(table.size())
@@ -696,15 +965,33 @@ impl<
         }
     }
 
-    /// 追加一个新的提交日志
+    /// 强制根 commit logger 轮换到一个新的 checkpoint。
+    ///
+    /// 成功返回 `pi_store::LogFile::split` 刚创建的可写 WAL 文件索引。依赖中的
+    /// `current_check_point()` 读取的是内部 `log_id` 的下一个待分配值，因此本方法成功后该值
+    /// 等于“返回索引 + 1”，不能把两者误认为同一个编号。每次调用都会创建/切换可写 WAL
+    /// 文件并把前一 checkpoint 加入只读确认队列，即使当前没有事务；因此不是纯函数，也不是
+    /// 幂等操作。它不会追加一条业务事务日志，`append_total_count` 不应因此增加。
+    ///
+    /// 该异步操作获取 logger checkpoint 锁并执行真实文件 I/O；并发 append/confirm/轮换按
+    /// `pi_store::CommitLogger` 锁顺序串行。错误原样作为 `io::Error` 返回，已发生的部分文件
+    /// 副作用不由本 API rollback。真实副作用由 `tests/manager_contract.rs` 验证。
     pub async fn append_new_commit_log(&self) -> IOResult<usize> {
         let commit_logger = self.0.tr_mgr.commit_logger();
         commit_logger.append_check_point().await
     }
 
-    /// 异步准备整理指定名称的数据表，准备整理成功，才允许开始整理表
+    /// 调用表实现的整理准备阶段。
+    ///
+    /// `table_name` 不会被保存。缺表当前静默返回 `Ok(())`；Memory/Btree 的准备阶段也是 no-op，
+    /// Meta/LogOrdered/LogWrite 会 split 各自日志文件。成功只表示表级准备返回成功，不自动调用
+    /// [`Self::collect_table`]，也不建立只能由同一调用者消费的一次性 token。
+    ///
+    /// 当前实现从取得 registry 读 guard 到表 future 完成期间一直持有该 guard，DDL registry
+    /// 写入可能被长 I/O 阻塞，见 `FIND-ASYNC-001`。底层表错误被格式化并统一包装为
+    /// `io::ErrorKind::Other`，错误等级信息不会结构化保留。非幂等表可能轮换文件。
     pub async fn ready_collect_table(&self, table_name: &Atom) -> IOResult<()> {
-        match self.0.tables.read().await.get(table_name) {
+        match self.0.tables.read().await.get(table_name).map(|registered| &registered.table) {
             None => (),
             Some(KVDBTable::MetaTab(table)) => {
                 if let Err(e) = table.ready_collect().await {
@@ -736,9 +1023,17 @@ impl<
         Ok(())
     }
 
-    /// 异步整理指定名称的数据表
+    /// 直接调用表实现的整理/压缩阶段。
+    ///
+    /// 缺表当前静默返回 `Ok(())`；Memory 为 no-op，日志表执行真实日志 collect，Btree 执行
+    /// redb 持久化/compact 路径。API 不检查调用方是否先调用 [`Self::ready_collect_table`]，
+    /// 不返回整理后的大小或记录数，也不保证与并发事务形成全库级原子边界。
+    ///
+    /// 调用可能长时间执行文件 I/O、同步 redb 锁和 runtime timeout；整个 await 期间当前仍持
+    /// registry 读 guard，见 `FIND-ASYNC-001`。表错误统一降为 `io::ErrorKind::Other`；Btree
+    /// collect 的重试控制另见 `FIND-TABLE-001`。该方法有文件副作用且不保证幂等。
     pub async fn collect_table(&self, table_name: &Atom) -> IOResult<()> {
-        match self.0.tables.read().await.get(table_name) {
+        match self.0.tables.read().await.get(table_name).map(|registered| &registered.table) {
             None => (),
             Some(KVDBTable::MetaTab(table)) => {
                 if let Err(e) = table.collect().await {
@@ -770,9 +1065,16 @@ impl<
         Ok(())
     }
 
+    /// 向可选 listener 通道发送一个事务信息报告请求事件。
     ///
-    /// 异步请求数据库的事务信息报告
+    /// 安装 listener 时，本方法把 [`KVDBEvent::ReportTrInfo`] 写入无界通道并返回；`Ok(())`
+    /// 只证明 send 接受了事件，不证明 listener 已被调度、已经清空该批事件或成功产出报告。
+    /// listener 回调可通过参数中的 [`Transaction2PcManager`] 自行读取当时统计。未安装 listener
+    /// 时返回 `io::ErrorKind::ConnectionAborted`。
     ///
+    /// 发送为异步安全且允许多线程并发，但通道无背压，持续调用可能增长内存。该 API 不持表
+    /// registry 锁、不执行文件 I/O、不等待用户回调，也不保证事件相对 collector 通知的全局
+    /// 顺序。真实投递由 `tests/manager_contract.rs` 验证。
     pub async fn report_transaction_info(&self) -> IOResult<()> {
         if let Some(notifier) = self.0.notifier.as_ref() {
             if let Err(e) = notifier.send(KVDBEvent::ReportTrInfo).await {
@@ -792,6 +1094,11 @@ impl<
     pub(crate) async fn try_repair(&self, enable_accelerated_repair: bool) -> IOResult<(usize, usize)> {
         //构建重播回调
         let db_mgr = self.clone();
+        // pi_store 当前会把 replay callback 的 io::Error 统一包装成 Other。该原子只标记
+        // “删表持久化输入非法”这一冻结分支，使 try_repair 能在不修改存储依赖和其它恢复
+        // 错误语义的前提下恢复 InvalidData 分类。
+        let invalid_remove_data = Arc::new(AtomicBool::new(false));
+        let invalid_remove_data_copy = invalid_remove_data.clone();
 
         let tables = Arc::new(Mutex::new(BTreeMap::new()));
         let tables_copy = tables.clone();
@@ -803,6 +1110,7 @@ impl<
             let (sender, receiver) = bounded(1);
 
             let tables_clone = tables_copy.clone();
+            let invalid_remove_data = invalid_remove_data_copy.clone();
             let boxed = async move {
                 let bytes_len = prepare_output.len(); //获取日志缓冲区长度
                 let mut offset = 0; //日志缓冲区偏移
@@ -855,11 +1163,41 @@ impl<
                                     }
                                 } else {
                                     //无值，则删除表
-                                    let table_name = Atom::from(write.key.as_ref());
+                                    // Meta tombstone 的 Key 与建表记录相同，都是 table_to_binary
+                                    // 生成的 BON Atom，不能把编码字节直接当 UTF-8 表名。该分支
+                                    // 只服务删表 WAL 恢复；解码失败表示持久化日志损坏。
+                                    // CONTRACT-DDL-REMOVE-001 / BUG-DDL-REMOVE-001：
+                                    // docs/SEMANTIC_CONTRACTS.md#contract-ddl-remove-crash-durability。
+                                    let table_name = match binary_to_table(&write.key) {
+                                        Err(e) => {
+                                            invalid_remove_data.store(true, Ordering::Release);
+                                            let _ = sender.send(Err(Error::new(
+                                                ErrorKind::InvalidData,
+                                                format!("Repair removed table failed, transaction_uid: {:?}, commit_uid: {:?}, table_key_bytes: {}, reason: decode table name failed: {:?}",
+                                                        transaciton_uid,
+                                                        commit_uid_copy,
+                                                        write.key.len(),
+                                                        e),
+                                            )));
+                                            return;
+                                        },
+                                        Ok(table_name) => table_name,
+                                    };
 
                                     if let Err(e) = tr.repair_remove_table(table_name.clone()).await {
-                                        //重播的移除表失败，则立即返回错误原因
-                                        let _ = sender.send(Err(Error::new(ErrorKind::Other, format!("Repair tables meta failed, transaction_uid: {:?}, commit_uid: {:?}, table_name: {:?}, reason: {:?}", transaciton_uid, commit_uid_copy, table_name, e))));
+                                        // 重播删表失败时保留底层 ErrorKind：保留 Meta 名称或非法
+                                        // 持久化名称必须作为 InvalidData 传播，不能被改写为 Other。
+                                        if e.kind() == ErrorKind::InvalidData {
+                                            invalid_remove_data.store(true, Ordering::Release);
+                                        }
+                                        let _ = sender.send(Err(Error::new(
+                                            e.kind(),
+                                            format!("Repair tables meta failed, transaction_uid: {:?}, commit_uid: {:?}, table_name: {:?}, reason: {:?}",
+                                                    transaciton_uid,
+                                                    commit_uid_copy,
+                                                    table_name,
+                                                    e),
+                                        )));
                                         return;
                                     }
                                 }
@@ -941,7 +1279,15 @@ impl<
         };
 
         //异步重播所有未确认的提交日志
-        let replay_result = self.0.tr_mgr.replay_commit_log(replay_callback).await?;
+        let replay_result = match self.0.tr_mgr.replay_commit_log(replay_callback).await {
+            Err(e) if invalid_remove_data.load(Ordering::Acquire) => {
+                // CommitLoggerLoader 当前丢失 callback kind，但原错误仍完整保存在其错误文本/源中。
+                // 只对上面明确标记的删表持久化输入恢复 InvalidData，禁止按字符串猜测分类。
+                return Err(Error::new(ErrorKind::InvalidData, e));
+            },
+            Err(e) => return Err(e),
+            Ok(result) => result,
+        };
 
         //所有未确认的提交日志已完成重播，则立即返回数据库修复成功
         let _ = self.0.tr_mgr.finish_replay().await?; //通知事务管理器，已完成重播
@@ -967,32 +1313,100 @@ struct InnerKVDBManager<
     db_path:            PathBuf,                                        //数据库的表文件所在目录的路径
     tables_meta_path:   PathBuf,                                        //数据库的元信息表文件所在目录的路径
     tables_path:        PathBuf,                                        //数据库表文件所在目录的路径
-    tables:             Arc<RwLock<XHashMap<Atom, KVDBTable<C, Log>>>>, //数据表
+    tables:             Arc<RwLock<XHashMap<Atom, RegisteredTable<C, Log>>>>, //数据表及其精确版本状态
+    key_versions:       KeyVersionRegistry,                             //数据库唯一的全局 Key 版本注册表
     status:             AtomicU64,                                      //数据库状态
     listener:           Option<Receiver<KVDBEvent<Guid>>>,              //数据库事件监听器
     notifier:           Option<Sender<KVDBEvent<Guid>>>,                //数据库事件通知器
 }
 
+#[derive(Clone)]
+struct RegisteredTable<
+    C: Clone + Send + 'static,
+    Log: AsyncCommitLog<C = C, Cid = Guid>,
+> {
+    table: KVDBTable<C, Log>,
+    versions: KeyVersions,
+}
+
+impl<
+    C: Clone + Send + 'static,
+    Log: AsyncCommitLog<C = C, Cid = Guid>,
+> RegisteredTable<C, Log> {
+    fn new(table: KVDBTable<C, Log>, versions: KeyVersions) -> Self {
+        Self { table, versions }
+    }
+}
+
+impl<
+    C: Clone + Send + 'static,
+    Log: AsyncCommitLog<C = C, Cid = Guid>,
+> Deref for RegisteredTable<C, Log> {
+    type Target = KVDBTable<C, Log>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.table
+    }
+}
+
+/// 在持有数据库表注册表写锁时安装表及其唯一版本状态。
 ///
-/// 键值对数据库事务
+/// 全局版本注册表先指向新实例，再替换表条目；旧事务仍可安全持有旧实例，但后续按身份删除
+/// 旧实例时不会误删同名新表的版本状态。调用方必须持续持有 `tables` 的写锁，禁止把该顺序
+/// 拆分到多个临界区。
+fn install_registered_table<
+    C: Clone + Send + 'static,
+    Log: AsyncCommitLog<C = C, Cid = Guid>,
+>(tables: &mut XHashMap<Atom, RegisteredTable<C, Log>>,
+  key_versions: &KeyVersionRegistry,
+  name: Atom,
+  table: KVDBTable<C, Log>) {
+    let versions = key_versions.create_table_versions();
+    key_versions.install(name.clone(), versions.clone());
+    if let Some(previous) = tables.insert(name.clone(), RegisteredTable::new(table, versions)) {
+        key_versions.remove_exact(&name, &previous.versions);
+    }
+}
+
+/// 根事务与五种表子事务共用的事务树节点枚举。
 ///
+/// [`KVDBManager::transaction`] 只返回 [`Self::RootTr`]。应用层应始终通过该根 variant 调用
+/// DDL、KV、stream、lock 和生命周期 API；其它 variant 由根事务在首次触表时惰性创建，供
+/// `pi_async_transaction` 遍历事务树。许多公开 wrapper 在子表 variant 上会 panic，这些
+/// variant 公开可构造并不代表它们属于合法应用调用域。
+///
+/// clone 为共享句柄 clone，不复制事务快照或状态。类型可在线程间移动/共享以支持 runtime
+/// 调度，但同一逻辑事务上的并发动作、prepare/commit/rollback 越序调用不提供可串行化保证；
+/// 当前状态防线不足见 `FIND-TR-002`。真实根生命周期见
+/// `tests/root_transaction_lifecycle.rs`。
 #[derive(Clone)]
 pub enum KVDBTransaction<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>,
 > {
-    RootTr(RootTransaction<C, Log>),        //键值对数据库的根事务
-    MetaTabTr(MetaTabTr<C, Log>),           //元信息表事务
-    MemOrdTabTr(MemOrdTabTr<C, Log>),       //有序内存表事务
-    LogOrdTabTr(LogOrdTabTr<C, Log>),       //有序日志表事务
-    LogWTabTr(LogWTabTr<C, Log>),           //只写日志表事务
-    BtreeOrdTabTr(BtreeOrdTabTr<C, Log>),   //有序B树表事务
+    /// 应用层唯一合法的事务入口；持有数据库管理器、子事务树和根版本上下文。
+    RootTr(RootTransaction<C, Log>),
+    /// 根事务按需创建的 Meta 子事务节点。
+    MetaTabTr(MetaTabTr<C, Log>),
+    /// 根事务按需创建的 Memory 子事务节点。
+    MemOrdTabTr(MemOrdTabTr<C, Log>),
+    /// 根事务按需创建的 LogOrdered 子事务节点。
+    LogOrdTabTr(LogOrdTabTr<C, Log>),
+    /// 根事务按需创建的 LogWrite 子事务节点；当前不允许外部业务使用该表。
+    LogWTabTr(LogWTabTr<C, Log>),
+    /// 根事务按需创建的 Btree 子事务节点。
+    BtreeOrdTabTr(BtreeOrdTabTr<C, Log>),
 }
 
+// SAFETY: 每个 variant 都是 Arc/同步原语保护的根或表事务共享句柄；移动枚举只移动该 owner，
+// 不搬移自引用数据。各表事务实现负责其 COW root、cache、状态和存储句柄的跨线程同步，Log
+// 又受 AsyncCommitLog: Send + Sync 约束。该保证只覆盖内存/线程安全，不扩大合法状态机域。
 unsafe impl<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>,
 > Send for KVDBTransaction<C, Log> {}
+// SAFETY: 共享调用最终委托给 RootTransaction 或各表事务的同步字段；枚举自身没有额外内部
+// 可变性、裸指针或 thread-owner 状态。并发逻辑动作仍须遵守事务状态和冲突协议。
 unsafe impl<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>,
@@ -1516,6 +1930,35 @@ impl<
 impl<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>,
+> Transaction2PcAllConflicts for KVDBTransaction<C, Log> {
+    fn precheck_all_conflicts(&self)
+        -> BoxFuture<'_, Result<(), <Self as Transaction2Pc>::PrepareError>> {
+        match self {
+            KVDBTransaction::RootTr(tr) => tr.precheck_all_conflicts(),
+            KVDBTransaction::MetaTabTr(tr) => tr.precheck_all_conflicts(),
+            KVDBTransaction::MemOrdTabTr(tr) => tr.precheck_all_conflicts(),
+            KVDBTransaction::LogOrdTabTr(tr) => tr.precheck_all_conflicts(),
+            KVDBTransaction::LogWTabTr(tr) => tr.precheck_all_conflicts(),
+            KVDBTransaction::BtreeOrdTabTr(tr) => tr.precheck_all_conflicts(),
+        }
+    }
+
+    fn prepare_all_conflicts(&self)
+        -> BoxFuture<'_, Result<Option<<Self as Transaction2Pc>::PrepareOutput>, <Self as Transaction2Pc>::PrepareError>> {
+        match self {
+            KVDBTransaction::RootTr(tr) => tr.prepare_all_conflicts(),
+            KVDBTransaction::MetaTabTr(tr) => tr.prepare_all_conflicts(),
+            KVDBTransaction::MemOrdTabTr(tr) => tr.prepare_all_conflicts(),
+            KVDBTransaction::LogOrdTabTr(tr) => tr.prepare_all_conflicts(),
+            KVDBTransaction::LogWTabTr(tr) => tr.prepare_all_conflicts(),
+            KVDBTransaction::BtreeOrdTabTr(tr) => tr.prepare_all_conflicts(),
+        }
+    }
+}
+
+impl<
+    C: Clone + Send + 'static,
+    Log: AsyncCommitLog<C = C, Cid = Guid>,
 > UnitTransaction for KVDBTransaction<C, Log> {
     type Status = Transaction2PcStatus;
     type Qos = TableTrQos;
@@ -1795,7 +2238,78 @@ impl<
         }
     }
 
-    /// 异步移除表
+    /// 从当前数据库根事务中移除指定表，并登记持久化的 Meta tombstone。
+    ///
+    /// `name` 的所有权移入本调用；其 UTF-8 编码长度必须位于
+    /// `1..=`[`crate::MAX_TABLE_NAME_BYTES`]。空名或超长名称会在根持久化标记、表注册表和
+    /// Meta 子事务发生任何变化前返回 [`std::io::ErrorKind::InvalidInput`]。内部 Meta 表名
+    /// `.tables_meta` 同样会被无副作用拒绝，防止删除数据库自身的表目录。当前校验仍不拒绝
+    /// 路径分隔符、绝对路径、`.` 或 `..`，调用方须遵守
+    /// [CONTRACT-TABLE-NAME-001](../docs/SEMANTIC_CONTRACTS.md#contract-table-name-001) 中记录的
+    /// 未决名称/路径边界。
+    ///
+    /// # 可观察顺序与返回值
+    ///
+    /// 对合法名称，当前实现按以下顺序执行：
+    ///
+    /// 1. 将根事务标记为需要持久化；
+    /// 2. 获取数据库表注册表的异步写锁，并立即移除名称对应的注册项；
+    /// 3. 在同一根事务的 Meta 子事务中写入该名称的删除动作；
+    /// 4. 返回 `Ok(())`，由调用方随后执行 [`Self::prepare_modified`] 和
+    ///    [`Self::commit_modified`]。
+    ///
+    /// `Ok(())` 只表示删表动作已经登记，不表示事务已经提交、根 WAL 已落地、Meta 数据文件
+    /// 已持久化或表资源已释放。`prepare_modified` 会生成包含 Meta tombstone 的根 WAL 输入；
+    /// `commit_modified` 成功才表示该 WAL 已 append/flush，之后 Meta 数据文件异步持久化，
+    /// 最终成功信号再确认该 WAL。提交成功后立即崩溃时，启动恢复会从原 WAL 重放删除。
+    ///
+    /// 表不存在不是错误：调用仍返回 `Ok(())` 并登记 tombstone，因此不能根据返回值判断表
+    /// 原先是否存在。重复调用在最终注册状态上是幂等的，但会重复产生事务动作/WAL 副作用，
+    /// 不是物理副作用意义上的幂等操作。Meta 动作失败返回 `io::ErrorKind::Other`，此时注册表
+    /// 可能已经改变。
+    ///
+    /// # 事务、取消与生命周期边界
+    ///
+    /// 本方法只支持 [`KVDBTransaction::RootTr`]；对任一表子事务 variant 调用会 panic。调用方
+    /// 必须使用可写根事务；当前实现不在本入口拒绝只读事务，只读误用可能已经改变注册表却在
+    /// prepare 时跳过持久化。当前 DDL 不具完整事务原子性：rollback 不会恢复已移除的注册项，
+    /// 合法名称通过校验后取消 future 也可能留下根持久化标记或部分副作用。因此本方法不是
+    /// rollback-safe 或 cancellation-safe，调用方不能把 `remove_table` 返回前后的中间状态当作
+    /// 原子切换。
+    ///
+    /// 移除注册项不会删除表目录/数据文件，不会停止后台 collector，也不会强制释放已有
+    /// `Arc`、表事务、redb/logfile 句柄或迭代流。已有流仍只在其创建事务存活期间按快照契约
+    /// 使用；实际资源回收边界见 `FIND-LIFE-001`。这些限制属于当前实现事实，不是最终或最佳
+    /// DDL 设计。
+    ///
+    /// # 并发、性能与安全
+    ///
+    /// 方法会等待 `async_lock::RwLock` 表注册表写锁，并在持有该 guard 时取得根事务的同步
+    /// `childs_map` 锁以及 Meta 事务内部同步锁；当前动作阶段不执行文件 I/O、用户回调、FFI
+    /// 或 V8 操作，但竞争会暂停同一注册表上的其它管理操作。并发 DDL 由这些锁和后续 Meta
+    /// prepare 冲突检查约束，不提供跨事务串行化或完整原子性保证。本实现没有新增 `unsafe`，
+    /// 不自行产生裸指针或跨运行时 owner；其 `Send/Sync` 边界继承根事务、表和 runtime 契约。
+    ///
+    /// 表注册表删除平均为 O(1)，Meta COW 删除为 O(log m)，名称编码为 O(name_len)；动作阶段
+    /// 额外空间为 O(name_len + log m)。真正根 WAL append/flush 的时间和空间由后续 prepare/
+    /// commit 的完整事务 payload 决定。与修复前错误跳过 WAL 的行为相比，成功删表提交会增加
+    /// 必需的 WAL I/O；修复本身在动作热路径只增加一次 O(1) relaxed 原子存储。
+    ///
+    /// # 使用顺序
+    ///
+    /// 以下片段假定 `transaction` 是由 manager 创建的可写根事务：
+    ///
+    /// ```ignore
+    /// transaction.remove_table(Atom::from("users")).await?;
+    /// let prepare_output = transaction.prepare_modified().await?;
+    /// transaction.commit_modified(prepare_output).await?;
+    /// ```
+    ///
+    /// 正式语义和 BUG 证据见
+    /// [CONTRACT-DDL-REMOVE-001](../docs/SEMANTIC_CONTRACTS.md#contract-ddl-remove-crash-durability)
+    /// 与 [修复归档](../docs/DDL_REMOVE_DURABILITY_FIX.md#ddl-remove-fix-index)；真实四进程
+    /// crash/replay/data-only 验证入口为 `tests/ddl_remove_crash_durability.rs`，名称边界入口为
+    /// `tests/table_name_contract.rs`。
     pub async fn remove_table(&self, name: Atom) -> IOResult<()> {
         match self {
             KVDBTransaction::RootTr(tr) => {
@@ -1805,7 +2319,12 @@ impl<
         }
     }
 
-    /// 异步修复移除表
+    /// 在根 WAL 重放期间登记一个删表动作。
+    ///
+    /// `name` 必须来自已成功解码的 Meta tombstone；空名或超长持久化名称按损坏数据返回
+    /// [`std::io::ErrorKind::InvalidData`]。有效输入复用正常删表流程，因此同样只允许根事务，
+    /// 同样不删除物理表文件，也继承当前 DDL 非完整原子性。该入口只由 `try_repair` 内部使用，
+    /// 不会重新 append 原 WAL；replay commit 负责发布恢复结果和最终确认原事务。
     pub(crate) async fn repair_remove_table(&self, name: Atom) -> IOResult<()> {
         match self {
             KVDBTransaction::RootTr(tr) => {
@@ -1859,7 +2378,17 @@ impl<
         }
     }
 
-    /// 在键值对数据库事务的根事务内，异步删除指定多个表和键的值，并返回删除值的结果集，删除可能会被覆蓋
+    /// 在根事务内按输入顺序脏删除多个表和 key，并返回各表实现当前能够取得的旧值。
+    ///
+    /// Btree 缓存值直接返回；已有 tombstone/重复删除返回 `None`；缓存完全缺席时同步读取
+    /// 调用时 redb 快照。redb 读取错误会记录详细 error 日志并降级为 `None`，删除仍写
+    /// tombstone 并可提交，因此 `None` 不能无条件解释为持久化存储中原本没有 key。
+    /// redb 成功读取的值或逻辑不存在会进入独立 KeyState 冲突基线，但不会写入事务创建时的
+    /// `cache_ref`；读取失败只能保留 `OverlayMissing`。prepare 先用 revision 捕获同值写/ABA，
+    /// 再按 allocation 身份快路和 bytes 回退比较逻辑状态。每个缓存缺席 Key 的独立读取可能
+    /// 短暂阻塞 worker。完整边界见 `CONTRACT-BTREE-DELETE-001`、
+    /// `CONTRACT-BTREE-PREPARE-BASELINE-001`、`tests/btree_delete_old_value.rs` 和
+    /// `tests/btree_redb_prepare_baseline.rs`。只能对根事务调用，否则 panic。
     pub async fn dirty_delete(&self,
                         table_kv_list: Vec<TableKV>)
                         -> Result<Vec<Option<Binary>>, KVTableTrError> {
@@ -1871,7 +2400,17 @@ impl<
         }
     }
 
-    /// 在键值对数据库事务的根事务内，异步删除指定多个表和键的值，并返回删除值的结果集
+    /// 在根事务内按输入顺序删除多个表和 key，并返回各表实现当前能够取得的旧值。
+    ///
+    /// Btree 缓存值直接返回；已有 tombstone/重复删除返回 `None`；缓存完全缺席时同步读取
+    /// 调用时 redb 快照。redb 读取错误会记录详细 error 日志并降级为 `None`，删除仍写
+    /// tombstone 并可提交，因此 `None` 不能无条件解释为持久化存储中原本没有 key。
+    /// redb 成功读取的值或逻辑不存在会进入独立 KeyState 冲突基线，但不会写入事务创建时的
+    /// `cache_ref`；读取失败只能保留 `OverlayMissing`。prepare 先用 revision 捕获同值写/ABA，
+    /// 再按 allocation 身份快路和 bytes 回退比较逻辑状态。每个缓存缺席 Key 的独立读取可能
+    /// 短暂阻塞 worker。完整边界见 `CONTRACT-BTREE-DELETE-001`、
+    /// `CONTRACT-BTREE-PREPARE-BASELINE-001`、`tests/btree_delete_old_value.rs` 和
+    /// `tests/btree_redb_prepare_baseline.rs`。只能对根事务调用，否则 panic。
     pub async fn delete(&self,
                         table_kv_list: Vec<TableKV>)
                         -> Result<Vec<Option<Binary>>, KVTableTrError> {
@@ -1883,7 +2422,22 @@ impl<
         }
     }
 
-    /// 在键值对数据库事务的根事务内，获取从指定表和关键字开始，从前向后或从后向前的关键字异步流
+    /// 在根事务内创建指定表的关键字快照流。
+    ///
+    /// `table_name` 必须是当前已注册表；不存在时返回 `None`。`key` 是包含边界，`None`
+    /// 表示从升序首项或降序末项开始；`descending=false/true` 分别选择升序/降序。只能对
+    /// [`KVDBTransaction::RootTr`] 调用，在子表事务枚举上调用会 panic。
+    ///
+    /// 首次访问表会创建并注册一个非持久化子事务，因此本方法不是纯函数；重复调用复用该
+    /// 子事务，但每次返回独立的创建时快照。调用返回后，本事务及其它事务可继续
+    /// `upsert/delete`，旧流保持不变；流不提供可串行化、实时可见或 commit/rollback 绑定。
+    /// 创建本流的根事务必须存活到流耗尽或被 drop，事务释放后继续 poll 属于非法用法。
+    ///
+    /// 返回项拥有 key；流可在线程间移动但应由单消费者 poll。提前 drop 会释放快照。
+    /// Memory/Meta/LogOrdered 创建为 O(1) COW 克隆加 O(log n) 定位；Btree 还会在本方法
+    /// 返回前同步建立 redb 读事务，可能短暂阻塞。底层流无错误 item，Btree 读错误当前可能
+    /// 表现为空流或提前结束。完整边界见 `CONTRACT-ITER-001` 和
+    /// `tests/iterator_snapshot_safety.rs`。
     pub async fn keys<'a>(&self,
                           table_name: Atom,
                           key: Option<Binary>,
@@ -1899,7 +2453,11 @@ impl<
         }
     }
 
-    /// 在键值对数据库事务的根事务内，获取从指定表和关键字开始，从前向后或从后向前的键值对异步流
+    /// 在根事务内创建指定表的键值对快照流。
+    ///
+    /// 表查找、根事务前置条件、包含边界、方向、子事务注册副作用、创建事务生命周期、
+    /// 并发修改、取消、错误和复杂度与 [`KVDBTransaction::keys`] 相同。每个 item 是创建时
+    /// 快照中 owned `(key, value)`；随后 value 更新或删除不会改变既有流。
     pub async fn values<'a>(&self,
                             table_name: Atom,
                             key: Option<Binary>,
@@ -1938,7 +2496,20 @@ impl<
         }
     }
 
-    /// 在键值对数据库事务的根事务内，异步预提交本次事务对键值对数据库的所有修改，成功返回预提交的输出
+    /// 初始化并预提交整棵根事务树，返回随后 commit 所需的 opaque 字节。
+    ///
+    /// 只能对 [`KVDBTransaction::RootTr`] 调用；对子表 variant 调用会 panic。首次调用先向
+    /// `Transaction2PcManager` 注册根事务并分配事务 UID，再按首次触表顺序 prepare 子事务。
+    /// 成功返回的 `Vec<u8>` 归调用方所有：需要根 WAL 时包含根事务 UID 和持久化子表动作；
+    /// 只读、无持久化动作及部分已完成 DDL 快路可返回空 Vec。
+    ///
+    /// 返回字节必须被视为一次性 opaque token，未经修改原样传给同一事务的
+    /// [`Self::commit_modified`]。当前实现尚未校验 token 与事务身份/最近 prepare 输出绑定，
+    /// 见 `FIND-TR-003`；篡改、跨事务交换、截断、附加或重复使用都不属于合法调用域。
+    ///
+    /// 非 Fatal prepare 错误使事务树失败但可调用 [`Self::rollback_modified`]；Fatal 永不可
+    /// rollback。timeout 字段当前不执行实际截止。调用会获取多个同步锁并可能执行表级异步
+    /// 操作；取消 future 不是已冻结的自动 rollback，调用方不得假设 drop future 会注销事务。
     pub async fn prepare_modified(&self) -> Result<Vec<u8>, KVTableTrError> {
         match self {
             KVDBTransaction::RootTr(tr) => {
@@ -1948,7 +2519,16 @@ impl<
         }
     }
 
-    /// 在键值对数据库事务的根事务内，异步预提交本次事务对键值对数据库的所有修改，成功返回预提交的输出，失败返回预提交冲突的首个表名和关键字
+    /// 以可定位冲突的路径初始化并预提交整棵根事务树。
+    ///
+    /// 调用顺序、RootTr 前置条件、输出所有权、timeout、取消和错误恢复边界与
+    /// [`Self::prepare_modified`] 相同。差异是表实现检测到写冲突时返回
+    /// [`KVTableTrError::Conflicts`]，其中保存首个冲突表名和 Key，错误等级为 Normal；多个
+    /// 冲突不保证全部报告，也不保证跨表诊断顺序独立于首次触表顺序。
+    ///
+    /// 冲突发生在根 WAL append/flush 和子表根原子发布之前，因此在没有其它 Fatal 节点时
+    /// 可以 rollback。真实 same-key 冲突和 manager 计数闭环由
+    /// `tests/root_transaction_lifecycle.rs` 验证。
     pub async fn prepare_modified_conflicts(&self) -> Result<Vec<u8>, KVTableTrError> {
         match self {
             KVDBTransaction::RootTr(tr) => {
@@ -1958,7 +2538,50 @@ impl<
         }
     }
 
-    /// 在键值对数据库事务的根事务内，异步提交本次事务对键值对数据库的所有修改
+    /// 以外部实际读取的版本集合和最终写集合执行完整冲突预提交。
+    ///
+    /// 只能对全新、可写的 RootTr 调用，并且只能与 [`Self::commit_with_version`] 组成独立协议；
+    /// 禁止与普通/dirty 动作、DDL、迭代器、普通 prepare/commit 混用。`read_set` 和 `write_set`
+    /// 均可为空；各集合内部不允许重复 `(table, key)`，跨集合重叠合法且最终动作以 write 为准。
+    /// `Some(value)` 是 upsert，`None` 是 delete；LogWrite 不支持 delete。
+    ///
+    /// 所有表名、Key、Value 长度及重复项会在 UID、子事务和共享状态副作用前检查。版本失配及
+    /// 只读表身份失效返回确定性 [`KVTableTrError::AllConflicts`]；写表缺失/替换和参数错误返回
+    /// 可 rollback 的 Normal Common。成功 token 是一次性 opaque 数据，只能原样传给同一事务。
+    pub async fn prepare_with_version(&self,
+                                      read_set: Vec<TableKeyVersion>,
+                                      write_set: Vec<TableKV>)
+        -> Result<Vec<u8>, KVTableTrError> {
+        match self {
+            KVDBTransaction::RootTr(tr) => {
+                tr.prepare_with_version(read_set, write_set).await
+            },
+            _ => panic!("Prepare with version failed, reason: invalid root transaction"),
+        }
+    }
+
+    /// 提交一次已经成功 prepare 的根事务。
+    ///
+    /// `prepare_output` 必须是同一事务最近一次成功 prepare 返回的完整 Vec，并且只能使用
+    /// 一次。只能对 RootTr 调用；子表 variant 会 panic。未先 prepare、重复 commit、传入其它
+    /// 事务或修改后的 token 都是非法调用；当前部分非法路径可能返回 Normal 错误，另一些路径
+    /// 会在内部 UID `unwrap` 处 panic，不能依赖其防御表现。
+    ///
+    /// 对需要持久化且有有效输出的事务，本方法先 append 并 flush 根 WAL；只有 WAL 落地成功
+    /// 后才发布各子表 COW 根并安排最终数据文件持久化。`Ok(())` 表示第一阶段“事务提交成功”，
+    /// 不表示所有数据文件已完成，也不表示根 WAL 已确认或改名 `.bak`。第二阶段只有全部持久化
+    /// 子表发出成功信号后才由 [`KVDBCommitConfirm`] 异步确认，见 `CONTRACT-TR-002`。
+    ///
+    /// 在尚未调用根 WAL append/flush 时产生的非 Fatal 逻辑失败可按状态 rollback；WAL 已成功
+    /// 后的数据文件失败不能 rollback，WAL 保持未确认并由重启 repair 补齐。方法会执行异步文件
+    /// I/O、同步锁和 runtime 任务投递，不保证取消安全；调用方必须等待明确结果并另行观察最终确认。
+    ///
+    /// 当前事务安全保证不覆盖根 WAL 自身因磁盘空间/配额、只读或故障文件系统、设备 I/O、
+    /// runtime 拒绝任务或文件大小限制导致的 append/flush 失败。依赖层普通 `io::Error` 不保留
+    /// 失败阶段和累计写入字节，因此这类错误下的 Normal、`LogCommitFailed` 或 rollback 成功
+    /// 都不能证明 WAL 完全未落盘，也不能证明 checkpoint 与磁盘状态已经回到事务前。该限制与
+    /// 空 prepare 输出无关，后者直接跳过 WAL I/O。完整现状链、外部处置边界和未来设计入口见
+    /// `LIMIT-ROOT-WAL-IO-001`：`docs/ROOT_WAL_IO_FAILURE_BOUNDARY.md`。
     pub async fn commit_modified(&self,
                                  prepare_output: Vec<u8>) -> Result<(), KVTableTrError> {
         match self {
@@ -1969,7 +2592,41 @@ impl<
         }
     }
 
-    /// 在键值对数据库事务的根事务内，异步回滚本次事务对键值对数据库的所有修改，事务严重错误无法回滚
+    /// 提交已经由 [`Self::prepare_with_version`] 成功预提交的根事务，并返回本事务发布的版本。
+    ///
+    /// token 必须来自同一事务且只能使用一次。返回项只描述本事务自己的最终写入，不会在方法尾
+    /// 重新读取可能已被后续事务推进的全局最新版本；顺序不属于稳定契约。Ok 表示根 WAL 已按需
+    /// 落地且表数据/版本已经发布，不表示异步数据文件全部持久化或 WAL 已确认为 `.bak`。
+    /// 任一提交错误只返回 Err 并丢弃部分回执；WAL 成功后的错误不可 rollback。
+    /// 根 WAL 自身的环境/runtime I/O 失败不属于当前事务安全保证，不能从 Err 或回执为空推断
+    /// WAL 未写入；其边界与 [`Self::commit_modified`] 完全相同。
+    pub async fn commit_with_version(&self,
+                                     prepare_output: Vec<u8>)
+        -> Result<Vec<TableKeyVersion>, KVTableTrError> {
+        match self {
+            KVDBTransaction::RootTr(tr) => {
+                tr.commit_with_version(prepare_output).await
+            },
+            _ => panic!("Commit with version failed, reason: invalid root transaction"),
+        }
+    }
+
+    /// 回滚处于可恢复失败状态的整棵事务树。
+    ///
+    /// 只能对 RootTr 调用；子表 variant 会 panic。本方法不是任意时刻可用的 cancel：当前
+    /// `Transaction2PcManager` 只接受 ActionFailed、PrepareFailed 或 LogCommitFailed，且事务树
+    /// 中不得存在 Fatal。Start、Prepared、Commited、CommitFailed 等其它状态调用会返回错误，
+    /// 并可能把状态推进到 RollbackFailed。
+    ///
+    /// 成功 rollback 会丢弃未发布的子表 COW 修改并从 manager 注销根事务；因为合法回滚点在
+    /// 根 WAL 成功落地和数据文件写入之前，不会撤销已提交数据。Fatal 永不可 rollback。方法
+    /// 可能 await 子事务回滚并获取同步锁；成功后返回 `Ok(())`，失败保留错误等级和事务状态，
+    /// 不应继续复用严重失败句柄。
+    ///
+    /// 上述安全结论只适用于当前受支持的事务失败域。若 `LogCommitFailed` 来源是根 WAL 的磁盘、
+    /// 文件系统、设备、runtime 或文件大小限制错误，当前依赖链无法证明 0/部分/完整落盘状态，
+    /// 即使本方法返回 `Ok(())` 也不承诺事务安全或 logger checkpoint 已清理；见
+    /// `LIMIT-ROOT-WAL-IO-001`。
     pub async fn rollback_modified(&self) -> Result<(), KVTableTrError> {
         match self {
             KVDBTransaction::RootTr(tr) => {
@@ -2052,19 +2709,29 @@ impl<
     }
 }
 
+/// 一棵数据库事务树的共享根节点。
 ///
-/// 键值对数据库的根事务
+/// 根节点保存 source、事务/提交 UID、2PC 状态、可写/持久化标志、当前未执行的 timeout、按
+/// 表名索引的子事务 map、按首次触表顺序排列的子事务 list，以及 manager clone。子事务只在
+/// 首次访问对应表时创建，同表后续动作复用同一节点。
 ///
+/// 应用通常不直接构造或匹配本类型，而通过 [`KVDBTransaction::RootTr`] 使用。clone 共享同一
+/// 状态机和子事务，不创建独立事务。根持有 manager，prepare 后 manager registry 又持有根；
+/// 正常 commit/rollback 的 `finish` 会解除 registry 边，非法/取消流程可能延长生命周期。
 #[derive(Clone)]
 pub struct RootTransaction<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>,
 >(Arc<InnerRootTransaction<C, Log>>);
 
+// SAFETY: InnerRootTransaction 的可变 UID/status/子事务容器由 SpinLock 保护，持久化标志为
+// AtomicBool，其余字段构造后只读；manager 自身满足 Send。移动 Arc 不改变内部地址或别名。
 unsafe impl<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>,
 > Send for RootTransaction<C, Log> {}
+// SAFETY: 共享引用只能通过上述锁/原子或线程安全 manager 访问可变状态。该 impl 保证内存
+// 安全，不保证对同一根事务并发调用多个动作或生命周期方法具有事务级串行语义。
 unsafe impl<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>,
@@ -2196,8 +2863,33 @@ impl<
 
     fn commit(&self, _confirm: <Self as Transaction2Pc>::CommitConfirm)
               -> BoxFuture<Result<<Self as AsyncTransaction>::Output, <Self as AsyncTransaction>::Error>> {
+        // 根节点没有独立数据文件，最终持久化由各子表负责；因此根 commit 不调用确认器，
+        // 也不贡献成功计数。事务树完成调度不等于根 WAL 已最终确认。详见 CONTRACT-CFM-001：
+        // docs/SEMANTIC_CONTRACTS.md#contract-confirm-success-only。
         async move {
             Ok(())
+        }.boxed()
+    }
+}
+
+impl<
+    C: Clone + Send + 'static,
+    Log: AsyncCommitLog<C = C, Cid = Guid>,
+> Transaction2PcAllConflicts for RootTransaction<C, Log> {
+    fn precheck_all_conflicts(&self)
+        -> BoxFuture<'_, Result<(), <Self as Transaction2Pc>::PrepareError>> {
+        let tr = self.clone();
+        async move {
+            tr.check_version_table_identities().await
+        }.boxed()
+    }
+
+    fn prepare_all_conflicts(&self)
+        -> BoxFuture<'_, Result<Option<<Self as Transaction2Pc>::PrepareOutput>, <Self as Transaction2Pc>::PrepareError>> {
+        let tr = self.clone();
+        async move {
+            tr.check_version_table_identities().await?;
+            tr.prepare().await
         }.boxed()
     }
 }
@@ -2277,7 +2969,10 @@ impl<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>,
 > RootTransaction<C, Log> {
-    // 获取需要持久化的子事务数量
+    // 获取根确认器期待的成功信号数：每个 persistence=true 子事务恰好计一次，根事务不计。
+    // 只有读动作的可写事务会得到 0；此时确认器只作为 inert 参数传过事务树，任何节点都不得
+    // 调用它，也不存在需要确认的根 WAL。该值的协议边界详见 CONTRACT-CFM-001：
+    // docs/SEMANTIC_CONTRACTS.md#contract-confirm-success-only。
     fn persistent_children_len(&self) -> usize {
         let mut len = 0;
         for child in self.to_children() {
@@ -2293,18 +2988,24 @@ impl<
     // 注意表事务是否持久化，表示事务是否允许持久化，允许事务持久化表示这个事务的所有写操作会被写入提交日志
     fn table_transaction(&self,
                          name: Atom,
-                         table: &KVDBTable<C, Log>,
+                         table: &RegisteredTable<C, Log>,
                          is_persistent: bool,
                          childes_map: &mut XHashMap<Atom, KVDBTransaction<C, Log>>)
                          -> KVDBTransaction<C, Log> {
-        match table {
+        match &table.table {
             KVDBTable::MetaTab(tab) => {
                 //创建元信息表的表事务，并作为子事务注册到根事务上
-                let tr = tab.transaction(self.get_source(),
-                                         self.is_writable(),
-                                         is_persistent,
-                                         self.get_prepare_timeout(),
-                                         self.get_commit_timeout());
+                let tr = MetaTabTr::new_managed(self.get_source(),
+                                                self.is_writable(),
+                                                is_persistent,
+                                                self.get_prepare_timeout(),
+                                                self.get_commit_timeout(),
+                                                tab.clone(),
+                                                table.versions.clone(),
+                                                PrepareMode::Ordinary,
+                                                XHashMap::default(),
+                                                None,
+                                                XHashMap::default());
                 let table_tr = KVDBTransaction::MetaTabTr(tr);
 
                 //注册到键值对数据库的根事务
@@ -2315,11 +3016,17 @@ impl<
             },
             KVDBTable::MemOrdTab(tab) => {
                 //创建有序内存表的表事务，并作为子事务注册到根事务上
-                let tr = tab.transaction(self.get_source(),
-                                         self.is_writable(),
-                                         is_persistent,
-                                         self.get_prepare_timeout(),
-                                         self.get_commit_timeout());
+                let tr = MemOrdTabTr::new_managed(self.get_source(),
+                                                  self.is_writable(),
+                                                  is_persistent,
+                                                  self.get_prepare_timeout(),
+                                                  self.get_commit_timeout(),
+                                                  tab.clone(),
+                                                  table.versions.clone(),
+                                                  PrepareMode::Ordinary,
+                                                  XHashMap::default(),
+                                                  None,
+                                                  XHashMap::default());
                 let table_tr = KVDBTransaction::MemOrdTabTr(tr);
 
                 //注册到键值对数据库的根事务
@@ -2329,11 +3036,17 @@ impl<
                 table_tr
             },
             KVDBTable::LogOrdTab(tab) => {
-                let tr = tab.transaction(self.get_source(),
-                                         self.is_writable(),
-                                         is_persistent,
-                                         self.get_prepare_timeout(),
-                                         self.get_commit_timeout());
+                let tr = LogOrdTabTr::new_managed(self.get_source(),
+                                                  self.is_writable(),
+                                                  is_persistent,
+                                                  self.get_prepare_timeout(),
+                                                  self.get_commit_timeout(),
+                                                  tab.clone(),
+                                                  table.versions.clone(),
+                                                  PrepareMode::Ordinary,
+                                                  XHashMap::default(),
+                                                  None,
+                                                  XHashMap::default());
                 let table_tr = KVDBTransaction::LogOrdTabTr(tr);
 
                 //注册到键值对数据库的根事务
@@ -2343,11 +3056,17 @@ impl<
                 table_tr
             },
             KVDBTable::LogWTab(tab) => {
-                let tr = tab.transaction(self.get_source(),
-                                         self.is_writable(),
-                                         is_persistent,
-                                         self.get_prepare_timeout(),
-                                         self.get_commit_timeout());
+                let tr = LogWTabTr::new_managed(self.get_source(),
+                                                self.is_writable(),
+                                                is_persistent,
+                                                self.get_prepare_timeout(),
+                                                self.get_commit_timeout(),
+                                                tab.clone(),
+                                                table.versions.clone(),
+                                                PrepareMode::Ordinary,
+                                                XHashMap::default(),
+                                                None,
+                                                XHashMap::default());
                 let table_tr = KVDBTransaction::LogWTabTr(tr);
 
                 //注册到键值对数据库的根事务
@@ -2357,11 +3076,17 @@ impl<
                 table_tr
             },
             KVDBTable::BtreeOrdTab(tab) => {
-                let tr = tab.transaction(self.get_source(),
-                                         self.is_writable(),
-                                         is_persistent,
-                                         self.get_prepare_timeout(),
-                                         self.get_commit_timeout());
+                let tr = BtreeOrdTabTr::new_managed(self.get_source(),
+                                                    self.is_writable(),
+                                                    is_persistent,
+                                                    self.get_prepare_timeout(),
+                                                    self.get_commit_timeout(),
+                                                    tab.clone(),
+                                                    table.versions.clone(),
+                                                    PrepareMode::Ordinary,
+                                                    XHashMap::default(),
+                                                    None,
+                                                    XHashMap::default());
                 let table_tr = KVDBTransaction::BtreeOrdTabTr(tr);
 
                 //注册到键值对数据库的根事务
@@ -2372,6 +3097,94 @@ impl<
             },
         }
     }
+
+    /// 为独立版本协议一次性安装预期版本和最终动作，并按输入首次触表顺序注册子事务。
+    fn versioned_table_transaction(&self,
+                                   name: Atom,
+                                   table: &RegisteredTable<C, Log>,
+                                   is_persistent: bool,
+                                   expected: XHashMap<Binary, Version>,
+                                   receipt: VersionReceipt,
+                                   actions: XHashMap<Binary, crate::KVActionLog>,
+                                   childes_map: &mut XHashMap<Atom, KVDBTransaction<C, Log>>)
+        -> KVDBTransaction<C, Log> {
+        let table_tr = match &table.table {
+            KVDBTable::MetaTab(tab) => {
+                KVDBTransaction::MetaTabTr(MetaTabTr::new_managed(
+                    self.get_source(),
+                    self.is_writable(),
+                    is_persistent,
+                    self.get_prepare_timeout(),
+                    self.get_commit_timeout(),
+                    tab.clone(),
+                    table.versions.clone(),
+                    PrepareMode::Versioned,
+                    expected,
+                    Some(receipt),
+                    actions))
+            },
+            KVDBTable::MemOrdTab(tab) => {
+                KVDBTransaction::MemOrdTabTr(MemOrdTabTr::new_managed(
+                    self.get_source(),
+                    self.is_writable(),
+                    is_persistent,
+                    self.get_prepare_timeout(),
+                    self.get_commit_timeout(),
+                    tab.clone(),
+                    table.versions.clone(),
+                    PrepareMode::Versioned,
+                    expected,
+                    Some(receipt),
+                    actions))
+            },
+            KVDBTable::LogOrdTab(tab) => {
+                KVDBTransaction::LogOrdTabTr(LogOrdTabTr::new_managed(
+                    self.get_source(),
+                    self.is_writable(),
+                    is_persistent,
+                    self.get_prepare_timeout(),
+                    self.get_commit_timeout(),
+                    tab.clone(),
+                    table.versions.clone(),
+                    PrepareMode::Versioned,
+                    expected,
+                    Some(receipt),
+                    actions))
+            },
+            KVDBTable::LogWTab(tab) => {
+                KVDBTransaction::LogWTabTr(LogWTabTr::new_managed(
+                    self.get_source(),
+                    self.is_writable(),
+                    is_persistent,
+                    self.get_prepare_timeout(),
+                    self.get_commit_timeout(),
+                    tab.clone(),
+                    table.versions.clone(),
+                    PrepareMode::Versioned,
+                    expected,
+                    Some(receipt),
+                    actions))
+            },
+            KVDBTable::BtreeOrdTab(tab) => {
+                KVDBTransaction::BtreeOrdTabTr(BtreeOrdTabTr::new_managed(
+                    self.get_source(),
+                    self.is_writable(),
+                    is_persistent,
+                    self.get_prepare_timeout(),
+                    self.get_commit_timeout(),
+                    tab.clone(),
+                    table.versions.clone(),
+                    PrepareMode::Versioned,
+                    expected,
+                    Some(receipt),
+                    actions))
+            },
+        };
+
+        childes_map.insert(name, table_tr.clone());
+        self.0.childs.lock().join(table_tr.clone());
+        table_tr
+    }
 }
 
 /*
@@ -2381,6 +3194,51 @@ impl<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>,
 > RootTransaction<C, Log> {
+    /// 检查版本协议装配时固定的表身份；只读失效汇总为冲突，任何写表失效优先返回 Common。
+    async fn check_version_table_identities(&self) -> Result<(), KVTableTrError> {
+        let Some(context) = self.0.version_context.lock().clone() else {
+            return Ok(());
+        };
+        let tables = self.0.db_mgr.0.tables.read().await;
+        let mut conflicts = Vec::new();
+        let mut invalid_write_table = None;
+
+        for identity in &context.tables {
+            let exact = match (&identity.versions, tables.get(&identity.name)) {
+                (Some(expected), Some(current)) => expected.ptr_eq(&current.versions),
+                _ => false,
+            };
+            if exact {
+                continue;
+            }
+            if identity.has_write {
+                if invalid_write_table.is_none() {
+                    invalid_write_table = Some(identity.name.clone());
+                }
+            } else {
+                for key in &identity.read_keys {
+                    conflicts.push(TableKey {
+                        table: identity.name.clone(),
+                        key: key.clone(),
+                    });
+                }
+            }
+        }
+        drop(tables);
+
+        if let Some(table) = invalid_write_table {
+            return Err(KVTableTrError::new_transaction_error(
+                ErrorLevel::Normal,
+                format!("Prepare with version failed, table: {:?}, reason: write table is missing or was replaced after transaction assembly",
+                        table.as_str())));
+        }
+        if conflicts.is_empty() {
+            Ok(())
+        } else {
+            Err(KVTableTrError::new_all_conflicts_error(conflicts))
+        }
+    }
+
     /// 异步获取表的元信息
     #[inline]
     async fn table_meta(&self, table: Atom) -> Option<KVTableMeta> {
@@ -2404,6 +3262,9 @@ impl<
                                        options: CreateTableOptions,
                                        enable_accelerated_repair: bool) -> IOResult<()>
     {
+        // 必须先于根持久化标记、注册表写锁、Meta 修改及文件/目录创建拒绝非法名称。
+        validate_table_name(&name, ErrorKind::InvalidInput, "create table")?;
+
         //检查待创建的指定名称的表是否存在
         let meta_table_name = Atom::from(DEFAULT_DB_TABLES_META_DIR);
         let mut tables = self.0.db_mgr.0.tables.write().await;
@@ -2432,7 +3293,7 @@ impl<
                         } else {
                             //待创建表的名称与已存在的表相同，但元信息不同
                             if table_meta.is_persistence() {
-                                match tables.get(&name) {
+                                match tables.get(&name).map(|registered| &registered.table) {
                                     Some(KVDBTable::LogOrdTab(tab)) => {
                                         if tab.len() > 0 {
                                             //已存在的同名表是持久化表，且元信息不同，且表中有记录，则表名冲突
@@ -2479,7 +3340,10 @@ impl<
                                                     meta.persistence);
 
                 //注册创建的有序内存表
-                tables.insert(name.clone(), KVDBTable::MemOrdTab(table));
+                install_registered_table(&mut *tables,
+                                         &self.0.db_mgr.0.key_versions,
+                                         name.clone(),
+                                         KVDBTable::MemOrdTab(table));
             },
             KVDBTableType::LogOrdTab => {
                 //创建一个有序日志表
@@ -2500,7 +3364,10 @@ impl<
                                              self.0.db_mgr.0.notifier.clone()).await;
 
                     //注册创建的有序日志表
-                    tables.insert(name.clone(), KVDBTable::LogOrdTab(table));
+                    install_registered_table(&mut *tables,
+                                             &self.0.db_mgr.0.key_versions,
+                                             name.clone(),
+                                             KVDBTable::LogOrdTab(table));
                 } else {
                     //没有有序日志表的选项，则立即返回错误原因
                     return Err(Error::new(ErrorKind::Other,
@@ -2526,7 +3393,10 @@ impl<
                                          60 * 1000).await;
 
                 //注册创建的只写日志表
-                tables.insert(name.clone(), KVDBTable::LogWTab(table));
+                install_registered_table(&mut *tables,
+                                         &self.0.db_mgr.0.key_versions,
+                                         name.clone(),
+                                         KVDBTable::LogWTab(table));
             },
             KVDBTableType::BtreeOrdTab => {
                 //创建一个有序B树表
@@ -2545,7 +3415,10 @@ impl<
                                                self.0.db_mgr.0.notifier.clone()).await;
 
                     //注册创建的有序日志表
-                    tables.insert(name.clone(), KVDBTable::BtreeOrdTab(table));
+                    install_registered_table(&mut *tables,
+                                             &self.0.db_mgr.0.key_versions,
+                                             name.clone(),
+                                             KVDBTable::BtreeOrdTab(table));
                 } else {
                     //没有有序日志表的选项，则立即返回错误原因
                     return Err(Error::new(ErrorKind::Other,
@@ -2629,6 +3502,14 @@ impl<
                                     enable_accelerated_repair: bool)
         -> IOResult<()>
     {
+        // 启动加载是该内部批量入口的唯一生产调用方。先校验完整输入，避免合法项已注册后
+        // 才在后项发现损坏名称，造成部分加载副作用。
+        for (name, _, _) in &table_metas {
+            validate_table_name(name,
+                                ErrorKind::InvalidData,
+                                "load multiple table metadata")?;
+        }
+
         //创建表的操作，一定会创建元信息表事务，而元信息表事务是需要持久化的事务，则根事务也设置为需要持久化
         self.require_persistence();
 
@@ -2668,7 +3549,7 @@ impl<
                                 } else {
                                     //待创建表的名称与已存在的表相同，但元信息不同
                                     if table_meta.is_persistence() {
-                                        match tables.get(&name) {
+                                        match tables.get(&name).map(|registered| &registered.table) {
                                             Some(KVDBTable::LogOrdTab(tab)) => {
                                                 if tab.len() > 0 {
                                                     //已存在的同名表是持久化表，且元信息不同，且表中有记录，则表名冲突
@@ -2729,6 +3610,7 @@ impl<
                 .0
                 .tables
                 .clone();
+            let key_versions = self.0.db_mgr.0.key_versions.clone();
             let result_copy = result.clone();
             let count_copy = count.clone();
 
@@ -2742,11 +3624,11 @@ impl<
                                                             meta.persistence);
 
                         //注册创建的有序内存表
-                        tables
-                            .write()
-                            .await
-                            .insert(name.clone(),
-                                    KVDBTable::MemOrdTab(table));
+                        let mut tables = tables.write().await;
+                        install_registered_table(&mut *tables,
+                                                 &key_versions,
+                                                 name.clone(),
+                                                 KVDBTable::MemOrdTab(table));
                     },
                     KVDBTableType::LogOrdTab => {
                         //创建一个有序日志表
@@ -2767,11 +3649,11 @@ impl<
                                                      notifier).await;
 
                             //注册创建的有序日志表
-                            tables
-                                .write()
-                                .await
-                                .insert(name.clone(),
-                                        KVDBTable::LogOrdTab(table));
+                            let mut tables = tables.write().await;
+                            install_registered_table(&mut *tables,
+                                                     &key_versions,
+                                                     name.clone(),
+                                                     KVDBTable::LogOrdTab(table));
                         } else {
                             //没有有序日志表的选项，则立即通知错误原因
                             result_copy.set(Err(Error::new(ErrorKind::Other,
@@ -2798,11 +3680,11 @@ impl<
                                                60 * 1000).await;
 
                         //注册创建的只写日志表
-                        tables
-                            .write()
-                            .await
-                            .insert(name.clone(),
-                                    KVDBTable::LogWTab(table));
+                        let mut tables = tables.write().await;
+                        install_registered_table(&mut *tables,
+                                                 &key_versions,
+                                                 name.clone(),
+                                                 KVDBTable::LogWTab(table));
                     },
                     KVDBTableType::BtreeOrdTab => {
                         //创建一个有序B树表
@@ -2821,11 +3703,11 @@ impl<
                                                        notifier).await;
 
                             //注册创建的有序日志表
-                            tables
-                                .write()
-                                .await
-                                .insert(name.clone(),
-                                        KVDBTable::BtreeOrdTab(table));
+                            let mut tables = tables.write().await;
+                            install_registered_table(&mut *tables,
+                                                     &key_versions,
+                                                     name.clone(),
+                                                     KVDBTable::BtreeOrdTab(table));
                         } else {
                             //没有有序日志表的选项，则立即通知错误原因
                             result_copy.set(Err(Error::new(ErrorKind::Other,
@@ -2896,6 +3778,9 @@ impl<
                                  meta: KVTableMeta,
                                  enable_accelerated_repair: bool) -> IOResult<()>
     {
+        // 名称来自已落地根 WAL；非法长度表示持久化数据损坏，而不是本次调用参数错误。
+        validate_table_name(&name, ErrorKind::InvalidData, "repair table creation")?;
+
         //检查待创建的指定名称的表是否存在
         let meta_table_name = Atom::from(DEFAULT_DB_TABLES_META_DIR);
         let mut tables = self.0.db_mgr.0.tables.write().await;
@@ -2910,7 +3795,10 @@ impl<
                                                     meta.persistence);
 
                 //注册创建的有序内存表
-                tables.insert(name.clone(), KVDBTable::MemOrdTab(table));
+                install_registered_table(&mut *tables,
+                                         &self.0.db_mgr.0.key_versions,
+                                         name.clone(),
+                                         KVDBTable::MemOrdTab(table));
             },
             KVDBTableType::LogOrdTab => {
                 //创建一个有序日志表
@@ -2929,7 +3817,10 @@ impl<
                                          self.0.db_mgr.0.notifier.clone()).await;
 
                 //注册创建的有序日志表
-                tables.insert(name.clone(), KVDBTable::LogOrdTab(table));
+                install_registered_table(&mut *tables,
+                                         &self.0.db_mgr.0.key_versions,
+                                         name.clone(),
+                                         KVDBTable::LogOrdTab(table));
             },
             KVDBTableType::LogWTab => {
                 //创建一个只写日志表
@@ -2947,7 +3838,10 @@ impl<
                                        60 * 1000).await;
 
                 //注册创建的只写日志表
-                tables.insert(name.clone(), KVDBTable::LogWTab(table));
+                install_registered_table(&mut *tables,
+                                         &self.0.db_mgr.0.key_versions,
+                                         name.clone(),
+                                         KVDBTable::LogWTab(table));
             },
             KVDBTableType::BtreeOrdTab => {
                 //尝试创建一个有序B树表
@@ -2963,7 +3857,10 @@ impl<
                                                enable_accelerated_repair,
                                                self.0.db_mgr.0.notifier.clone()).await {
                     //尝试创建成功，则注册创建的有序日志表
-                    tables.insert(name.clone(), KVDBTable::BtreeOrdTab(table));
+                    install_registered_table(&mut *tables,
+                                             &self.0.db_mgr.0.key_versions,
+                                             name.clone(),
+                                             KVDBTable::BtreeOrdTab(table));
                 }
             },
         }
@@ -2997,13 +3894,31 @@ impl<
         Ok(())
     }
 
-    /// 异步移除表
+    /// 实现根事务的删表动作；公开契约见 [`KVDBTransaction::remove_table`]。
+    ///
+    /// 根持久化标记必须先于任何注册表副作用，Meta tombstone 必须继续使用
+    /// `table_to_binary` 的 BON Atom 编码。不得把本方法扩展为物理目录删除或 DDL rollback
+    /// 补偿；两者均超出 BUG-DDL-REMOVE-001 的冻结修复边界。
     #[inline]
     async fn remove_table(&self, table: Atom) -> IOResult<()> {
+        // 必须先于注册表移除和 Meta tombstone 拒绝非法名称，保证 InvalidInput 无副作用。
+        validate_removable_table_name(&table, ErrorKind::InvalidInput, "remove table")?;
+
+        // 删表会持久化 Meta tombstone，因此根事务必须参与 WAL。该标记必须先于注册表移除；
+        // 否则 Meta 子事务虽会异步写数据文件，根 prepare 却会丢弃子日志，commit 返回成功后
+        // 立即崩溃将无法恢复删除。这里只恢复删表耐久性，不改变 DDL 当前 rollback 非原子性。
+        self.require_persistence();
+
         let mut tables = self.0.db_mgr.0.tables.write().await;
 
         //移除表
-        let _ = tables.remove(&table);
+        if let Some(removed) = tables.remove(&table) {
+            self.0
+                .db_mgr
+                .0
+                .key_versions
+                .remove_exact(&table, &removed.versions);
+        }
 
         //删除表的元信息
         let meta_table_name = Atom::from(DEFAULT_DB_TABLES_META_DIR);
@@ -3035,9 +3950,11 @@ impl<
         Ok(())
     }
 
-    /// 异步修复移除表
+    /// 重放已提交但未最终确认的删表 WAL；只接受有效持久化名称并复用正常删除动作。
     #[inline]
     async fn repair_remove_table(&self, table: Atom) -> IOResult<()> {
+        // 恢复入口接收持久化 WAL 中的名称；先用持久化数据错误语义校验，再复用正常移除。
+        validate_removable_table_name(&table, ErrorKind::InvalidData, "repair table removal")?;
         self.remove_table(table).await
     }
 
@@ -3770,6 +4687,150 @@ impl<
         }
     }
 
+    /// 使用外部读缓存版本和最终写集合，一次性装配并预提交独立版本事务。
+    async fn prepare_with_version(&self,
+                                  read_set: Vec<TableKeyVersion>,
+                                  write_set: Vec<TableKV>)
+        -> Result<Vec<u8>, KVTableTrError> {
+        if !self.is_writable() {
+            return Err(KVTableTrError::new_transaction_error(
+                ErrorLevel::Normal,
+                "Prepare with version failed, reason: root transaction is read-only"));
+        }
+        validate_prepare_with_version_inputs(&read_set, &write_set)?;
+
+        // 先在事务私有内存中规范化输入，不触碰表、版本或 manager。分组顺序取两个输入 Vec
+        // 第一次出现表的顺序；同一 Table/Key 跨 read/write 重叠时保留 expected 读版本，但最终
+        // 动作原子替换为 Write。集合内部重复项已在上方拒绝，避免 HashMap 覆盖掩盖协议错误。
+        let mut groups: Vec<VersionPrepareGroup<C, Log>> = Vec::new();
+        let mut group_indices: XHashMap<Atom, usize> = XHashMap::default();
+        for item in read_set {
+            let index = if let Some(index) = group_indices.get(&item.table) {
+                *index
+            } else {
+                let index = groups.len();
+                group_indices.insert(item.table.clone(), index);
+                groups.push(VersionPrepareGroup {
+                    name: item.table.clone(),
+                    registered: None,
+                    expected: XHashMap::default(),
+                    actions: XHashMap::default(),
+                    read_keys: Vec::new(),
+                    has_write: false,
+                });
+                index
+            };
+            let group = &mut groups[index];
+            group.read_keys.push(item.key.clone());
+            group.expected.insert(item.key.clone(), item.version);
+            group.actions.insert(item.key, crate::KVActionLog::Read);
+        }
+        for item in write_set {
+            let index = if let Some(index) = group_indices.get(&item.table) {
+                *index
+            } else {
+                let index = groups.len();
+                group_indices.insert(item.table.clone(), index);
+                groups.push(VersionPrepareGroup {
+                    name: item.table.clone(),
+                    registered: None,
+                    expected: XHashMap::default(),
+                    actions: XHashMap::default(),
+                    read_keys: Vec::new(),
+                    has_write: false,
+                });
+                index
+            };
+            let group = &mut groups[index];
+            group.has_write = true;
+            group.actions.insert(item.key, crate::KVActionLog::Write(item.value));
+        }
+
+        // 这里只克隆注册项并立即释放 registry guard；后续构造、publication await 和 prepare
+        // 都不得持有数据库表锁。现存 LogWrite 的 delete 是静态能力错误，必须先于 UID 拒绝。
+        {
+            let tables = self.0.db_mgr.0.tables.read().await;
+            for group in &mut groups {
+                group.registered = tables.get(&group.name).cloned();
+                if let Some(RegisteredTable {
+                    table: KVDBTable::LogWTab(_),
+                    ..
+                }) = group.registered.as_ref() {
+                    if group.actions.values().any(|action| {
+                        matches!(action, crate::KVActionLog::Write(None))
+                    }) {
+                        return Err(KVTableTrError::new_transaction_error(
+                            ErrorLevel::Normal,
+                            format!("Prepare with version failed, table: {:?}, reason: LogWrite does not support delete",
+                                    group.name.as_str())));
+                    }
+                }
+            }
+        }
+
+        // 所有子表共享一个只收集“本事务最终写”的回执 owner。它不读取全局最新版本，且只有
+        // commit_with_version 会在整棵树提交成功后 take；普通 commit 混用虽被协议禁止，但仍不
+        // 能跳过底层版本发布。
+        let receipt = VersionReceipt::new();
+        let mut identities = Vec::with_capacity(groups.len());
+        let mut childes_map = self.0.childs_map.lock();
+        for group in groups {
+            let identity_versions = group
+                .registered
+                .as_ref()
+                .map(|registered| registered.versions.clone());
+            identities.push(RootVersionTableIdentity {
+                name: group.name.clone(),
+                versions: identity_versions,
+                read_keys: group.read_keys,
+                has_write: group.has_write,
+            });
+
+            if let Some(registered) = group.registered {
+                let is_persistent = group.has_write && registered.is_persistent();
+                if is_persistent {
+                    self.require_persistence();
+                }
+                self.versioned_table_transaction(group.name,
+                                                   &registered,
+                                                   is_persistent,
+                                                   group.expected,
+                                                   receipt.clone(),
+                                                   group.actions,
+                                                   &mut *childes_map);
+            }
+        }
+        drop(childes_map);
+        *self.0.version_context.lock() = Some(RootVersionContext {
+            tables: identities,
+            receipt,
+        });
+
+        self
+            .0
+            .db_mgr
+            .0
+            .tr_mgr
+            .start(KVDBTransaction::RootTr(self.clone()))
+            .await?;
+        let prepare_output = self
+            .0
+            .db_mgr
+            .0
+            .tr_mgr
+            .prepare_all_conflicts(KVDBTransaction::RootTr(self.clone()))
+            .await?;
+
+        if self.is_require_persistence() {
+            match prepare_output {
+                Some(output) if output.len() > 16 => Ok(output),
+                _ => Ok(Vec::new()),
+            }
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
     /// 异步预提交本次事务对键值对数据库的所有修改，成功返回预提交的输出
     #[inline]
     async fn prepare_modified(&self) -> Result<Vec<u8>, KVTableTrError> {
@@ -3881,21 +4942,42 @@ impl<
     /// 异步提交本次事务对键值对数据库的所有修改
     #[inline]
     async fn commit_modified(&self, prepare_output: Vec<u8>) -> Result<(), KVTableTrError> {
-        if self.is_writable()
-            && self.is_require_persistence()
-            && prepare_output.is_empty() {
-            //当前事务是可写且需要持久化的事务，但预提交输出为空，则立即完成本次键值对数据库事务
-            //一般只出现在事务中只有创建或删除表操作，且表已创建或已删除
-            self
-                .0
-                .db_mgr
-                .0
-                .tr_mgr
-                .finish(KVDBTransaction::RootTr(self.clone()));
-            return Ok(());
-        }
+        self.commit_core(prepare_output).await
+    }
 
-        //为本次事务的异步提交确认，创建提交确认回调
+    /// 版本提交与普通提交共享唯一 WAL/事务管理器闭环，差异只在成功后的回执所有权。
+    async fn commit_with_version(&self,
+                                 prepare_output: Vec<u8>)
+        -> Result<Vec<TableKeyVersion>, KVTableTrError> {
+        let receipt = self
+            .0
+            .version_context
+            .lock()
+            .as_ref()
+            .expect("Commit with version failed, reason: transaction was not prepared by version protocol")
+            .receipt
+            .clone();
+        match self.commit_core(prepare_output).await {
+            Ok(()) => Ok(receipt.take()),
+            Err(error) => {
+                receipt.clear();
+                Err(error)
+            },
+        }
+    }
+
+    async fn commit_core(&self, prepare_output: Vec<u8>) -> Result<(), KVTableTrError> {
+        // 为本次事务创建“持久化成功信号”聚合器。计数只包含需要持久化的子表；
+        // 根事务自身和非持久化子表不参与。子表数据文件失败时不会调用该回调，根 WAL
+        // 因计数未归零而保持未确认。可写事务只有读动作时 prepare_output 和计数都可以为 0：
+        // 空输出只跳过 WAL I/O，仍必须由上游 manager 提交整棵 Prepared 树，以释放表级读预留；
+        // 此时确认器不会被调用。详见 CONTRACT-CFM-001 和 CONTRACT-TR-005：
+        // docs/SEMANTIC_CONTRACTS.md#contract-confirm-success-only。
+        // 根 WAL append/flush 的环境/runtime 失败属于 LIMIT-ROOT-WAL-IO-001：上游当前会返回
+        // LogCommitFailed，但普通 io::Error 无法证明 WAL 的实际落盘阶段。本层只透传错误，不得
+        // 在这里猜测耐久状态、清理 CommitLogger checkpoint 或改变 rollback/Fatal 分类。
+        // 当前根 WAL 链最终调用 pi_async_file::AsyncFile::write，而不是未被这四库调用的
+        // write_batch；后者的独立实现缺陷归档为 FIND-ASYNC-FILE-BATCH-001，不得据此扩大本边界。
         let commit_confirm = KVDBCommitConfirm::new(self.0.db_mgr.0.rt.clone(),
                                                     self.0.db_mgr.0.tr_mgr.commit_logger(),
                                                     self.get_transaction_uid().unwrap(),
@@ -3991,7 +5073,9 @@ impl<
                            transaction_uid: Guid,
                            commit_uid: Guid,
                            prepare_output: Vec<u8>) -> Result<(), KVTableTrError> {
-        //为本次事务的异步提交确认，创建提交确认回调
+        // 恢复提交沿用正常提交的成功信号协议：只有本次重放涉及的全部持久化子表成功，
+        // 原根 WAL 才能确认；任一数据文件失败都不发送成功信号。详见 CONTRACT-CFM-001：
+        // docs/SEMANTIC_CONTRACTS.md#contract-confirm-success-only。
         let commit_confirm = KVDBCommitConfirm::new(self.0.db_mgr.0.rt.clone(),
                                                     self.0.db_mgr.0.tr_mgr.commit_logger(),
                                                     transaction_uid.clone(),
@@ -4025,6 +5109,46 @@ impl<
     }
 }
 
+/// 版本事务装配时固定的一张表身份和用途。
+///
+/// `versions` 的 Arc 身份同时代表精确表实例；缺表保存 None。根事务在 Phase 1 和 Phase 2
+/// 分别复核一次，防止两阶段之间的 registry 替换被忽略。只读身份失效可枚举 read_keys 为完整
+/// 冲突；含写表失效则返回 Common，因为旧表写入不能安全改投到同名新表。
+#[derive(Clone)]
+struct RootVersionTableIdentity {
+    name: Atom,
+    versions: Option<KeyVersions>,
+    read_keys: Vec<Binary>,
+    has_write: bool,
+}
+
+/// 一棵独立版本事务树的根级上下文。
+///
+/// 表身份按首次触表顺序保存；receipt 与所有已创建子事务共享。上下文只属于
+/// `prepare_with_version -> commit_with_version` 协议，不得与普通动作、DDL 或普通提交入口混用。
+#[derive(Clone)]
+struct RootVersionContext {
+    tables: Vec<RootVersionTableIdentity>,
+    receipt: VersionReceipt,
+}
+
+/// `prepare_with_version` 在共享状态副作用前构造的单表规范化输入。
+///
+/// `expected` 与最终 `actions` 是两个不同维度：跨 read/write 重叠的 Key 同时保留外部读版本和
+/// 最终 Write。`registered` 只克隆 registry 中的精确 `(table, versions)` 配对，后续 await 不持
+/// tables guard。
+struct VersionPrepareGroup<
+    C: Clone + Send + 'static,
+    Log: AsyncCommitLog<C = C, Cid = Guid>,
+> {
+    name: Atom,
+    registered: Option<RegisteredTable<C, Log>>,
+    expected: XHashMap<Binary, Version>,
+    actions: XHashMap<Binary, crate::KVActionLog>,
+    read_keys: Vec<Binary>,
+    has_write: bool,
+}
+
 ///
 /// 内部键值对数据库的根事务
 ///
@@ -4043,27 +5167,37 @@ struct InnerRootTransaction<
     childs_map:         SpinLock<XHashMap<Atom, KVDBTransaction<C, Log>>>,  //子事务表
     childs:             SpinLock<KVDBChildTrList<C, Log>>,                  //子事务列表
     db_mgr:             KVDBManager<C, Log>,                                //键值对数据库管理器
+    version_context:    SpinLock<Option<RootVersionContext>>,               //版本协议表身份和提交回执
 }
 
+/// 数据库注册表中五种物理/逻辑表实现的类型擦除句柄。
 ///
-/// 键值对数据库的表
-///
+/// clone 只克隆内部表句柄，不复制数据。应用层从 [`KVDBManager`] 的公开方法操作表；直接
+/// 构造 variant 会绕过名称、元数据、版本 registry 和目录注册协议，属于禁止调用域。
 #[derive(Clone)]
 pub enum KVDBTable<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>,
 > {
-    MetaTab(MetaTable<C, Log>),             //元信息表
-    MemOrdTab(MemoryOrderedTable<C, Log>),  //有序内存表
-    LogOrdTab(LogOrderedTable<C, Log>),     //有序日志表
-    LogWTab(LogWriteTable<C, Log>),         //只写日志表
-    BtreeOrdTab(BtreeOrderedTable<C, Log>), //有序B树表
+    /// 记录数据库表定义的 Meta 表。
+    MetaTab(MetaTable<C, Log>),
+    /// COW 有序 Map 支撑的 Memory 表。
+    MemOrdTab(MemoryOrderedTable<C, Log>),
+    /// 日志文件支撑的可查询 LogOrdered 表。
+    LogOrdTab(LogOrderedTable<C, Log>),
+    /// 只写 LogWrite 表；当前不允许外部业务使用。
+    LogWTab(LogWriteTable<C, Log>),
+    /// 事务写缓存与 redb 数据文件共同支撑的 Btree 表。
+    BtreeOrdTab(BtreeOrderedTable<C, Log>),
 }
 
+// SAFETY: 所有 variant 的表句柄都由 Arc/线程安全存储和同步原语持有；移动枚举仅移动共享
+// owner，不移动自引用对象或暴露可变别名。表级合法调用协议不由该 marker 保证。
 unsafe impl<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>,
 > Send for KVDBTable<C, Log> {}
+// SAFETY: 各表实现负责其 COW root、缓存、日志/redb 句柄的同步；枚举没有额外内部可变性。
 unsafe impl<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>,
@@ -4126,4 +5260,109 @@ pub(crate) fn table_to_binary(table_name: &Atom) -> Binary {
 pub(crate) fn binary_to_table(bin: &Binary) -> Result<Atom, ReadBonErr> {
     let mut buffer = ReadBuffer::new(bin, 0);
     Atom::decode(&mut buffer)
+}
+
+// 校验完整表名的 UTF-8 字节长度。调用方选择 InvalidInput（公开 DDL 参数）或 InvalidData
+//（Meta/WAL 恢复数据）；错误消息只记录长度，避免把最多数 KiB 的名称复制进日志。
+#[inline]
+fn validate_table_name(table_name: &Atom,
+                       error_kind: ErrorKind,
+                       operation: &'static str) -> IOResult<()> {
+    let bytes_len = table_name.as_str().as_bytes().len();
+    if bytes_len == 0 || bytes_len > MAX_TABLE_NAME_BYTES {
+        return Err(Error::new(error_kind,
+                              format!("{} failed, table_name_bytes: {}, valid_range: 1..={}, reason: invalid table name length",
+                                      operation,
+                                      bytes_len,
+                                      MAX_TABLE_NAME_BYTES)));
+    }
+
+    Ok(())
+}
+
+/// 校验版本协议的单个 Table/Key，必须在 Guid 分配、版本写入和事务创建前调用。
+#[inline]
+fn validate_version_table_key(table: &Atom,
+                              key: &Binary,
+                              operation: &'static str) -> Result<(), KVTableTrError> {
+    validate_table_name(table, ErrorKind::InvalidInput, operation).map_err(|e| {
+        KVTableTrError::new_transaction_error(ErrorLevel::Normal, e)
+    })?;
+    if key.len() == 0 || key.len() > u16::MAX as usize {
+        return Err(KVTableTrError::new_transaction_error(
+            ErrorLevel::Normal,
+            format!("{} failed, table: {:?}, key_bytes: {}, valid_range: 1..={}, reason: invalid key length",
+                    operation,
+                    table.as_str(),
+                    key.len(),
+                    u16::MAX)));
+    }
+
+    Ok(())
+}
+
+/// 静态校验版本事务的两个输入集合；本函数无共享状态副作用，必须先于事务 UID 和子事务创建。
+fn validate_prepare_with_version_inputs(read_set: &[TableKeyVersion],
+                                        write_set: &[TableKV])
+    -> Result<(), KVTableTrError> {
+    let mut read_seen: XHashMap<Atom, XHashMap<Binary, ()>> = XHashMap::default();
+    for item in read_set {
+        validate_version_table_key(&item.table, &item.key, "prepare with version read set")?;
+        if read_seen
+            .entry(item.table.clone())
+            .or_default()
+            .insert(item.key.clone(), ())
+            .is_some() {
+            return Err(KVTableTrError::new_transaction_error(
+                ErrorLevel::Normal,
+                format!("Prepare with version failed, table: {:?}, key_bytes: {}, reason: duplicate key in read set",
+                        item.table.as_str(),
+                        item.key.len())));
+        }
+    }
+
+    let mut write_seen: XHashMap<Atom, XHashMap<Binary, ()>> = XHashMap::default();
+    for item in write_set {
+        validate_version_table_key(&item.table, &item.key, "prepare with version write set")?;
+        if let Some(value) = item.value.as_ref() {
+            if value.len() == 0 || value.len() > u32::MAX as usize {
+                return Err(KVTableTrError::new_transaction_error(
+                    ErrorLevel::Normal,
+                    format!("Prepare with version failed, table: {:?}, value_bytes: {}, valid_range: 1..={}, reason: invalid value length",
+                            item.table.as_str(),
+                            value.len(),
+                            u32::MAX)));
+            }
+        }
+        if write_seen
+            .entry(item.table.clone())
+            .or_default()
+            .insert(item.key.clone(), ())
+            .is_some() {
+            return Err(KVTableTrError::new_transaction_error(
+                ErrorLevel::Normal,
+                format!("Prepare with version failed, table: {:?}, key_bytes: {}, reason: duplicate key in write set",
+                        item.table.as_str(),
+                        item.key.len())));
+        }
+    }
+
+    Ok(())
+}
+
+// 删表专用校验：除通用长度契约外，内部 Meta 表永远不能成为公开删除或 WAL 删除恢复目标。
+// 调用方必须在根持久化标记、注册表锁和 Meta 动作之前调用，以保证拒绝路径无副作用。
+#[inline]
+fn validate_removable_table_name(table_name: &Atom,
+                                 error_kind: ErrorKind,
+                                 operation: &'static str) -> IOResult<()> {
+    validate_table_name(table_name, error_kind, operation)?;
+    if table_name.as_str() == DEFAULT_DB_TABLES_META_DIR {
+        return Err(Error::new(error_kind,
+                              format!("{} failed, table_name: {:?}, reason: reserved internal meta table cannot be removed",
+                                      operation,
+                                      DEFAULT_DB_TABLES_META_DIR)));
+    }
+
+    Ok(())
 }

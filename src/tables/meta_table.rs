@@ -1,3 +1,10 @@
+//! 数据库内部 Meta 表及其 2PC 子事务实现。
+//!
+//! Meta 表以 COW `OrdMap` 保存“表名编码 -> `KVTableMeta` 编码”，并以独立 `LogFile` 保存
+//! 已提交表定义。DDL 通过根事务访问本模块；外部不得直接构造 Meta 表事务。提交先在
+//! publication 写门内发布内存根与 Key 版本，再异步把动作批量写入表日志；只有表日志成功
+//! 后才调用确认器，失败时保留根 WAL 供启动修复。
+
 use std::mem;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -18,9 +25,10 @@ use pi_async_rt::{lock::spin_lock::SpinLock,
 use pi_atom::Atom;
 use pi_guid::Guid;
 use pi_hash::XHashMap;
-use pi_ordmap::{ordmap::{Iter, OrdMap, Keys, Entry}, asbtree::Tree};
+use pi_ordmap::{ordmap::OrdMap, asbtree::Tree};
 use pi_async_transaction::{AsyncTransaction,
                            Transaction2Pc,
+                           Transaction2PcAllConflicts,
                            UnitTransaction,
                            SequenceTransaction,
                            TransactionTree,
@@ -34,8 +42,17 @@ use pi_store::log_store::log_file::{PairLoader,
                                     LogFile};
 
 use crate::{Binary, KVAction, TableTrQos, KVActionLog, KVDBCommitConfirm, KVTableTrError,
+            TableKey,
             db::{KVDBTransaction, KVDBChildTrList},
-            tables::KVTable,
+            key_version::{KeyVersions,
+                          PrepareMode,
+                          PreparedActions,
+                          TableVersionContext,
+                          Version,
+                          VersionReceipt,
+                          binary_state_equal,
+                          has_prepared_conflict},
+            tables::{KVTable, ordmap_snapshot::OrdMapSnapshot},
             utils::KVDBEvent,
             KVDBTableType};
 
@@ -44,19 +61,24 @@ use crate::{Binary, KVAction, TableTrQos, KVActionLog, KVDBCommitConfirm, KVTabl
 ///
 const DEFAULT_LOG_FILE_COMMIT_DELAY_TIMEOUT: usize = 1000;
 
+/// 数据库表目录使用的持久化、有序 Meta 表共享句柄。
 ///
-/// 元信息表
-///
+/// `root` 是当前进程内已提交表定义的权威 COW 根，`prepare` 记录已通过冲突检查但尚未 commit
+/// 的事务动作。clone 只增加内部 `Arc` 引用。该类型始终具有独立日志文件；DDL 的建表/删表
+/// 完整事务原子性是当前已归档限制，不能仅凭内存 Meta 可见就推断目录和全部文件已原子完成。
 #[derive(Clone)]
 pub struct MetaTable<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>,
 >(Arc<InnerMetaTable<C, Log>>);
 
+// SAFETY: 内部共享状态由 Mutex/AsyncMutex/原子类型、线程安全 runtime 和 LogFile 保护；外层
+// 只移动 Arc owner，不暴露可变引用或裸指针。
 unsafe impl<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>,
 > Send for MetaTable<C, Log> {}
+// SAFETY: 所有 `&self` 可变访问均经过上述同步原语；DDL/事务调用顺序属于协议约束。
 unsafe impl<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>,
@@ -172,7 +194,19 @@ impl<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>,
 > MetaTable<C, Log> {
-    /// 构建一个元信息表
+    /// 在不创建事务的前提下读取当前已提交 COW 根；调用方负责 publication 同步。
+    pub(crate) fn query_committed(&self, key: &Binary) -> Option<Binary> {
+        self.0.root.lock().get(key).cloned()
+    }
+
+    /// 打开并加载一个 Meta 表，然后启动提交待确认队列的永久整理任务。
+    ///
+    /// `path` 指向表日志目录；`log_file_limit`/`block_limit` 控制日志文件；`load_buf_len` 和
+    /// `is_checksum` 控制启动加载；`waits_limit`/`wait_timeout` 控制已发布事务何时批量写表
+    /// 日志。打开或加载失败会 panic，因此该构造器只供已校验的数据库启动路径使用。
+    ///
+    /// 返回前日志已加载进 COW 根，但后台整理任务没有 shutdown 接口并会持有表 clone。任务
+    /// 每轮串行 drain `waits`；它不参与根 WAL append，只有表日志成功后才发送提交确认。
     pub async fn new<P: AsRef<Path>>(rt: MultiTaskRuntime<()>,
                                      path: P,
                                      name: Atom,
@@ -271,57 +305,79 @@ impl<
     }
 }
 
-// 内部元信息表
+/// Meta 表的共享状态及锁所有权。
+///
+/// 同步锁只保护短内存临界区；`waits` 使用异步锁，因为 collector 会在持有该锁时执行表日志
+/// `delay_commit().await`。当前锁顺序是版本 publication（表外）-> `prepare` -> `root`，提交
+/// 不反向取得 publication；collector 不访问这三把锁。
 struct InnerMetaTable<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>,
 > {
-    //表名
+    // 逻辑表名，正常数据库固定为 `.tables_meta`。
     name:           Atom,
-    //元信息表的根节点
+    // 当前已提交数据根；clone 是稳定 COW 快照，写操作必须在锁内替换或合并。
     root:           Mutex<OrdMap<Tree<Binary, Binary>>>,
-    //元信息表的预提交表
-    prepare:        Mutex<XHashMap<Guid, XHashMap<Binary, KVActionLog>>>,
-    //异步运行时
+    // TID -> 已预留动作；prepare 原子检查并插入，commit/rollback 按同一 TID 移除。
+    prepare:        Mutex<XHashMap<Guid, PreparedActions>>,
+    // 驱动表日志打开、定时 collector 和异步确认流程的 runtime。
     rt:             MultiTaskRuntime<()>,
-    //等待异步写日志文件的已提交的元信息事务列表
+    // 内存根已发布、仍待写表日志并确认的 FIFO；元素同时保活事务和根确认回调。
     waits:          AsyncMutex<VecDeque<(MetaTabTr<C, Log>, XHashMap<Binary, KVActionLog>, <MetaTabTr<C, Log> as Transaction2Pc>::CommitConfirm)>>,
-    //等待异步写日志文件的已提交的有序日志事务的键值对大小
+    // 新入队动作的近似累计 bytes，用于触发 size collector；触发时先归零。
     waits_size:     AtomicUsize,
-    //等待异步写日志文件的已提交的元信息事务大小限制
+    // `waits_size` 达到该值时立即尝试整理。
     waits_limit:    usize,
-    //等待异步写日志文件的超时时长，单位毫秒
+    // 定时整理间隔，单位毫秒。
     wait_timeout:   usize,
-    //是否正在整理等待异步写日志文件的已提交的元信息事务列表
+    // size/timer 两种触发器共享的单 collector owner 标志。
     collecting:     AtomicBool,
-    //日志文件
+    // Meta 的独立数据日志；不等同于根 CommitLogger/WAL。
     log_file:       LogFile,
-    //表事件通知器
+    // 可选观测事件通道；不参与提交正确性或确认判定。
     notifier:       Option<Sender<KVDBEvent<Guid>>>,
 }
 
+// SAFETY: 字段分别由同步原语或其线程安全类型保护，泛型 Log 只经 trait 约束持有在事务/确认器
+// 中；没有未同步裸内存。
 unsafe impl<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>,
 > Send for InnerMetaTable<C, Log> {}
+// SAFETY: 共享引用无法绕过 root/prepare/waits 的锁和原子 collector owner。
 unsafe impl<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>,
 > Sync for InnerMetaTable<C, Log> {}
 
+/// 一棵根事务树中的 Meta 表单元子事务。
 ///
-/// 元信息表事务
-///
+/// 创建时 `root_ref` 固定已提交基线，`root_mut` 是事务私有 COW 根，`actions` 记录 Read、
+/// Write 或 DirtyWrite。prepare 逐 Key 比较基线、当前根、版本 revision 和其它 prepared
+/// 预留；commit 才把私有状态发布到表根。clone 共享同一事务状态，不产生新事务或新快照。
 #[derive(Clone)]
 pub struct MetaTabTr<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>,
 >(Arc<InnerMetaTabTr<C, Log>>);
 
+/// 同一冲突事实面向三种上层 prepare API 的错误投影方式。
+#[derive(Clone, Copy)]
+enum PrepareConflictKind {
+    /// 普通 prepare：返回可恢复 Normal 文本错误。
+    Common,
+    /// `prepare_conflicts`：只返回首个表/Key。
+    First,
+    /// `prepare_all_conflicts`：返回当前表收集到的全部 Key。
+    All,
+}
+
+// SAFETY: 外层只持 Arc；内部所有可变状态由 SpinLock/AtomicBool 或表级同步原语保护。
 unsafe impl<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>,
 > Send for MetaTabTr<C, Log> {}
+// SAFETY: clone/共享引用不会产生事务私有根的无同步可变别名。并发动作顺序仍由外部协议保证。
 unsafe impl<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>,
@@ -362,9 +418,13 @@ impl<
         let tr = self.clone();
 
         async move {
-            //移除事务在元信息表的预提交表中的操作记录
+            // rollback 只撤销尚未发布的 prepared 预留并释放版本快照租约；事务私有 COW 根
+            // 随最后一个 Arc 释放。commit 已经发布的数据不属于该回滚路径。
             let transaction_uid = tr.get_transaction_uid().unwrap();
             let _ = tr.0.table.0.prepare.lock().remove(&transaction_uid);
+            if let Some(context) = tr.0.version_context.as_ref() {
+                context.release_snapshot();
+            }
 
             Ok(())
         }.boxed()
@@ -437,84 +497,7 @@ impl<
         let tr = self.clone();
 
         async move {
-            if tr.is_writable() {
-                //可写事务预提交
-                #[allow(unused_assignments)]
-                let mut write_buf = None; //默认的写操作缓冲区
-
-                {
-                    //同步锁住元信息表的预提交表，并进行预提交表的检查和修改
-                    let mut prepare_locked = tr.0.table.0.prepare.lock();
-
-                    //将事务的操作记录与表的预提交表进行比较
-                    let mut buf = Vec::new();
-                    let mut writed_count = 0;
-                    for (_key, action) in tr.0.actions.lock().iter() {
-                        match action {
-                            KVActionLog::Write(_) | KVActionLog::DirtyWrite(_) => {
-                                //对指定关键字进行了写操作，则增加本次事务写操作计数
-                                writed_count += 1;
-                            }
-                            KVActionLog::Read => (), //忽略指定关键字的读操作计数
-                        }
-                    }
-                    tr
-                        .0
-                        .table
-                        .init_table_prepare_output(&mut buf,
-                                                   writed_count); //初始化本次表事务的预提交输出缓冲区
-
-                    let init_buf_len = buf.len(); //获取初始化本次表事务的预提交输出缓冲区后，缓冲区的长度
-                    for (key, action) in tr.0.actions.lock().iter() {
-                        if let Err(e) = tr
-                            .check_prepare_conflict(&mut prepare_locked,
-                                                    key,
-                                                    action) {
-                            //尝试表的预提交失败，则立即返回错误原因
-                            return Err(e);
-                        }
-
-                        if !action.is_dirty_writed() {
-                            //非脏写操作需要对根节点冲突进行检查
-                            if let Err(e) = tr
-                                .check_root_conflict(key) {
-                                //尝试表的预提交失败，则立即返回错误原因
-                                return Err(e);
-                            }
-                        }
-
-                        //指定关键字的操作预提交成功，则将写操作写入预提交缓冲区
-                        match action {
-                            KVActionLog::Write(None) | KVActionLog::DirtyWrite(None) => {
-                                tr.0.table.append_key_value_to_table_prepare_output(&mut buf, key, None);
-                            },
-                            KVActionLog::Write(Some(value)) | KVActionLog::DirtyWrite(Some(value)) => {
-                                tr.0.table.append_key_value_to_table_prepare_output(&mut buf, key, Some(value));
-                            },
-                            _ => (), //忽略读操作
-                        }
-                    }
-
-                    if buf.len() <= init_buf_len {
-                        //本次事务没有对本地表的写操作，则设置写操作缓冲区为空
-                        write_buf = None;
-                    } else {
-                        //本次事务有对本地表的写操作，则写操作缓冲区为指定的预提交缓冲区
-                        write_buf = Some(buf);
-                    }
-
-                    //获取事务的当前操作记录，并重置事务的当前操作记录
-                    let actions = mem::replace(&mut *tr.0.actions.lock(), XHashMap::default());
-
-                    //将事务的当前操作记录，写入表的预提交表
-                    prepare_locked.insert(tr.get_transaction_uid().unwrap(), actions);
-                }
-
-                Ok(write_buf)
-            } else {
-                //只读事务，则不需要同步锁住元信息表的预提交表，并立即返回
-                Ok(None)
-            }
+            tr.prepare_registered(PrepareConflictKind::Common).await
         }.boxed()
     }
 
@@ -522,76 +505,7 @@ impl<
         let tr = self.clone();
 
         async move {
-            if tr.is_writable() {
-                //可写事务预提交
-                #[allow(unused_assignments)]
-                let mut write_buf = None; //默认的写操作缓冲区
-
-                {
-                    //同步锁住元信息表的预提交表，并进行预提交表的检查和修改
-                    let mut prepare_locked = tr.0.table.0.prepare.lock();
-
-                    //将事务的操作记录与表的预提交表进行比较
-                    let mut buf = Vec::new();
-                    let mut writed_count = 0;
-                    for (_key, action) in tr.0.actions.lock().iter() {
-                        match action {
-                            KVActionLog::Write(_) | KVActionLog::DirtyWrite(_) => {
-                                //对指定关键字进行了写操作，则增加本次事务写操作计数
-                                writed_count += 1;
-                            }
-                            KVActionLog::Read => (), //忽略指定关键字的读操作计数
-                        }
-                    }
-                    tr
-                        .0
-                        .table
-                        .init_table_prepare_output(&mut buf,
-                                                   writed_count); //初始化本次表事务的预提交输出缓冲区
-
-                    let init_buf_len = buf.len(); //获取初始化本次表事务的预提交输出缓冲区后，缓冲区的长度
-                    for (key, action) in tr.0.actions.lock().iter() {
-                        tr.check_prepare_conflict_result(&mut prepare_locked,
-                                                         key,
-                                                         action)?;
-
-                        if !action.is_dirty_writed() {
-                            //非脏写操作需要对根节点冲突进行检查
-                            tr.check_root_conflict_result(key)?;
-                        }
-
-                        //指定关键字的操作预提交成功，则将写操作写入预提交缓冲区
-                        match action {
-                            KVActionLog::Write(None) | KVActionLog::DirtyWrite(None) => {
-                                tr.0.table.append_key_value_to_table_prepare_output(&mut buf, key, None);
-                            },
-                            KVActionLog::Write(Some(value)) | KVActionLog::DirtyWrite(Some(value)) => {
-                                tr.0.table.append_key_value_to_table_prepare_output(&mut buf, key, Some(value));
-                            },
-                            _ => (), //忽略读操作
-                        }
-                    }
-
-                    if buf.len() <= init_buf_len {
-                        //本次事务没有对本地表的写操作，则设置写操作缓冲区为空
-                        write_buf = None;
-                    } else {
-                        //本次事务有对本地表的写操作，则写操作缓冲区为指定的预提交缓冲区
-                        write_buf = Some(buf);
-                    }
-
-                    //获取事务的当前操作记录，并重置事务的当前操作记录
-                    let actions = mem::replace(&mut *tr.0.actions.lock(), XHashMap::default());
-
-                    //将事务的当前操作记录，写入表的预提交表
-                    prepare_locked.insert(tr.get_transaction_uid().unwrap(), actions);
-                }
-
-                Ok(write_buf)
-            } else {
-                //只读事务，则不需要同步锁住元信息表的预提交表，并立即返回
-                Ok(None)
-            }
+            tr.prepare_registered(PrepareConflictKind::First).await
         }.boxed()
     }
 
@@ -600,55 +514,96 @@ impl<
         let tr = self.clone();
 
         async move {
-            //移除事务在元信息表的预提交表中的操作记录
             let transaction_uid = tr.get_transaction_uid().unwrap();
+            // publication write 使元信息根和全部 Key 版本相对于 query_with_version 一次可见。
+            // prepare 锁只用于取走预留，不能延伸到根发布或后续异步 LogFile 路径。
+            let publication = match tr.0.version_context.as_ref() {
+                Some(context) => Some(context.versions().publication().write().await),
+                None => None,
+            };
+            let actions = tr
+                .0
+                .table
+                .0
+                .prepare
+                .lock()
+                .remove(&transaction_uid)
+                .map(|prepared| prepared.actions)
+                .unwrap_or_default();
+            let has_writes = actions.values().any(|action| {
+                matches!(action, KVActionLog::Write(_) | KVActionLog::DirtyWrite(_))
+            });
 
-            //从元信息表的预提交表中移除当前事务的操作记录
-            let actions = {
-                let mut table_prepare = tr
-                    .0
-                    .table
-                    .0
-                    .prepare
-                    .lock();
-                let actions = table_prepare.get(&transaction_uid); //获取元信息表，本次事务预提交成功的相关操作记录
+            if has_writes {
+                // revision 只为实际写动作分配；纯读事务不会推进版本时钟或产生回执。
+                let revision = match tr.0.version_context.as_ref() {
+                    Some(context) => {
+                        match context.versions().checked_next_revision() {
+                            Some(revision) => Some(revision),
+                            None => {
+                                drop(publication);
+                                context.release_snapshot();
+                                return Err(KVTableTrError::new_transaction_error(
+                                    ErrorLevel::Fatal,
+                                    format!("Commit meta table failed, table: {:?}, source: {:?}, transaction_uid: {:?}, reason: key version revision exhausted",
+                                            tr.0.table.name().as_str(),
+                                            tr.0.source,
+                                            transaction_uid)));
+                            },
+                        }
+                    },
+                    None => None,
+                };
 
-                //更新元信息表的根节点
-                if let Some(actions) = actions {
-                    {
-                        let mut locked = tr.0.table.0.root.lock();
-                        if !locked.ptr_eq(&tr.0.root_ref) {
-                            //元信息表的根节点在当前事务执行过程中已改变，
-                            //一般是因为其它事务更新了与当前事务无关的关键字，
-                            //则将当前事务的修改直接作用在当前元信息表中
-                            for (key, action) in actions.iter() {
-                                match action {
-                                    KVActionLog::Write(None) | KVActionLog::DirtyWrite(None) => {
-                                        //删除指定关键字
-                                        let _ = locked.delete(key, false);
-                                    },
-                                    KVActionLog::Write(Some(value)) | KVActionLog::DirtyWrite(Some(value)) => {
-                                        //插入或更新指定关键字
-                                        let _ = locked.upsert(key.clone(), value.clone(), false);
-                                    },
-                                    KVActionLog::Read => (), //忽略读操作
-                                }
-                            }
-                        } else {
-                            //元信息表的根节点在当前事务执行过程中未改变，则用本次事务修改并提交成功的根节点替换元信息表的根节点
-                            *locked = tr.0.root_mut.lock().clone();
+                let mut committed_versions = Vec::new();
+                let mut root = tr.0.table.0.root.lock();
+                if root.ptr_eq(&tr.0.root_ref) {
+                    // 仅 commit 保留 COW 整根替换；prepare 已经逐 Key 完成状态冲突检查。
+                    *root = tr.0.root_mut.lock().clone();
+                } else {
+                    for (key, action) in &actions {
+                        match action {
+                            KVActionLog::Write(None) | KVActionLog::DirtyWrite(None) => {
+                                let _ = root.delete(key, false);
+                            },
+                            KVActionLog::Write(Some(value)) | KVActionLog::DirtyWrite(Some(value)) => {
+                                let _ = root.upsert(key.clone(), value.clone(), false);
+                            },
+                            KVActionLog::Read => (),
                         }
                     }
-
-                    //元信息表提交完成后，从元信息表的预提交表中移除当前事务的操作记录
-                    table_prepare.remove(&transaction_uid).unwrap()
-                } else {
-                    XHashMap::default()
                 }
-            };
+
+                if let (Some(context), Some(revision)) =
+                    (tr.0.version_context.as_ref(), revision) {
+                    for (key, action) in &actions {
+                        let value = match action {
+                            KVActionLog::Write(value) | KVActionLog::DirtyWrite(value) => value,
+                            KVActionLog::Read => continue,
+                        };
+                        committed_versions.push(context.versions().publish(
+                            tr.0.table.name(),
+                            key.clone(),
+                            value.as_ref(),
+                            transaction_uid.clone(),
+                            revision));
+                    }
+                    context.versions().complete_revision(revision);
+                    if let Some(receipt) = context.receipt() {
+                        receipt.append(committed_versions);
+                    }
+                }
+            }
+
+            drop(publication);
+            if let Some(context) = tr.0.version_context.as_ref() {
+                context.release_snapshot();
+            }
 
             if tr.is_require_persistence() {
-                //持久化的元信息表事务，则异步将表的修改写入日志文件后，再确认提交成功
+                // commit future 只登记异步表日志写入并返回；最终 LogFile 成功后才发送 Ok
+                // 成功信号。持久化失败不调用确认器，使根 WAL 保持未确认。详见
+                // CONTRACT-CFM-001：docs/SEMANTIC_CONTRACTS.md#contract-confirm-success-only。
                 let table_copy = tr.0.table.clone();
                 let _ = self.0.table.0.rt.spawn(async move {
                     let mut size = 0;
@@ -690,6 +645,27 @@ impl<
             }
 
             Ok(())
+        }.boxed()
+    }
+}
+
+impl<
+    C: Clone + Send + 'static,
+    Log: AsyncCommitLog<C = C, Cid = Guid>,
+> Transaction2PcAllConflicts for MetaTabTr<C, Log> {
+    fn precheck_all_conflicts(&self)
+        -> BoxFuture<'_, Result<(), <Self as Transaction2Pc>::PrepareError>> {
+        let tr = self.clone();
+        async move {
+            tr.precheck_versions().await
+        }.boxed()
+    }
+
+    fn prepare_all_conflicts(&self)
+        -> BoxFuture<'_, Result<Option<<Self as Transaction2Pc>::PrepareOutput>, <Self as Transaction2Pc>::PrepareError>> {
+        let tr = self.clone();
+        async move {
+            tr.prepare_registered(PrepareConflictKind::All).await
         }.boxed()
     }
 }
@@ -849,6 +825,10 @@ impl<
             //记录对指定关键字的最新删除操作，并增加写操作计数
             let _ = tr.0.actions.lock().insert(key.clone(), KVActionLog::DirtyWrite(None));
 
+            // `copy=false` 是内部 Meta 表的既定语义：删除事务私有根中的表定义，但不返回
+            // 旧元数据 Binary。命中与未命中最终都返回 Ok(None)，DDL 结果不能据此判断
+            // 定义原先是否存在。见 docs/SEMANTIC_CONTRACTS.md#contract-action-001 与
+            // docs/REVIEW_FINDINGS.md#find-ordered-delete-001。
             if let Some(Some(value)) = tr.0.root_mut.lock().delete(&key, false) {
                 //指定关键字存在
                 return Ok(Some(value));
@@ -866,6 +846,10 @@ impl<
             //记录对指定关键字的最新删除操作，并增加写操作计数
             let _ = tr.0.actions.lock().insert(key.clone(), KVActionLog::Write(None));
 
+            // `copy=false` 是内部 Meta 表的既定语义：删除事务私有根中的表定义，但不返回
+            // 旧元数据 Binary。命中与未命中最终都返回 Ok(None)，DDL 结果不能据此判断
+            // 定义原先是否存在。见 docs/SEMANTIC_CONTRACTS.md#contract-action-001 与
+            // docs/REVIEW_FINDINGS.md#find-ordered-delete-001。
             if let Some(Some(value)) = tr.0.root_mut.lock().delete(&key, false) {
                 //指定关键字存在
                 return Ok(Some(value));
@@ -879,16 +863,16 @@ impl<
                 key: Option<<Self as KVAction>::Key>,
                 descending: bool)
                 -> BoxStream<'a, <Self as KVAction>::Key> {
-        let ptr = Box::into_raw(Box::new(self.0.root_mut.lock().keys(key.as_ref(), descending))) as usize;
+        // 元信息流固定调用返回前的事务私有 COW 根；后续 DDL 对 root_mut 的修改不会改变
+        // 已创建流。这里只修复快照所有权，不改变 DDL 当前非完整原子性边界。
+        // CONTRACT-ITER-001 / tests/iterator_snapshot_safety.rs。
+        let root = self.0.root_mut.lock().clone();
+        let mut iterator = OrdMapSnapshot::new(root, key.as_ref(), descending);
 
         let stream = stream! {
-            let mut iterator = unsafe {
-                Box::from_raw(ptr as *mut Keys<'_, Tree<<Self as KVAction>::Key, <Self as KVAction>::Value>>)
-            };
-
-            while let Some(key) = iterator.next() {
-                //从迭代器获取到下一个关键字
-                yield key.clone();
+            while let Some(key) = iterator.next_key() {
+                // 从 owner 保活的创建时快照获取下一个 owned key。
+                yield key;
             }
         };
 
@@ -899,16 +883,14 @@ impl<
                   key: Option<<Self as KVAction>::Key>,
                   descending: bool)
                   -> BoxStream<'a, (<Self as KVAction>::Key, <Self as KVAction>::Value)> {
-        let ptr = Box::into_raw(Box::new(self.0.root_mut.lock().iter(key.as_ref(), descending))) as usize;
+        // 与 keys 使用同一 owner 模型；根锁在构造完成后释放，不跨 yield 持有。
+        let root = self.0.root_mut.lock().clone();
+        let mut iterator = OrdMapSnapshot::new(root, key.as_ref(), descending);
 
         let stream = stream! {
-            let mut iterator = unsafe {
-                Box::from_raw(ptr as *mut <Tree<<Self as KVAction>::Key, <Self as KVAction>::Value> as Iter<'_>>::IterType)
-            };
-
-            while let Some(Entry(key, value)) = iterator.next() {
-                //从迭代器获取到下一个键值对
-                yield (key.clone(), value.clone());
+            while let Some((key, value)) = iterator.next_entry() {
+                // 从 owner 保活的创建时快照获取下一个 owned 键值对。
+                yield (key, value);
             }
         };
 
@@ -957,231 +939,233 @@ impl<
             root_ref,
             table,
             actions: SpinLock::new(XHashMap::default()),
+            version_context: None,
         };
 
         MetaTabTr(Arc::new(inner))
     }
 
-    // 检查元信息表的预提交表的读写冲突
-    fn check_prepare_conflict(&self,
-                              prepare: &mut XHashMap<Guid, XHashMap<Binary, KVActionLog>>,
-                              key: &Binary,
-                              action: &KVActionLog)
-                              -> Result<(), KVTableTrError> {
-        for (guid, actions) in prepare.iter() {
-            match actions.get(key) {
-                Some(KVActionLog::Read) => {
-                    match action {
-                        KVActionLog::Read | KVActionLog::DirtyWrite(_) => {
-                            //本地预提交事务对相同的关键字也执行了读操作或脏写操作，则不存在读写冲突，并继续检查预提交表中是否存在读写冲突
-                            continue;
-                        },
-                        KVActionLog::Write(_) => {
-                            //本地预提交事务对相同的关键字执行了写操作，则存在读写冲突
-                            return Err(<Self as Transaction2Pc>::PrepareError::new_transaction_error(ErrorLevel::Normal,
-                                                                                                     format!("Prepare meta table conflicted, table: {:?}, key: {:?}, source: {:?}, transaction_uid: {:?}, prepare_uid: {:?}, confilicted_transaction_uid: {:?}, reason: require write key but reading now",
-                                                                                                             self.0.table.name().as_str(),
-                                                                                                             key,
-                                                                                                             self.0.source,
-                                                                                                             self.get_transaction_uid(),
-                                                                                                             self.get_prepare_uid(),
-                                                                                                             guid)));
-                        },
+    /// 构建由数据库管理器装配的事务，并在同一根 guard 内固定数据快照和版本 revision。
+    pub(crate) fn new_managed(source: Atom,
+                              is_writable: bool,
+                              is_persistent: bool,
+                              prepare_timeout: u64,
+                              commit_timeout: u64,
+                              table: MetaTable<C, Log>,
+                              versions: KeyVersions,
+                              mode: PrepareMode,
+                              expected: XHashMap<Binary, Version>,
+                              receipt: Option<VersionReceipt>,
+                              actions: XHashMap<Binary, KVActionLog>) -> Self {
+        let root_locked = table.0.root.lock();
+        let root_ref = root_locked.clone();
+        let snapshot = versions.lease_current();
+        drop(root_locked);
+        let mut root_mut = root_ref.clone();
+        for (key, action) in &actions {
+            match action {
+                KVActionLog::Write(Some(value)) | KVActionLog::DirtyWrite(Some(value)) => {
+                    let _ = root_mut.upsert(key.clone(), value.clone(), false);
+                },
+                KVActionLog::Write(None) | KVActionLog::DirtyWrite(None) => {
+                    let _ = root_mut.delete(key, false);
+                },
+                KVActionLog::Read => (),
+            }
+        }
+        let version_context = TableVersionContext::new(versions,
+                                                       snapshot,
+                                                       mode,
+                                                       expected,
+                                                       receipt);
+        let inner = InnerMetaTabTr {
+            source,
+            tid: SpinLock::new(None),
+            cid: SpinLock::new(None),
+            status: SpinLock::new(Transaction2PcStatus::default()),
+            writable: is_writable,
+            persistence: AtomicBool::new(is_persistent),
+            prepare_timeout,
+            commit_timeout,
+            root_mut: SpinLock::new(root_mut),
+            root_ref,
+            table,
+            actions: SpinLock::new(actions),
+            version_context: Some(version_context),
+        };
+
+        MetaTabTr(Arc::new(inner))
+    }
+
+    async fn precheck_versions(&self) -> Result<(), KVTableTrError> {
+        // 根 `prepare_with_version` 的阶段一：只检查外部 read-set，完整收集本表不匹配项。
+        // publication 读门保证 value/version 发布期间不会读到中间状态；这里不取得 prepare 锁。
+        let Some(context) = self.0.version_context.as_ref() else {
+            return Ok(());
+        };
+        if context.mode() != PrepareMode::Versioned {
+            return Ok(());
+        }
+
+        let _publication = context.versions().publication().read().await;
+        let mut conflicts = Vec::new();
+        for (key, expected) in context.expected() {
+            if context.versions().current_version(key).as_ref() != Some(expected) {
+                conflicts.push(TableKey {
+                    table: self.0.table.name(),
+                    key: key.clone(),
+                });
+            }
+        }
+        if conflicts.is_empty() {
+            Ok(())
+        } else {
+            Err(KVTableTrError::new_all_conflicts_error(conflicts))
+        }
+    }
+
+    async fn prepare_registered(&self,
+                                conflict_kind: PrepareConflictKind)
+        -> Result<Option<Vec<u8>>, KVTableTrError> {
+        // 只读表事务没有动作需要预留，也不生成表 WAL 片段。
+        if !self.is_writable() {
+            return Ok(None);
+        }
+
+        // 锁序固定为 publication(read) -> prepare；publication guard 覆盖版本、当前根和预留
+        // 三类检查，commit 只能在 guard 释放后取得 publication(write)，避免检查后发布穿插。
+        let _publication = match self.0.version_context.as_ref() {
+            Some(context) => Some(context.versions().publication().read().await),
+            None => None,
+        };
+        let actions = self.0.actions.lock().clone();
+        let mode = self
+            .0
+            .version_context
+            .as_ref()
+            .map(TableVersionContext::mode)
+            .unwrap_or(PrepareMode::Ordinary);
+        let mut conflict_keys = Vec::new();
+
+        if let Some(context) = self.0.version_context.as_ref() {
+            if context.mode() == PrepareMode::Versioned {
+                // 阶段二仍重复检查 read-set：阶段一到本表 prepare 之间可能已有其它事务提交。
+                for (key, expected) in context.expected() {
+                    if context.versions().current_version(key).as_ref() != Some(expected) {
+                        conflict_keys.push(key.clone());
                     }
-                },
-                Some(KVActionLog::DirtyWrite(_)) => {
-                    //元信息表的预提交表中的一个预提交事务与本地预提交事务操作了相同的关键字，且是写操作，则不存在读写冲突，并继续检查预提交表中是否存在读写冲突
-                    continue;
-                },
-                Some(KVActionLog::Write(_)) => {
-                    match action {
-                        KVActionLog::DirtyWrite(_) => {
-                            //本地预提交事务对相同的关键字也执行了脏写操作，则不存在读写冲突，并继续检查预提交表中是否存在读写冲突
-                            continue;
-                        },
-                        _ => {
-                            //元信息表的预提交表中的一个预提交事务与本地预提交事务操作了相同的关键字，且是写操作，则存在读写冲突
-                            return Err(<Self as Transaction2Pc>::PrepareError::new_transaction_error(ErrorLevel::Normal,
-                                                                                                     format!("Prepare meta table conflicted, table: {:?}, key: {:?}, source: {:?}, transaction_uid: {:?}, prepare_uid: {:?}, confilicted_transaction_uid: {:?}, reason: writing now",
-                                                                                                             self.0.table.name().as_str(),
-                                                                                                             key,
-                                                                                                             self.0.source,
-                                                                                                             self.get_transaction_uid(),
-                                                                                                             self.get_prepare_uid(),
-                                                                                                             guid)));
-                        },
-                    }
-                },
-                None => {
-                    //元信息表的预提交表中没有任何预提交事务与本地预提交事务操作了相同的关键字，则不存在读写冲突，并继续检查预提交表中是否存在读写冲突
-                    continue;
-                },
+                }
             }
         }
 
-        Ok(())
-    }
-
-    // 检查元信息表的预提交表的读写冲突
-    fn check_prepare_conflict_result(&self,
-                                     prepare: &mut XHashMap<Guid, XHashMap<Binary, KVActionLog>>,
-                                     key: &Binary,
-                                     action: &KVActionLog)
-        -> Result<(), KVTableTrError>
-    {
-        for (_guid, actions) in prepare.iter() {
-            match actions.get(key) {
-                Some(KVActionLog::Read) => {
-                    match action {
-                        KVActionLog::Read | KVActionLog::DirtyWrite(_) => {
-                            //本地预提交事务对相同的关键字也执行了读操作或脏写操作，则不存在读写冲突，并继续检查预提交表中是否存在读写冲突
-                            continue;
-                        },
-                        KVActionLog::Write(_) => {
-                            //本地预提交事务对相同的关键字执行了写操作，则存在读写冲突
-                            return Err(<Self as Transaction2Pc>::PrepareError::new_conflicts_error(self.0.table.name().clone(),
-                                                                                                   key.clone()));
-                        },
-                    }
-                },
-                Some(KVActionLog::DirtyWrite(_)) => {
-                    //元信息表的预提交表中的一个预提交事务与本地预提交事务操作了相同的关键字，且是写操作，则不存在读写冲突，并继续检查预提交表中是否存在读写冲突
+        // 不以根指针相同作为跳过条件；每个非 dirty 动作都比较创建时与当前逻辑值状态。
+        let current_root = self.0.table.0.root.lock().clone();
+        for (key, action) in &actions {
+            if action.is_dirty_writed() {
+                continue;
+            }
+            if let Some(context) = self.0.version_context.as_ref() {
+                if context
+                    .versions()
+                    .has_committed_after(key, context.snapshot_revision()) {
+                    conflict_keys.push(key.clone());
                     continue;
-                },
-                Some(KVActionLog::Write(_)) => {
-                    match action {
-                        KVActionLog::DirtyWrite(_) => {
-                            //本地预提交事务对相同的关键字也执行了脏写操作，则不存在读写冲突，并继续检查预提交表中是否存在读写冲突
-                            continue;
-                        },
-                        _ => {
-                            //元信息表的预提交表中的一个预提交事务与本地预提交事务操作了相同的关键字，且是写操作，则存在读写冲突
-                            return Err(<Self as Transaction2Pc>::PrepareError::new_conflicts_error(self.0.table.name().clone(),
-                                                                                                   key.clone()));
-                        },
-                    }
-                },
-                None => {
-                    //元信息表的预提交表中没有任何预提交事务与本地预提交事务操作了相同的关键字，则不存在读写冲突，并继续检查预提交表中是否存在读写冲突
-                    continue;
-                },
+                }
+            }
+            if !binary_state_equal(self.0.root_ref.get(key), current_root.get(key)) {
+                conflict_keys.push(key.clone());
             }
         }
 
-        Ok(())
-    }
-
-    // 检查元信息表的根节点冲突
-    fn check_root_conflict(&self, key: &Binary) -> Result<(), KVTableTrError> {
-        let b = self.0.table.0.root.lock().ptr_eq(&self.0.root_ref);
-        if !b {
-            //元信息表的根节点在当前事务执行过程中已改变
-            let key = key.clone();
-            match self.0.table.0.root.lock().get(&key) {
-                None => {
-                    //事务的当前操作记录中的关键字，在当前表中不存在
-                    match self.0.root_ref.get(&key) {
-                        None => {
-                            //事务的当前操作记录中的关键字，在事务创建时的表中也不存在
-                            //表示此关键字是在当前事务内新增的，则此关键字的操作记录可以预提交
-                            //并继续其它关键字的操作记录的预提交
-                            ()
-                        },
-                        _ => {
-                            //事务的当前操作记录中的关键字，在事务创建时的表中已存在
-                            //表示此关键字在当前事务执行过程中被删除，则此关键字的操作记录不允许预提交
-                            //并立即返回当前事务预提交冲突
-                            return Err(<Self as Transaction2Pc>::PrepareError::new_transaction_error(ErrorLevel::Normal,
-                                                                                                     format!("Prepare meta table conflicted, table: {:?}, key: {:?}, source: {:?}, transaction_uid: {:?}, prepare_uid: {:?}, reason: the key is deleted in table while the transaction is running",
-                                                                                                             self.0.table.name().as_str(),
-                                                                                                             key,
-                                                                                                             self.0.source,
-                                                                                                             self.get_transaction_uid(),
-                                                                                                             self.get_prepare_uid())));
-                        },
-                    }
-                },
-                Some(root_value) => {
-                    //事务的当前操作记录中的关键字，在当前表中已存在
-                    match self.0.root_ref.get(&key) {
-                        Some(copy_value) if Binary::binary_equal(root_value, copy_value) => {
-                            //事务的当前操作记录中的关键字，在事务创建时的表中也存在，且值引用相同
-                            //表示此关键字在当前事务执行过程中未改变，且值也未改变，则此关键字的操作记录允许预提交
-                            //并继续其它关键字的操作记录的预提交
-                            ()
-                        },
-                        _ => {
-                            //事务的当前操作记录中的关键字，与事务创建时的表中的关键字不匹配
-                            //表示此关键字在当前事务执行过程中未改变，但值已改变，则此关键字的操作记录不允许预提交
-                            //并立即返回当前事务预提交冲突
-                            return Err(<Self as Transaction2Pc>::PrepareError::new_transaction_error(ErrorLevel::Normal,
-                                                                                                     format!("Prepare meta table conflicted, table: {:?}, key: {:?}, source: {:?}, transaction_uid: {:?}, prepare_uid: {:?}, reason: the value is updated in table while the transaction is running",
-                                                                                                             self.0.table.name().as_str(),
-                                                                                                             key,
-                                                                                                             self.0.source,
-                                                                                                             self.get_transaction_uid(),
-                                                                                                             self.get_prepare_uid())));
-                        },
-                    }
-                },
+        let write_buf = self.prepare_output(&actions);
+        let mut prepare = self.0.table.0.prepare.lock();
+        // prepared-vs-prepared 检查与当前事务预留插入由同一同步锁串行化；不能把循环和 insert
+        // 拆到两个临界区，否则两个首次插入相同 Key 的事务可能同时通过。
+        for (key, action) in &actions {
+            if has_prepared_conflict(&prepare, key, mode, action) {
+                conflict_keys.push(key.clone());
             }
         }
-
-        Ok(())
-    }
-
-    // 检查元信息表的根节点冲突
-    fn check_root_conflict_result(&self, key: &Binary) -> Result<(), KVTableTrError> {
-        let b = self.0.table.0.root.lock().ptr_eq(&self.0.root_ref);
-        if !b {
-            //元信息表的根节点在当前事务执行过程中已改变
-            let key = key.clone();
-            match self.0.table.0.root.lock().get(&key) {
-                None => {
-                    //事务的当前操作记录中的关键字，在当前表中不存在
-                    match self.0.root_ref.get(&key) {
-                        None => {
-                            //事务的当前操作记录中的关键字，在事务创建时的表中也不存在
-                            //表示此关键字是在当前事务内新增的，则此关键字的操作记录可以预提交
-                            //并继续其它关键字的操作记录的预提交
-                            ()
-                        },
-                        _ => {
-                            //事务的当前操作记录中的关键字，在事务创建时的表中已存在
-                            //表示此关键字在当前事务执行过程中被删除，则此关键字的操作记录不允许预提交
-                            //并立即返回当前事务预提交冲突
-                            return Err(<Self as Transaction2Pc>::PrepareError::new_conflicts_error(self.0.table.name().clone(),
-                                                                                                   key.clone()));
-                        },
-                    }
-                },
-                Some(root_value) => {
-                    //事务的当前操作记录中的关键字，在当前表中已存在
-                    match self.0.root_ref.get(&key) {
-                        Some(copy_value) if Binary::binary_equal(root_value, copy_value) => {
-                            //事务的当前操作记录中的关键字，在事务创建时的表中也存在，且值引用相同
-                            //表示此关键字在当前事务执行过程中未改变，且值也未改变，则此关键字的操作记录允许预提交
-                            //并继续其它关键字的操作记录的预提交
-                            ()
-                        },
-                        _ => {
-                            //事务的当前操作记录中的关键字，与事务创建时的表中的关键字不匹配
-                            //表示此关键字在当前事务执行过程中未改变，但值已改变，则此关键字的操作记录不允许预提交
-                            //并立即返回当前事务预提交冲突
-                            return Err(<Self as Transaction2Pc>::PrepareError::new_conflicts_error(self.0.table.name().clone(),
-                                                                                                   key.clone()));
-                        },
-                    }
-                },
-            }
+        if !conflict_keys.is_empty() {
+            return Err(self.prepare_conflict_error(conflict_kind, conflict_keys));
         }
 
-        Ok(())
+        // 只有全部冲突检查通过才清空事务动作并转移所有权；失败时 actions 保留供 rollback
+        // 关闭事务。外部不得在同一事务上再次 prepare。
+        let _ = mem::replace(&mut *self.0.actions.lock(), XHashMap::default());
+        prepare.insert(self.get_transaction_uid().unwrap(), PreparedActions {
+            mode,
+            actions,
+        });
+        Ok(write_buf)
     }
 
-    // 预提交所有修复修改
-    // 在表的当前根节点上执行键值对操作中的所有写操作
-    // 将元信息表事务的键值对操作记录移动到对应的元信息表的预提交表，一般只用于修复元信息表
+    fn prepare_output(&self,
+                      actions: &XHashMap<Binary, KVActionLog>) -> Option<Vec<u8>> {
+        // Meta 始终是持久化表，但纯读仍返回 None；None 表示本表没有根 WAL 数据片段，不表示
+        // 整棵根事务必然只读或无需由 manager 完成生命周期。
+        let writed_count = actions
+            .values()
+            .filter(|action| matches!(action,
+                                     KVActionLog::Write(_) | KVActionLog::DirtyWrite(_)))
+            .count() as u64;
+        if writed_count == 0 {
+            return None;
+        }
+
+        let mut buf = Vec::new();
+        self.0.table.init_table_prepare_output(&mut buf, writed_count);
+        for (key, action) in actions {
+            match action {
+                KVActionLog::Write(None) | KVActionLog::DirtyWrite(None) => {
+                    self.0.table.append_key_value_to_table_prepare_output(&mut buf, key, None);
+                },
+                KVActionLog::Write(Some(value)) | KVActionLog::DirtyWrite(Some(value)) => {
+                    self.0.table.append_key_value_to_table_prepare_output(&mut buf,
+                                                                          key,
+                                                                          Some(value));
+                },
+                KVActionLog::Read => (),
+            }
+        }
+        Some(buf)
+    }
+
+    fn prepare_conflict_error(&self,
+                              conflict_kind: PrepareConflictKind,
+                              keys: Vec<Binary>) -> KVTableTrError {
+        // 调用方只在 keys 非空时进入。All 模式保留本表完整集合；根 manager 最终再跨表归一化。
+        let key = keys[0].clone();
+        match conflict_kind {
+            PrepareConflictKind::Common => {
+                KVTableTrError::new_transaction_error(
+                    ErrorLevel::Normal,
+                    format!("Prepare meta table conflicted, table: {:?}, key: {:?}, source: {:?}, transaction_uid: {:?}, reason: committed state or prepared reservation changed",
+                            self.0.table.name().as_str(),
+                            key,
+                            self.0.source,
+                            self.get_transaction_uid()))
+            },
+            PrepareConflictKind::First => {
+                KVTableTrError::new_conflicts_error(self.0.table.name(), key)
+            },
+            PrepareConflictKind::All => {
+                KVTableTrError::new_all_conflicts_error(keys
+                    .into_iter()
+                    .map(|key| TableKey {
+                        table: self.0.table.name(),
+                        key,
+                    })
+                    .collect())
+            },
+        }
+    }
+
+    /// 为启动 repair 重建已由根 WAL 判定为 committed 的 Meta 动作。
+    ///
+    /// 该内部入口刻意跳过普通冲突检查：先把 WAL 动作直接作用于当前根，再以指定 TID 放入
+    /// `prepare`，使后续 replay commit 沿正常清理/确认结构完成。只能由受信 repair 调用，不能
+    /// 用于在线业务事务，也不会创建版本协议上下文。
     pub(crate) fn prepare_repair(&self, transaction_uid: Guid) {
         //获取事务的当前操作记录，并重置事务的当前操作记录
         let actions = mem::replace(&mut *self.0.actions.lock(), XHashMap::default());
@@ -1208,30 +1192,40 @@ impl<
         }
 
         //将事务的当前操作记录，写入表的预提交表
-        self.0.table.0.prepare.lock().insert(transaction_uid, actions);
+        self.0.table.0.prepare.lock().insert(transaction_uid, PreparedActions {
+            mode: PrepareMode::Ordinary,
+            actions,
+        });
     }
 }
 
-// 内部元信息表事务
+/// Meta 子事务的共享状态。
+///
+/// `root_ref` 与版本 lease 在 managed 构造时同一根锁窗口内取得，保证数据基线和
+/// `snapshot_revision` 对应同一观察点。`root_mut`/`actions` 是事务私有逻辑状态；表级
+/// `prepare` 才是跨事务可见的预留。
 struct InnerMetaTabTr<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>,
 > {
-    source:             Atom,                                                                       //事件源
-    tid:                SpinLock<Option<Guid>>,                                                     //事务唯一id
-    cid:                SpinLock<Option<Guid>>,                                                     //事务提交唯一id
-    status:             SpinLock<Transaction2PcStatus>,                                             //事务状态
-    writable:           bool,                                                                       //事务是否可写
-    persistence:        AtomicBool,                                                                 //事务是否持久化
-    prepare_timeout:    u64,                                                                        //事务预提交超时时长，单位毫秒
-    commit_timeout:     u64,                                                                        //事务提交超时时长，单位毫秒
-    root_mut:           SpinLock<OrdMap<Tree<Binary, Binary>>>,                                     //元信息表的根节点的可写复制
-    root_ref:           OrdMap<Tree<Binary, Binary>>,                                               //元信息表的根节点的只读复制
-    table:              MetaTable<C, Log>,                                                          //事务对应的元信息表
-    actions:            SpinLock<XHashMap<Binary, KVActionLog>>,                                    //事务内操作记录
+    source:             Atom,                                                                       // 诊断事件源，不参与冲突身份。
+    tid:                SpinLock<Option<Guid>>,                                                     // 根 manager 在 prepare 前分配并传播的事务 ID。
+    cid:                SpinLock<Option<Guid>>,                                                     // 根 WAL 提交确认占位/回执使用的 commit ID。
+    status:             SpinLock<Transaction2PcStatus>,                                             // 由事务框架推进的 2PC 状态。
+    writable:           bool,                                                                       // 创建时固定；false 时 prepare 立即短路。
+    persistence:        AtomicBool,                                                                 // Meta 写是否要求进入根 WAL；可由父事务聚合提升。
+    prepare_timeout:    u64,                                                                        // 预提交超时，单位毫秒。
+    commit_timeout:     u64,                                                                        // 提交超时，单位毫秒。
+    root_mut:           SpinLock<OrdMap<Tree<Binary, Binary>>>,                                     // 应用本事务动作后的私有 COW 根。
+    root_ref:           OrdMap<Tree<Binary, Binary>>,                                               // 创建事务瞬间的只读冲突基线。
+    table:              MetaTable<C, Log>,                                                          // 表共享 owner，保证事务/stream 期间表存活。
+    actions:            SpinLock<XHashMap<Binary, KVActionLog>>,                                    // 每 Key 最终动作；prepare 成功后转移到表级预留。
+    version_context:    Option<TableVersionContext>,                                                 // managed 模式的 lease/revision/expected/receipt。
 }
 
-// 元信息表的加载器
+/// 按“新日志优先”规则把 Meta 日志文件集合恢复为一个内存根的启动 loader。
+///
+/// `removed` 防止旧文件中的已删除 Key 复活；已在 root 中出现的 Key 也不重复加载。
 struct MetaTableLoader<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>,
@@ -1332,8 +1326,15 @@ impl<
     }
 }
 
-// 异步整理元信息表中，等待写入日志文件的事务，
-// 返回本次整理消耗的时间，本次写入日志文件成功的事务数、关键字数和字节数，以及本次写入日志文件失败的事务数、关键字数和字节数
+/// 批量持久化已经发布到 Meta 内存根、尚未完成表级确认的事务。
+///
+/// timer 和 size 两个入口通过 `collecting` 竞争唯一 owner；成功 owner 在 `waits` 异步锁内
+/// drain 当前 FIFO、append 全部动作并执行一次 `delay_commit`。只有该 I/O 成功后才逐事务调用
+/// `confirm(Ok(()))`；失败不确认，根 WAL 因而继续保留供 repair。返回统计为本轮耗时以及
+/// `(事务数, Key 数, bytes)`，Err/Ok 分别表示表日志提交失败/成功。
+///
+/// 当前实现会在表日志 await 期间持有 `waits` 锁，新 commit 只能等待入队；这是现状性能边界。
+/// 函数不持有数据根、prepare 或 publication 锁，不与事务冲突临界区交叉。
 async fn collect_waits<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>,
@@ -1412,7 +1413,8 @@ async fn collect_waits<
                           false,
                           DEFAULT_LOG_FILE_COMMIT_DELAY_TIMEOUT)
             .await {
-            //写入日志文件失败，则立即中止本次整理
+            // 持久化失败后有意不调用 confirm；根 WAL 保留，供重试或启动恢复。
+            // 详见 CONTRACT-CFM-001：docs/SEMANTIC_CONTRACTS.md#contract-confirm-success-only。
             table.0.collecting.store(false, Ordering::Release); //设置为已整理结束
             error!("Collect meta table failed, table: {:?}, transactions: {}, keys: {}, bytes: {}, reason: {:?}",
             table.name().as_str(),
@@ -1425,8 +1427,10 @@ async fn collect_waits<
         }
     }
 
-    //写入日志文件成功，则调用指定事务的确认提交回调，并继续写入下一个事务
+    // 表日志持久化成功后才发送 Ok 成功信号；有/无 notifier 只改变事件报告，不改变协议。
     if let Some(notifier) = table.0.notifier.as_ref() {
+        // 已归档 FIND-EVENT-001：KVDBTableType 当前没有 Meta variant，本分支沿用
+        // BtreeOrdTab 标签。它只是现状观测标签，不能解释为真实表引擎类型；本轮不改事件模型。
         //指定了监听器
         for (wait_tr, confirm) in waits {
             if let Err(e) = confirm(wait_tr.get_transaction_uid().unwrap(),

@@ -9,3 +9,5 @@ testlogfile
 **/db
 **/specific_db
 tests/table.dat
+AGENTS.md
+docs
