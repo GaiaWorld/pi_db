@@ -22,12 +22,15 @@ use pi_async_rt::rt::{
     multi_thread::{MultiTaskRuntime, MultiTaskRuntimeBuilder},
     startup_global_time_loop, AsyncRuntime,
 };
-use pi_async_transaction::{AsyncCommitLog, manager_2pc::Transaction2PcManager};
+use pi_async_transaction::{
+    AsyncCommitLog, ErrorLevel, UnitTransaction,
+    manager_2pc::{Transaction2PcManager, Transaction2PcStatus},
+};
 use pi_atom::Atom;
 use pi_bon::{Encode, WriteBuffer};
 use pi_db::{
     db::{KVDBManager, KVDBManagerBuilder, KVDBTransaction},
-    Binary, KVDBTableType, KVTableMeta, Version,
+    Binary, KVDBTableType, KVTableMeta, TableKeyVersion, Version,
 };
 use pi_guid::GuidGen;
 use pi_sinfo::EnumType;
@@ -57,9 +60,89 @@ fn test_key_version_ttl_never_expires_before_effective_duration() {
             fixture.logger.append_total_count() > 0,
             "real Memory DDL did not append through the root CommitLogger",
         )?;
-        verify_repeated_ttl_lifetimes(&rt, &fixture.db).await
+        verify_repeated_ttl_lifetimes(&rt, &fixture.db).await?;
+        verify_expired_read_version_is_a_complete_conflict(&rt, &fixture).await
     })
     .unwrap_or_else(|error| panic!("key-version TTL lower-bound contract failed: {error}"));
+}
+
+/// 当外部 read-set 携带的版本已经被 TTL 淘汰时，当前实现没有可比较的值基线；它必须在
+/// manager prepare 中保守返回完整冲突，而不能把缺席当成匹配、重新生成版本或继续写 WAL。
+async fn verify_expired_read_version_is_a_complete_conflict(
+    rt: &MultiTaskRuntime<()>,
+    fixture: &Fixture,
+) -> TestResult<()> {
+    let table = Atom::from(TABLE_NAME);
+    let key = encode_usize(0x5454_4c02);
+    let (value, expired_version) = fixture
+        .db
+        .query_with_version(table.clone(), key.clone())
+        .await
+        .map_err(|error| format!("creating read-set version for TTL conflict failed: {error:?}"))?;
+    require(value.is_none(), "TTL conflict key unexpectedly had a value")?;
+    require_delete_version(&expired_version, "TTL conflict initial observation")?;
+
+    // 前一矩阵已经证明 64 个真实 TTL 周期能够推进。这里等待 25 个有效 TTL，使目标记录在
+    // 没有任何读写刷新、没有活跃 snapshot lease 的条件下确定进入淘汰窗口。
+    rt.timeout(500).await;
+
+    let produced_before = fixture.manager.produced_transaction_total();
+    let consumed_before = fixture.manager.consumed_transaction_total();
+    let appended_before = fixture.logger.append_total_count();
+    let transaction = transaction(&fixture.db, "expired read-set version")?;
+    let error = transaction
+        .prepare_with_version(
+            vec![TableKeyVersion {
+                table: table.clone(),
+                key: key.clone(),
+                version: expired_version.clone(),
+            }],
+            Vec::new(),
+        )
+        .await
+        .expect_err("an expired read-set version must not prepare successfully");
+    if !error.is_all_conflicts() || !matches!(error.level(), ErrorLevel::Normal) {
+        return Err(format!(
+            "expired read-set version expected AllConflicts(Normal), observed {error:?}",
+        ));
+    }
+    let conflicts = error
+        .all_conflicts()
+        .ok_or_else(|| "expired read-set conflict omitted its complete set".to_owned())?;
+    require(conflicts.len() == 1, &format!(
+        "expired read-set expected one conflict, observed {conflicts:?}",
+    ))?;
+    require(conflicts[0].table == table,
+            "expired read-set conflict reported the wrong table")?;
+    require(conflicts[0].key.as_ref() == key.as_ref(),
+            "expired read-set conflict reported the wrong key")?;
+    require(transaction.get_status() == Transaction2PcStatus::PrepareFailed,
+            "expired read-set transaction did not enter PrepareFailed")?;
+    require(fixture.logger.append_total_count() == appended_before,
+            "expired read-set conflict unexpectedly appended root WAL")?;
+
+    transaction
+        .rollback_modified()
+        .await
+        .map_err(|error| format!("rolling back expired read-set transaction failed: {error:?}"))?;
+    require(transaction.get_status() == Transaction2PcStatus::Rollbacked,
+            "expired read-set transaction did not close as Rollbacked")?;
+    require(fixture.manager.transaction_len() == 0,
+            "expired read-set rollback left an active manager entry")?;
+    require(fixture.manager.produced_transaction_total() - produced_before == 1,
+            "expired read-set manager did not produce exactly one transaction")?;
+    require(fixture.manager.consumed_transaction_total() - consumed_before == 1,
+            "expired read-set manager did not consume exactly one transaction")?;
+
+    let (replacement_value, replacement_version) = fixture
+        .db
+        .query_with_version(table, key)
+        .await
+        .map_err(|error| format!("refreshing expired read-set version failed: {error:?}"))?;
+    require(replacement_value.is_none(), "refreshed TTL conflict key unexpectedly had a value")?;
+    require_delete_version(&replacement_version, "TTL conflict replacement observation")?;
+    require(replacement_version != expired_version,
+            "query_with_version reused the version that TTL had removed")
 }
 
 async fn verify_repeated_ttl_lifetimes(
@@ -201,13 +284,13 @@ async fn build_database(rt: &MultiTaskRuntime<()>, root: &Path) -> TestResult<Fi
         logger.clone(),
     );
     let db_path = root.join("database");
-    let db = KVDBManagerBuilder::new(rt.clone(), manager, &db_path)
+    let db = KVDBManagerBuilder::new(rt.clone(), manager.clone(), &db_path)
         .key_version_ttl(CONFIGURED_TTL)
         .key_version_ttl_poll_interval(POLL_INTERVAL)
         .startup(false)
         .await
         .map_err(|error| format!("starting database at {db_path:?} failed: {error}"))?;
-    Ok(Fixture { db, logger })
+    Ok(Fixture { db, logger, manager })
 }
 
 fn run_on_runtime<T, F, Fut>(timeout: Duration, build: F) -> TestResult<T>
@@ -248,6 +331,7 @@ fn encode_usize(value: usize) -> Binary {
 struct Fixture {
     db: RealDb,
     logger: CommitLogger,
+    manager: Transaction2PcManager<usize, CommitLogger>,
 }
 
 struct TempRoot {

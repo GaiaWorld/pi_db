@@ -2428,9 +2428,12 @@ impl<
     /// 表示从升序首项或降序末项开始；`descending=false/true` 分别选择升序/降序。只能对
     /// [`KVDBTransaction::RootTr`] 调用，在子表事务枚举上调用会 panic。
     ///
-    /// 首次访问表会创建并注册一个非持久化子事务，因此本方法不是纯函数；重复调用复用该
-    /// 子事务，但每次返回独立的创建时快照。调用返回后，本事务及其它事务可继续
-    /// `upsert/delete`，旧流保持不变；流不提供可串行化、实时可见或 commit/rollback 绑定。
+    /// 若根事务已经因普通动作注册同表子事务，本方法复用它以保留 read-your-own-write；否则
+    /// 只创建不加入根 `childs_map/childs` 的只读、非持久化快照事务。因此纯 iterator 不参与
+    /// 2PC，也不会与随后由 `prepare_with_version` 安装的同表版本子事务共享 TID/prepare 项。
+    /// 每次调用仍返回独立的创建时快照。调用返回后，本事务及其它事务可继续 `upsert/delete`，
+    /// 旧流保持不变；流不提供可串行化、实时可见或 commit/rollback 绑定，也不会自动加入
+    /// 版本协议 read-set。
     /// 创建本流的根事务必须存活到流耗尽或被 drop，事务释放后继续 poll 属于非法用法。
     ///
     /// 返回项拥有 key；流可在线程间移动但应由单消费者 poll。提前 drop 会释放快照。
@@ -2455,7 +2458,7 @@ impl<
 
     /// 在根事务内创建指定表的键值对快照流。
     ///
-    /// 表查找、根事务前置条件、包含边界、方向、子事务注册副作用、创建事务生命周期、
+    /// 表查找、根事务前置条件、包含边界、方向、快照事务装配、创建事务生命周期、
     /// 并发修改、取消、错误和复杂度与 [`KVDBTransaction::keys`] 相同。每个 item 是创建时
     /// 快照中 owned `(key, value)`；随后 value 更新或删除不会改变既有流。
     pub async fn values<'a>(&self,
@@ -2540,10 +2543,12 @@ impl<
 
     /// 以外部实际读取的版本集合和最终写集合执行完整冲突预提交。
     ///
-    /// 只能对全新、可写的 RootTr 调用，并且只能与 [`Self::commit_with_version`] 组成独立协议；
-    /// 禁止与普通/dirty 动作、DDL、迭代器、普通 prepare/commit 混用。`read_set` 和 `write_set`
-    /// 均可为空；各集合内部不允许重复 `(table, key)`，跨集合重叠合法且最终动作以 write 为准。
-    /// `Some(value)` 是 upsert，`None` 是 delete；LogWrite 不支持 delete。
+    /// 只能对未注册普通 2PC 子节点的可写 RootTr 调用，并且只能与
+    /// [`Self::commit_with_version`] 组成独立协议；禁止与普通/dirty 动作、DDL、普通
+    /// prepare/commit 混用。纯 `keys/values` 流例外：它们使用脱离根 2PC 的快照事务，不选择
+    /// 协议，也不会自动加入 `read_set`，因此允许先创建并保持到版本提交完成。`read_set` 和
+    /// `write_set` 均可为空；各集合内部不允许重复 `(table, key)`，跨集合重叠合法且最终动作以
+    /// write 为准。`Some(value)` 是 upsert，`None` 是 delete；LogWrite 不支持 delete。
     ///
     /// 所有表名、Key、Value 长度及重复项会在 UID、子事务和共享状态副作用前检查。版本失配及
     /// 只读表身份失效返回确定性 [`KVTableTrError::AllConflicts`]；写表缺失/替换和参数错误返回
@@ -2712,8 +2717,9 @@ impl<
 /// 一棵数据库事务树的共享根节点。
 ///
 /// 根节点保存 source、事务/提交 UID、2PC 状态、可写/持久化标志、当前未执行的 timeout、按
-/// 表名索引的子事务 map、按首次触表顺序排列的子事务 list，以及 manager clone。子事务只在
-/// 首次访问对应表时创建，同表后续动作复用同一节点。
+/// 表名索引的子事务 map、按首次触表顺序排列的子事务 list，以及 manager clone。普通动作首次
+/// 触表或版本 prepare 批量装配时才注册 2PC 子事务，同表后续普通动作复用同一节点；纯
+/// `keys/values` 在没有同表普通节点时使用脱离根容器的快照事务，不参与这两个索引。
 ///
 /// 应用通常不直接构造或匹配本类型，而通过 [`KVDBTransaction::RootTr`] 使用。clone 共享同一
 /// 状态机和子事务，不创建独立事务。根持有 manager，prepare 后 manager registry 又持有根；
@@ -2992,6 +2998,13 @@ impl<
                          is_persistent: bool,
                          childes_map: &mut XHashMap<Atom, KVDBTransaction<C, Log>>)
                          -> KVDBTransaction<C, Log> {
+        // 调用方已经持有 childs_map；版本树安装也使用 childs_map -> childs ->
+        // version_context 的固定顺序。只要版本上下文存在，就不允许再向同一根事务树加入
+        // 普通子事务。协议族混用由外部禁止，此处 fail-fast 是防止非法调用破坏树结构的
+        // 最后一道不变量保护，不会限制不同根事务在同一张表上的并发。
+        assert!(self.0.version_context.lock().is_none(),
+                "Create ordinary table transaction failed, table: {:?}, reason: root transaction already selected version protocol",
+                name.as_str());
         match &table.table {
             KVDBTable::MetaTab(tab) => {
                 //创建元信息表的表事务，并作为子事务注册到根事务上
@@ -3098,17 +3111,62 @@ impl<
         }
     }
 
-    /// 为独立版本协议一次性安装预期版本和最终动作，并按输入首次触表顺序注册子事务。
-    fn versioned_table_transaction(&self,
-                                   name: Atom,
+    /// 为纯迭代器创建一个不参与根 2PC 的只读快照事务。
+    ///
+    /// 返回事务只负责把表的创建时 COW/redb 快照所有权交给流；它不租用 Key 版本、不写入
+    /// childs_map/childs，也不会被 manager 分配根 TID。若根中已有普通表事务，调用方应复用
+    /// 该事务以保留 read-your-own-write，而不是调用本函数。
+    fn detached_iterator_table_transaction(&self,
+                                           table: &RegisteredTable<C, Log>)
+        -> KVDBTransaction<C, Log> {
+        match &table.table {
+            KVDBTable::MetaTab(tab) => {
+                KVDBTransaction::MetaTabTr(tab.transaction(self.get_source(),
+                                                           false,
+                                                           false,
+                                                           self.get_prepare_timeout(),
+                                                           self.get_commit_timeout()))
+            },
+            KVDBTable::MemOrdTab(tab) => {
+                KVDBTransaction::MemOrdTabTr(tab.transaction(self.get_source(),
+                                                             false,
+                                                             false,
+                                                             self.get_prepare_timeout(),
+                                                             self.get_commit_timeout()))
+            },
+            KVDBTable::LogOrdTab(tab) => {
+                KVDBTransaction::LogOrdTabTr(tab.transaction(self.get_source(),
+                                                             false,
+                                                             false,
+                                                             self.get_prepare_timeout(),
+                                                             self.get_commit_timeout()))
+            },
+            KVDBTable::LogWTab(tab) => {
+                KVDBTransaction::LogWTabTr(tab.transaction(self.get_source(),
+                                                           false,
+                                                           false,
+                                                           self.get_prepare_timeout(),
+                                                           self.get_commit_timeout()))
+            },
+            KVDBTable::BtreeOrdTab(tab) => {
+                KVDBTransaction::BtreeOrdTabTr(tab.transaction(self.get_source(),
+                                                               false,
+                                                               false,
+                                                               self.get_prepare_timeout(),
+                                                               self.get_commit_timeout()))
+            },
+        }
+    }
+
+    /// 在根锁之外构造一个版本子事务；调用方随后统一、原子地安装整批子节点。
+    fn build_versioned_table_transaction(&self,
                                    table: &RegisteredTable<C, Log>,
                                    is_persistent: bool,
                                    expected: XHashMap<Binary, Version>,
                                    receipt: VersionReceipt,
-                                   actions: XHashMap<Binary, crate::KVActionLog>,
-                                   childes_map: &mut XHashMap<Atom, KVDBTransaction<C, Log>>)
+                                   actions: XHashMap<Binary, crate::KVActionLog>)
         -> KVDBTransaction<C, Log> {
-        let table_tr = match &table.table {
+        match &table.table {
             KVDBTable::MetaTab(tab) => {
                 KVDBTransaction::MetaTabTr(MetaTabTr::new_managed(
                     self.get_source(),
@@ -3179,11 +3237,7 @@ impl<
                     Some(receipt),
                     actions))
             },
-        };
-
-        childes_map.insert(name, table_tr.clone());
-        self.0.childs.lock().join(table_tr.clone());
-        table_tr
+        }
     }
 }
 
@@ -4499,16 +4553,21 @@ impl<
                       table_name: Atom,
                       key: Option<Binary>,
                       descending: bool) -> Option<BoxStream<'a, Binary>> {
-        if let Some(table) = self.0.db_mgr.0.tables.read().await.get(&table_name) {
-            //指定名称的表存在，则获取表事务，并开始获取关键字的异步流
-            let mut childes_map = self.0.childs_map.lock();
-            let table_tr = if let Some(table_tr) = childes_map.get(&table_name) {
-                //指定名称的表的子事务存在
-                table_tr.clone()
-            } else {
-                //指定名称的表的子事务不存在，则创建指定表的事务，因为是查询操作，所以初始化指定表的子事务为非持久化事务
-                self.table_transaction(table_name, table, false, &mut *childes_map)
+        let table = self.0.db_mgr.0.tables.read().await.get(&table_name).cloned();
+        if let Some(table) = table {
+            // childs_map 与 version_context 在同一短临界区内观察。版本树安装持有 childs_map
+            // 直到 context 可见，所以这里不可能误把已安装的版本子事务当成普通事务复用。
+            let ordinary_table_tr = {
+                let childes_map = self.0.childs_map.lock();
+                if self.0.version_context.lock().is_none() {
+                    childes_map.get(&table_name).cloned()
+                } else {
+                    None
+                }
             };
+            let table_tr = ordinary_table_tr.unwrap_or_else(|| {
+                self.detached_iterator_table_transaction(&table)
+            });
 
             match &table_tr {
                 KVDBTransaction::RootTr(_tr) => {
@@ -4548,16 +4607,21 @@ impl<
                         table_name: Atom,
                         key: Option<Binary>,
                         descending: bool) -> Option<BoxStream<'a, (Binary, Binary)>> {
-        if let Some(table) = self.0.db_mgr.0.tables.read().await.get(&table_name) {
-            //指定名称的表存在，则获取表事务，并开始获取键值对异步流
-            let mut childes_map = self.0.childs_map.lock();
-            let table_tr = if let Some(table_tr) = childes_map.get(&table_name) {
-                //指定名称的表的子事务存在
-                table_tr.clone()
-            } else {
-                //指定名称的表的子事务不存在，则创建指定表的事务，因为是查询操作，所以初始化指定表的子事务为非持久化事务
-                self.table_transaction(table_name, table, false, &mut *childes_map)
+        let table = self.0.db_mgr.0.tables.read().await.get(&table_name).cloned();
+        if let Some(table) = table {
+            // 与 keys 使用相同的树隔离：只复用普通子事务；纯 iterator 和版本树都使用独立
+            // 快照事务，不改变根 2PC 子节点数量或协议模式。
+            let ordinary_table_tr = {
+                let childes_map = self.0.childs_map.lock();
+                if self.0.version_context.lock().is_none() {
+                    childes_map.get(&table_name).cloned()
+                } else {
+                    None
+                }
             };
+            let table_tr = ordinary_table_tr.unwrap_or_else(|| {
+                self.detached_iterator_table_transaction(&table)
+            });
 
             match &table_tr {
                 KVDBTransaction::RootTr(_tr) => {
@@ -4699,11 +4763,32 @@ impl<
         }
         validate_prepare_with_version_inputs(&read_set, &write_set)?;
 
+        // 版本协议只能选择一棵尚未安装任何 2PC 子节点的根事务树。创建根句柄时协议仍是
+        // Neutral；普通 query/upsert/delete/DDL 首次触表后树即为 Ordinary。纯 iterator 不在
+        // 两个容器中注册，因此不影响选择。这里先做无共享副作用的快检，避免协议误用仍去
+        // 租用表版本快照；安装前还会在同一固定锁序下复检，封闭并发装配窗口。
+        {
+            let childes_map = self.0.childs_map.lock();
+            let childes = self.0.childs.lock();
+            if childes_map.len() != childes.len() {
+                return Err(KVTableTrError::new_transaction_error(
+                    ErrorLevel::Fatal,
+                    format!("Prepare with version failed, reason: inconsistent root child containers, map_len: {}, list_len: {}",
+                            childes_map.len(), childes.len())));
+            }
+            if !childes_map.is_empty() || self.0.version_context.lock().is_some() {
+                return Err(KVTableTrError::new_transaction_error(
+                    ErrorLevel::Normal,
+                    "Prepare with version failed, reason: root transaction already contains ordinary or version 2PC children"));
+            }
+        }
+
         // 先在事务私有内存中规范化输入，不触碰表、版本或 manager。分组顺序取两个输入 Vec
         // 第一次出现表的顺序；同一 Table/Key 跨 read/write 重叠时保留 expected 读版本，但最终
         // 动作原子替换为 Write。集合内部重复项已在上方拒绝，避免 HashMap 覆盖掩盖协议错误。
         let mut groups: Vec<VersionPrepareGroup<C, Log>> = Vec::new();
         let mut group_indices: XHashMap<Atom, usize> = XHashMap::default();
+        let mut expected_writes = XHashMap::default();
         for item in read_set {
             let index = if let Some(index) = group_indices.get(&item.table) {
                 *index
@@ -4726,6 +4811,15 @@ impl<
             group.actions.insert(item.key, crate::KVActionLog::Read);
         }
         for item in write_set {
+            let expected_kind = if item.value.is_some() {
+                ExpectedVersionKind::Upsert
+            } else {
+                ExpectedVersionKind::Delete
+            };
+            expected_writes.insert(TableKey {
+                table: item.table.clone(),
+                key: item.key.clone(),
+            }, expected_kind);
             let index = if let Some(index) = group_indices.get(&item.table) {
                 *index
             } else {
@@ -4773,7 +4867,8 @@ impl<
         // 能跳过底层版本发布。
         let receipt = VersionReceipt::new();
         let mut identities = Vec::with_capacity(groups.len());
-        let mut childes_map = self.0.childs_map.lock();
+        let mut children = Vec::with_capacity(groups.len());
+        let mut require_persistence = false;
         for group in groups {
             let identity_versions = group
                 .registered
@@ -4789,22 +4884,50 @@ impl<
             if let Some(registered) = group.registered {
                 let is_persistent = group.has_write && registered.is_persistent();
                 if is_persistent {
-                    self.require_persistence();
+                    require_persistence = true;
                 }
-                self.versioned_table_transaction(group.name,
-                                                   &registered,
-                                                   is_persistent,
-                                                   group.expected,
-                                                   receipt.clone(),
-                                                   group.actions,
-                                                   &mut *childes_map);
+                let table_tr = self.build_versioned_table_transaction(&registered,
+                                                                       is_persistent,
+                                                                       group.expected,
+                                                                       receipt.clone(),
+                                                                       group.actions);
+                children.push((group.name, table_tr));
             }
         }
-        drop(childes_map);
-        *self.0.version_context.lock() = Some(RootVersionContext {
+        let version_context = RootVersionContext {
             tables: identities,
             receipt,
-        });
+            expected_writes: Arc::new(expected_writes),
+        };
+
+        // 子事务构造可能锁各表数据根并租用版本快照，所以必须发生在根锁之外。安装阶段只做
+        // HashMap/VecDeque/Option 的内存操作，固定锁序为 childs_map -> childs ->
+        // version_context，锁内没有 await、I/O、publication/table 锁或回调。context 在释放
+        // childs_map 前可见，保证后续普通子事务构造只能观察到完整版本树并 fail-fast。
+        {
+            let mut childes_map = self.0.childs_map.lock();
+            let mut childes = self.0.childs.lock();
+            let mut context = self.0.version_context.lock();
+            if childes_map.len() != childes.len() {
+                return Err(KVTableTrError::new_transaction_error(
+                    ErrorLevel::Fatal,
+                    format!("Prepare with version failed, reason: inconsistent root child containers during install, map_len: {}, list_len: {}",
+                            childes_map.len(), childes.len())));
+            }
+            if !childes_map.is_empty() || context.is_some() {
+                return Err(KVTableTrError::new_transaction_error(
+                    ErrorLevel::Normal,
+                    "Prepare with version failed, reason: root transaction protocol changed during version child assembly"));
+            }
+            for (name, table_tr) in children {
+                childes_map.insert(name, table_tr.clone());
+                childes.join(table_tr);
+            }
+            *context = Some(version_context);
+            if require_persistence {
+                self.require_persistence();
+            }
+        }
 
         self
             .0
@@ -4949,21 +5072,84 @@ impl<
     async fn commit_with_version(&self,
                                  prepare_output: Vec<u8>)
         -> Result<Vec<TableKeyVersion>, KVTableTrError> {
-        let receipt = self
+        let context = self
             .0
             .version_context
             .lock()
             .as_ref()
             .expect("Commit with version failed, reason: transaction was not prepared by version protocol")
-            .receipt
             .clone();
+        let receipt = context.receipt.clone();
         match self.commit_core(prepare_output).await {
-            Ok(()) => Ok(receipt.take()),
+            Ok(()) => {
+                let versions = receipt.take();
+                self.validate_version_receipt(&context.expected_writes, &versions)?;
+                Ok(versions)
+            },
             Err(error) => {
                 receipt.clear();
                 Err(error)
             },
         }
+    }
+
+    /// 在整棵树已经提交后验证版本回执与本次最终写集合严格一一对应。
+    ///
+    /// 该检查不读取全局版本缓存，避免把后续事务的新版本误当成本事务回执。任何不一致都
+    /// 说明整棵树已进入并完成不可 rollback 的 commit，却没有形成确定回执；无论该事务是否
+    /// 实际写根 WAL，都只能返回 Fatal，不能 rollback。
+    fn validate_version_receipt(&self,
+                                expected: &XHashMap<TableKey, ExpectedVersionKind>,
+                                versions: &[TableKeyVersion])
+        -> Result<(), KVTableTrError> {
+        let transaction_uid = self.get_transaction_uid().ok_or_else(|| {
+            KVTableTrError::new_transaction_error(
+                ErrorLevel::Fatal,
+                "Validate version receipt failed, reason: committed root transaction has no transaction uid")
+        })?;
+        if versions.len() != expected.len() {
+            return Err(KVTableTrError::new_transaction_error(
+                ErrorLevel::Fatal,
+                format!("Validate version receipt failed, transaction_uid: {:?}, expected_count: {}, actual_count: {}, reason: committed receipt count does not match final write set",
+                        transaction_uid, expected.len(), versions.len())));
+        }
+
+        let mut remaining = expected.clone();
+        for item in versions {
+            let table_key = TableKey {
+                table: item.table.clone(),
+                key: item.key.clone(),
+            };
+            let Some(expected_kind) = remaining.remove(&table_key) else {
+                return Err(KVTableTrError::new_transaction_error(
+                    ErrorLevel::Fatal,
+                    format!("Validate version receipt failed, transaction_uid: {:?}, table: {:?}, key: {:?}, reason: duplicate or unexpected receipt item",
+                            transaction_uid, item.table.as_str(), item.key)));
+            };
+            let valid = match (&item.version, expected_kind) {
+                (Version::Upsert(uid), ExpectedVersionKind::Upsert) => uid == &transaction_uid,
+                (Version::Delete(uid), ExpectedVersionKind::Delete) => uid == &transaction_uid,
+                _ => false,
+            };
+            if !valid {
+                return Err(KVTableTrError::new_transaction_error(
+                    ErrorLevel::Fatal,
+                    format!("Validate version receipt failed, transaction_uid: {:?}, table: {:?}, key: {:?}, expected_kind: {:?}, actual_version: {:?}, reason: receipt action or transaction uid mismatch",
+                            transaction_uid,
+                            item.table.as_str(),
+                            item.key,
+                            expected_kind,
+                            item.version)));
+            }
+        }
+
+        if !remaining.is_empty() {
+            return Err(KVTableTrError::new_transaction_error(
+                ErrorLevel::Fatal,
+                format!("Validate version receipt failed, transaction_uid: {:?}, missing_count: {}, reason: final write set contains unacknowledged entries",
+                        transaction_uid, remaining.len())));
+        }
+        Ok(())
     }
 
     async fn commit_core(&self, prepare_output: Vec<u8>) -> Result<(), KVTableTrError> {
@@ -5122,14 +5308,24 @@ struct RootVersionTableIdentity {
     has_write: bool,
 }
 
+/// 根提交回执中一项写入必须具有的动作类型。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExpectedVersionKind {
+    Upsert,
+    Delete,
+}
+
 /// 一棵独立版本事务树的根级上下文。
 ///
-/// 表身份按首次触表顺序保存；receipt 与所有已创建子事务共享。上下文只属于
-/// `prepare_with_version -> commit_with_version` 协议，不得与普通动作、DDL 或普通提交入口混用。
+/// 表身份按首次触表顺序保存；receipt 与所有已创建子事务共享；expected_writes 固定本次输入
+/// 的最终写集合，用于提交后验证每个 `(Table, Key)` 恰好产生同 TID、同动作类型的一项回执。
+/// 上下文只属于 `prepare_with_version -> commit_with_version` 协议，不得与普通动作、DDL 或
+/// 普通提交入口混用。
 #[derive(Clone)]
 struct RootVersionContext {
     tables: Vec<RootVersionTableIdentity>,
     receipt: VersionReceipt,
+    expected_writes: Arc<XHashMap<TableKey, ExpectedVersionKind>>,
 }
 
 /// `prepare_with_version` 在共享状态副作用前构造的单表规范化输入。

@@ -61,10 +61,13 @@ use pi_store::log_store::log_file::LogMethod;
 use crate::{Binary, KVAction, KVActionLog, KVDBCommitConfirm, KVTableTrError, TableKey, TableTrQos, TransactionDebugEvent, transaction_debug_logger, db::{KVDBChildTrList, KVDBTransaction}, key_version::{KeyVersions,
                                                                                                                                                                                                                                                       PrepareMode,
                                                                                                                                                                                                                                                       PreparedActions,
+                                                                                                                                                                                                                                                      PreparedCommitError,
                                                                                                                                                                                                                                                       TableVersionContext,
                                                                                                                                                                                                                                                       Version,
                                                                                                                                                                                                                                                       VersionReceipt,
-                                                                                                                                                                                                                                                      has_prepared_conflict}, tables::{KVTable, ordmap_snapshot::OrdMapSnapshot,
+                                                                                                                                                                                                                                                      has_prepared_conflict,
+                                                                                                                                                                                                                                                      has_prepared_transaction,
+                                                                                                                                                                                                                                                      take_prepared_for_commit}, tables::{KVTable, ordmap_snapshot::OrdMapSnapshot,
                                                                                                                                                                                             log_ord_table::{LogOrderedTable, LogOrdTabTr}}, utils::KVDBEvent, KVDBTableType};
 
 // 默认的表文件名
@@ -777,15 +780,52 @@ impl<
             };
             // 预提交成功后动作只存在于 prepare 表。按 TID remove 既取得冻结提交输入，也释放
             // 该事务的 Key 预留；同一事务不允许重复 commit。
-            let actions = tr
+            // 在线 prepare 和 WAL repair 的 prepare_repair 都必须先登记根 TID；repair 固定使用
+            // Ordinary mode，所以 replay 跳过框架标准 prepare 仍不会合法地产生缺项。
+            let expected_mode = tr
                 .0
-                .table
-                .0
-                .prepare
-                .lock()
-                .remove(&transaction_uid)
-                .map(|prepared| prepared.actions)
-                .unwrap_or_default();
+                .version_context
+                .as_ref()
+                .map(TableVersionContext::mode)
+                .unwrap_or(PrepareMode::Ordinary);
+            let prepared = {
+                let mut prepare = tr.0.table.0.prepare.lock();
+                take_prepared_for_commit(&mut prepare,
+                                         &transaction_uid,
+                                         expected_mode,
+                                         tr.is_writable())
+            };
+            let actions = match prepared {
+                Ok(Some(prepared)) => prepared.actions,
+                Ok(None) => XHashMap::default(),
+                Err(PreparedCommitError::ModeMismatch(prepared_mode)) => {
+                    drop(publication);
+                    if let Some(context) = tr.0.version_context.as_ref() {
+                        context.release_snapshot();
+                    }
+                    return Err(KVTableTrError::new_transaction_error(
+                        ErrorLevel::Fatal,
+                        format!("Commit b-tree ordered table failed, table: {:?}, source: {:?}, transaction_uid: {:?}, expected_mode: {:?}, prepared_mode: {:?}, reason: prepared action protocol mismatch after entering non-rollbackable commit",
+                                tr.0.table.name().as_str(),
+                                tr.0.source,
+                                transaction_uid,
+                                expected_mode,
+                                prepared_mode)));
+                },
+                Err(PreparedCommitError::Missing) => {
+                    drop(publication);
+                    if let Some(context) = tr.0.version_context.as_ref() {
+                        context.release_snapshot();
+                    }
+                    return Err(KVTableTrError::new_transaction_error(
+                        ErrorLevel::Fatal,
+                        format!("Commit b-tree ordered table failed, table: {:?}, source: {:?}, transaction_uid: {:?}, expected_mode: {:?}, reason: prepared actions missing after entering non-rollbackable commit",
+                                tr.0.table.name().as_str(),
+                                tr.0.source,
+                                transaction_uid,
+                                expected_mode)));
+                },
+            };
             let has_writes = actions.values().any(|action| {
                 matches!(action, KVActionLog::Write(_) | KVActionLog::DirtyWrite(_))
             });
@@ -1861,6 +1901,17 @@ impl<
         // 由不可变动作在锁外生成 WAL payload，缩短 prepare 全表锁临界区。
         let write_buf = self.prepare_output(&actions);
         let mut prepare = self.0.table.0.prepare.lock();
+        let transaction_uid = self.get_transaction_uid().unwrap();
+        // prepare map 的 TID 是表内冻结动作 owner。重复 TID 表示同表兄弟子节点或重复
+        // prepare；在这里覆盖会让错误节点消费动作并静默丢写，因此必须在 WAL 前拒绝。
+        if has_prepared_transaction(&prepare, &transaction_uid) {
+            return Err(KVTableTrError::new_transaction_error(
+                ErrorLevel::Normal,
+                format!("Prepare b-tree ordered table failed, table: {:?}, source: {:?}, transaction_uid: {:?}, reason: duplicate prepared transaction uid",
+                        self.0.table.name().as_str(),
+                        self.0.source,
+                        transaction_uid)));
+        }
         for (key, action) in &actions {
             if has_prepared_conflict(&prepare, key, mode, action) {
                 conflict_keys.push(key.clone());
@@ -1873,7 +1924,7 @@ impl<
         // 在同一个 prepare guard 下完成“检查所有其它预留 -> 登记本事务整批动作”。只有零冲突
         // 才清空事务 KeyState，故失败事务仍可由外部 rollback，并且不能出现部分登记。
         let _ = mem::replace(&mut *self.0.key_states.lock(), XHashMap::default());
-        prepare.insert(self.get_transaction_uid().unwrap(), PreparedActions {
+        prepare.insert(transaction_uid, PreparedActions {
             mode,
             actions,
         });

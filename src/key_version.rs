@@ -862,6 +862,44 @@ pub(crate) struct PreparedActions {
     pub(crate) actions: XHashMap<Binary, KVActionLog>,
 }
 
+/// 表级 commit 取得 prepared 项时可能发现的结构不变量错误。
+///
+/// 该错误只描述同步 `prepare` map 的局部状态，不决定事务错误等级。调用方已经进入 commit，
+/// 必须结合整棵事务树可能已有兄弟节点发布这一事实，把两种错误都转换为 Fatal。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PreparedCommitError {
+    Missing,
+    ModeMismatch(PrepareMode),
+}
+
+/// 判断同一表的 prepare map 是否已经登记指定根 TID。
+///
+/// 调用方必须在同一个 prepare mutex guard 内完成本检查、全部 Key 冲突检查和最终 insert，
+/// 才能保证第二个同 TID 子节点不会覆盖第一个节点已经冻结的动作。
+#[inline]
+pub(crate) fn has_prepared_transaction(prepare: &XHashMap<Guid, PreparedActions>,
+                                       transaction_uid: &Guid) -> bool {
+    prepare.contains_key(transaction_uid)
+}
+
+/// 原子临界区内按根 TID 取出 prepared 项，并校验它属于当前表事务的协议模式。
+///
+/// 本函数本身不加锁；调用方只需持有现有 prepare mutex guard。匹配项被返回，模式错配项也会
+/// 被移除，因为 commit 已不可安全 rollback；只读子事务允许缺项，可写子事务缺项必须报错。
+#[inline]
+pub(crate) fn take_prepared_for_commit(prepare: &mut XHashMap<Guid, PreparedActions>,
+                                       transaction_uid: &Guid,
+                                       expected_mode: PrepareMode,
+                                       is_writable: bool)
+    -> Result<Option<PreparedActions>, PreparedCommitError> {
+    match prepare.remove(transaction_uid) {
+        Some(prepared) if prepared.mode == expected_mode => Ok(Some(prepared)),
+        Some(prepared) => Err(PreparedCommitError::ModeMismatch(prepared.mode)),
+        None if is_writable => Err(PreparedCommitError::Missing),
+        None => Ok(None),
+    }
+}
+
 /// 版本化根事务的共享提交回执汇聚器。
 ///
 /// 每个子表只在自己的 publication write 内追加本事务最终写集合；根事务在整棵树 commit 成功
@@ -994,15 +1032,90 @@ mod tests {
     use pi_bon::{Encode, WriteBuffer};
     use pi_guid::Guid;
 
-    use crate::Binary;
+    use crate::{Binary, KVActionLog};
 
     use super::{KeyVersionConfig,
                 KeyVersionRegistry,
                 MAX_TICK,
+                PrepareMode,
+                PreparedActions,
+                PreparedCommitError,
                 TTL_SCAN_BATCH_SIZE,
                 TtlKeyIndex,
                 deadline_tick,
-                duration_to_ticks};
+                duration_to_ticks,
+                has_prepared_transaction,
+                take_prepared_for_commit};
+
+    /// 重复根 TID 检查必须精确区分已登记和未登记项，且不得修改既有冻结动作。
+    #[test]
+    fn test_prepared_transaction_duplicate_guard_is_non_destructive() {
+        let transaction_uid = Guid(11);
+        let other_uid = Guid(12);
+        let mut prepare = pi_hash::XHashMap::default();
+        prepare.insert(transaction_uid.clone(), PreparedActions {
+            mode: PrepareMode::Ordinary,
+            actions: pi_hash::XHashMap::default(),
+        });
+
+        assert!(has_prepared_transaction(&prepare, &transaction_uid));
+        assert!(!has_prepared_transaction(&prepare, &other_uid));
+        assert_eq!(prepare.len(), 1);
+        assert_eq!(prepare.get(&transaction_uid).map(|item| item.mode),
+                   Some(PrepareMode::Ordinary));
+    }
+
+    /// commit 必须只取得同 TID、同模式项；可写缺项和模式错配均不能退化为空动作成功。
+    #[test]
+    fn test_take_prepared_for_commit_enforces_mode_and_writable_presence() {
+        let ordinary_uid = Guid(21);
+        let mismatch_uid = Guid(22);
+        let missing_uid = Guid(23);
+        let mut prepare = pi_hash::XHashMap::default();
+        let mut ordinary_actions = pi_hash::XHashMap::default();
+        ordinary_actions.insert(binary_from_u32(1), KVActionLog::Read);
+        prepare.insert(ordinary_uid.clone(), PreparedActions {
+            mode: PrepareMode::Ordinary,
+            actions: ordinary_actions,
+        });
+        prepare.insert(mismatch_uid.clone(), PreparedActions {
+            mode: PrepareMode::Versioned,
+            actions: pi_hash::XHashMap::default(),
+        });
+
+        match take_prepared_for_commit(&mut prepare,
+                                       &ordinary_uid,
+                                       PrepareMode::Ordinary,
+                                       true) {
+            Ok(Some(prepared)) => {
+                assert_eq!(prepared.mode, PrepareMode::Ordinary);
+                assert!(prepared
+                    .actions
+                    .get(&binary_from_u32(1))
+                    .map(|action| matches!(action, KVActionLog::Read))
+                    .unwrap_or(false));
+            },
+            _ => panic!("matching writable prepared item must be returned"),
+        }
+        assert!(!prepare.contains_key(&ordinary_uid));
+
+        assert!(matches!(take_prepared_for_commit(&mut prepare,
+                                                  &mismatch_uid,
+                                                  PrepareMode::Ordinary,
+                                                  true),
+                         Err(PreparedCommitError::ModeMismatch(PrepareMode::Versioned))));
+        assert!(!prepare.contains_key(&mismatch_uid));
+        assert!(matches!(take_prepared_for_commit(&mut prepare,
+                                                  &missing_uid,
+                                                  PrepareMode::Ordinary,
+                                                  true),
+                         Err(PreparedCommitError::Missing)));
+        assert!(matches!(take_prepared_for_commit(&mut prepare,
+                                                  &missing_uid,
+                                                  PrepareMode::Ordinary,
+                                                  false),
+                         Ok(None)));
+    }
 
     /// TTL 使用 1ms 最小单位；非零 sub-ms 值提升到最小单位，其余小数直接忽略。
     ///

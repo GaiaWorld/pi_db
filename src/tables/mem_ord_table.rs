@@ -42,11 +42,14 @@ use crate::{Binary,
             key_version::{KeyVersions,
                           PrepareMode,
                           PreparedActions,
+                          PreparedCommitError,
                           TableVersionContext,
                           Version,
                           VersionReceipt,
                           binary_state_equal,
-                          has_prepared_conflict},
+                          has_prepared_conflict,
+                          has_prepared_transaction,
+                          take_prepared_for_commit},
             tables::{KVTable, ordmap_snapshot::OrdMapSnapshot}};
 
 /// 以 COW `OrdMap` 保存已提交数据的有序 Memory 表共享句柄。
@@ -359,7 +362,51 @@ impl<
                 Some(context) => Some(context.versions().publication().write().await),
                 None => None,
             };
-            let prepared = tr.0.table.0.prepare.lock().remove(&transaction_uid);
+            // 正常 prepare 与 WAL repair 的 prepare_repair 都必须先登记该项；repair 使用
+            // Ordinary mode，因此“replay 跳过事务框架标准 prepare”不等于允许这里缺项。
+            let expected_mode = tr
+                .0
+                .version_context
+                .as_ref()
+                .map(TableVersionContext::mode)
+                .unwrap_or(PrepareMode::Ordinary);
+            let prepared = {
+                let mut prepare = tr.0.table.0.prepare.lock();
+                take_prepared_for_commit(&mut prepare,
+                                         &transaction_uid,
+                                         expected_mode,
+                                         tr.is_writable())
+            };
+            let prepared = match prepared {
+                Ok(prepared) => prepared,
+                Err(PreparedCommitError::ModeMismatch(prepared_mode)) => {
+                    drop(publication);
+                    if let Some(context) = tr.0.version_context.as_ref() {
+                        context.release_snapshot();
+                    }
+                    return Err(KVTableTrError::new_transaction_error(
+                        ErrorLevel::Fatal,
+                        format!("Commit memory ordered table failed, table: {:?}, source: {:?}, transaction_uid: {:?}, expected_mode: {:?}, prepared_mode: {:?}, reason: prepared action protocol mismatch after entering non-rollbackable commit",
+                                tr.0.table.name().as_str(),
+                                tr.0.source,
+                                transaction_uid,
+                                expected_mode,
+                                prepared_mode)));
+                },
+                Err(PreparedCommitError::Missing) => {
+                    drop(publication);
+                    if let Some(context) = tr.0.version_context.as_ref() {
+                        context.release_snapshot();
+                    }
+                    return Err(KVTableTrError::new_transaction_error(
+                        ErrorLevel::Fatal,
+                        format!("Commit memory ordered table failed, table: {:?}, source: {:?}, transaction_uid: {:?}, expected_mode: {:?}, reason: prepared actions missing after entering non-rollbackable commit",
+                                tr.0.table.name().as_str(),
+                                tr.0.source,
+                                transaction_uid,
+                                expected_mode)));
+                },
+            };
             let mut committed_versions = Vec::new();
 
             if let Some(prepared) = prepared {
@@ -881,6 +928,17 @@ impl<
 
         let write_buf = self.prepare_output(&actions);
         let mut prepare = self.0.table.0.prepare.lock();
+        let transaction_uid = self.get_transaction_uid().unwrap();
+        // 表级 prepare 以根 TID 为索引；同一 TID 已存在意味着事务树错误地包含了同表兄弟
+        // 节点或发生重复 prepare。必须在转移动作前拒绝，绝不能覆盖先前节点的冻结动作。
+        if has_prepared_transaction(&prepare, &transaction_uid) {
+            return Err(KVTableTrError::new_transaction_error(
+                ErrorLevel::Normal,
+                format!("Prepare memory ordered table failed, table: {:?}, source: {:?}, transaction_uid: {:?}, reason: duplicate prepared transaction uid",
+                        self.0.table.name().as_str(),
+                        self.0.source,
+                        transaction_uid)));
+        }
         // 检查全部既有预留并插入当前 TID 必须位于同一锁临界区，保证首次插入冲突原子化。
         for (key, action) in &actions {
             if has_prepared_conflict(&prepare, key, mode, action) {
@@ -893,7 +951,7 @@ impl<
 
         // 冲突失败前不转移动作；成功后同一事务不允许再次 prepare。
         let _ = mem::replace(&mut *self.0.actions.lock(), XHashMap::default());
-        prepare.insert(self.get_transaction_uid().unwrap(), PreparedActions {
+        prepare.insert(transaction_uid, PreparedActions {
             mode,
             actions,
         });

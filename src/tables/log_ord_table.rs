@@ -47,11 +47,14 @@ use crate::{Binary, KVAction, TableTrQos, KVActionLog, KVDBCommitConfirm, KVTabl
             key_version::{KeyVersions,
                           PrepareMode,
                           PreparedActions,
+                          PreparedCommitError,
                           TableVersionContext,
                           Version,
                           VersionReceipt,
                           binary_state_equal,
-                          has_prepared_conflict},
+                          has_prepared_conflict,
+                          has_prepared_transaction,
+                          take_prepared_for_commit},
             tables::{KVTable, ordmap_snapshot::OrdMapSnapshot},
             utils::KVDBEvent,
             KVDBTableType};
@@ -550,15 +553,52 @@ impl<
                 Some(context) => Some(context.versions().publication().write().await),
                 None => None,
             };
-            let actions = tr
+            // 正常 prepare 和启动 repair 都必须先登记根 TID；prepare_repair 使用 Ordinary
+            // mode。合法 replay 跳过框架标准 prepare，但不会跳过该表级恢复预置步骤。
+            let expected_mode = tr
                 .0
-                .table
-                .0
-                .prepare
-                .lock()
-                .remove(&transaction_uid)
-                .map(|prepared| prepared.actions)
-                .unwrap_or_default();
+                .version_context
+                .as_ref()
+                .map(TableVersionContext::mode)
+                .unwrap_or(PrepareMode::Ordinary);
+            let prepared = {
+                let mut prepare = tr.0.table.0.prepare.lock();
+                take_prepared_for_commit(&mut prepare,
+                                         &transaction_uid,
+                                         expected_mode,
+                                         tr.is_writable())
+            };
+            let actions = match prepared {
+                Ok(Some(prepared)) => prepared.actions,
+                Ok(None) => XHashMap::default(),
+                Err(PreparedCommitError::ModeMismatch(prepared_mode)) => {
+                    drop(publication);
+                    if let Some(context) = tr.0.version_context.as_ref() {
+                        context.release_snapshot();
+                    }
+                    return Err(KVTableTrError::new_transaction_error(
+                        ErrorLevel::Fatal,
+                        format!("Commit log ordered table failed, table: {:?}, source: {:?}, transaction_uid: {:?}, expected_mode: {:?}, prepared_mode: {:?}, reason: prepared action protocol mismatch after entering non-rollbackable commit",
+                                tr.0.table.name().as_str(),
+                                tr.0.source,
+                                transaction_uid,
+                                expected_mode,
+                                prepared_mode)));
+                },
+                Err(PreparedCommitError::Missing) => {
+                    drop(publication);
+                    if let Some(context) = tr.0.version_context.as_ref() {
+                        context.release_snapshot();
+                    }
+                    return Err(KVTableTrError::new_transaction_error(
+                        ErrorLevel::Fatal,
+                        format!("Commit log ordered table failed, table: {:?}, source: {:?}, transaction_uid: {:?}, expected_mode: {:?}, reason: prepared actions missing after entering non-rollbackable commit",
+                                tr.0.table.name().as_str(),
+                                tr.0.source,
+                                transaction_uid,
+                                expected_mode)));
+                },
+            };
             let has_writes = actions.values().any(|action| {
                 matches!(action, KVActionLog::Write(_) | KVActionLog::DirtyWrite(_))
             });
@@ -1124,6 +1164,17 @@ impl<
 
         let write_buf = self.prepare_output(&actions);
         let mut prepare = self.0.table.0.prepare.lock();
+        let transaction_uid = self.get_transaction_uid().unwrap();
+        // prepare map 的 TID 必须唯一归属于一个表子节点；覆盖同 TID 会把冻结动作交给错误
+        // 节点提交。该错误发生在根 WAL 前，保留私有动作并返回可恢复错误。
+        if has_prepared_transaction(&prepare, &transaction_uid) {
+            return Err(KVTableTrError::new_transaction_error(
+                ErrorLevel::Normal,
+                format!("Prepare log ordered table failed, table: {:?}, source: {:?}, transaction_uid: {:?}, reason: duplicate prepared transaction uid",
+                        self.0.table.name().as_str(),
+                        self.0.source,
+                        transaction_uid)));
+        }
         // prepared 检查和当前 TID 插入必须在同一锁临界区，封闭相同新 Key 并发插入窗口。
         for (key, action) in &actions {
             if has_prepared_conflict(&prepare, key, mode, action) {
@@ -1136,7 +1187,7 @@ impl<
 
         // 成功才转移动作；冲突失败保留事务私有状态供 rollback 关闭。
         let _ = mem::replace(&mut *self.0.actions.lock(), XHashMap::default());
-        prepare.insert(self.get_transaction_uid().unwrap(), PreparedActions {
+        prepare.insert(transaction_uid, PreparedActions {
             mode,
             actions,
         });
