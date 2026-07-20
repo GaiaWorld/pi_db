@@ -3,9 +3,10 @@
 //!
 //! 本文件成对测量 Meta、持久化 Memory 和 Btree：普通协议以 1/16/256 个 Key 执行
 //! `upsert -> prepare_modified_conflicts -> commit_modified`；版本协议对同规模 Key 执行
-//! `query_with_version -> prepare_with_version -> commit_with_version`。另有三类表的稳定 cache-hit
-//! qwv。数据库、4-worker runtime、事务管理器、根 `CommitLogger`、redb 和临时文件系统均为
-//! 真实组件；数据库启动、DDL 和热读基线写入位于采样区间之外。
+//! `query_with_version -> prepare_with_version -> commit_with_version`。Memory 另测量幂等建表前导
+//! 后的版本提交，以量化协议中立 Schema 子节点的固定成本；三类表另有稳定 cache-hit qwv。
+//! 数据库、4-worker runtime、事务管理器、根 `CommitLogger`、redb 和临时文件系统均为真实组件；
+//! 数据库启动、首次 DDL 和热读基线写入位于采样区间之外。
 //!
 //! 结果包含 Binary/BON 构造、版本读取、事务树创建、冲突检查、回执校验、WAL append/flush
 //! 及表提交成本，不是底层 Map、锁或文件写的裸性能。Meta 使用真实存在的表定义记录，Memory
@@ -86,6 +87,22 @@ macro_rules! version_benchmark {
     };
 }
 
+macro_rules! schema_version_benchmark {
+    ($name:ident, $keys:expr) => {
+        #[doc = concat!(
+                    "测量真实 Memory 表先执行幂等建表前导，再以版本事务提交 ",
+                    stringify!($keys),
+                    " 个唯一 Key 的端到端延迟。"
+                )]
+        #[bench]
+        fn $name(b: &mut Bencher) {
+            let _time_loop = startup_global_time_loop(10);
+            let fixture = Fixture::new(BenchTable::Memory, $keys);
+            b.iter(|| black_box(fixture.commit_version_batch_after_schema($keys)));
+        }
+    };
+}
+
 macro_rules! query_benchmark {
     ($name:ident, $table:expr) => {
         #[doc = concat!("测量真实 ", stringify!($table), " 表稳定 Key 的 qwv cache-hit 延迟。")]
@@ -117,6 +134,8 @@ version_benchmark!(bench_version_memory_256_keys, BenchTable::Memory, 256);
 version_benchmark!(bench_version_btree_1_key, BenchTable::Btree, 1);
 version_benchmark!(bench_version_btree_16_keys, BenchTable::Btree, 16);
 version_benchmark!(bench_version_btree_256_keys, BenchTable::Btree, 256);
+schema_version_benchmark!(bench_schema_version_memory_1_key, 1);
+schema_version_benchmark!(bench_schema_version_memory_16_keys, 16);
 query_benchmark!(bench_qwv_meta_cached, BenchTable::Meta);
 query_benchmark!(bench_qwv_memory_cached, BenchTable::Memory);
 query_benchmark!(bench_qwv_btree_overlay_cached, BenchTable::Btree);
@@ -274,6 +293,85 @@ impl Fixture {
                 key_count
             })
             .expect("key-version benchmark runtime must execute the version sample")
+    }
+
+    /// 在同一根事务先执行幂等建表前导，再完成版本提交并严格校验公开回执。
+    ///
+    /// 已存在且定义相同的表不会重复产生 Meta 写；该样本专门量化协议中立 Schema 子节点、
+    /// 根协议选择和版本业务节点共同装配的固定成本，不代表首次物理建表或目录创建成本。
+    fn commit_version_batch_after_schema(&self, key_count: usize) -> usize {
+        assert!(matches!(self.table_kind, BenchTable::Memory));
+        let writes = self.build_writes(key_count);
+        let db = self.db.clone();
+        let table = self.table.clone();
+        let source = self.source.clone();
+        self.rt
+            .block_on(async move {
+                let transaction = db
+                    .transaction(source, true, 10_000, 10_000)
+                    .expect("schema benchmark version transaction must start");
+                transaction
+                    .create_table(
+                        table.clone(),
+                        KVTableMeta::new(
+                            KVDBTableType::MemOrdTab,
+                            true,
+                            EnumType::Usize,
+                            EnumType::Usize,
+                        ),
+                        false,
+                    )
+                    .await
+                    .expect("schema benchmark idempotent table prelude must succeed");
+
+                let mut reads = Vec::with_capacity(key_count);
+                for write in &writes {
+                    let (value, version) = db
+                        .query_with_version(table.clone(), write.key.clone())
+                        .await
+                        .expect("schema benchmark qwv baseline must succeed");
+                    assert!(value.is_none(), "unique schema benchmark Key must be absent");
+                    reads.push(TableKeyVersion {
+                        table: table.clone(),
+                        key: write.key.clone(),
+                        version,
+                    });
+                }
+
+                let prepare = transaction
+                    .prepare_with_version(reads, writes.clone())
+                    .await
+                    .expect("schema benchmark version prepare must succeed");
+                let transaction_uid = transaction
+                    .get_transaction_uid()
+                    .expect("schema benchmark prepare must allocate the root transaction UID");
+                let receipt = transaction
+                    .commit_with_version(prepare)
+                    .await
+                    .expect("schema benchmark version commit must succeed");
+                assert_eq!(receipt.len(), key_count, "schema benchmark receipt length must match");
+                let receipt_keys: HashSet<_> = receipt
+                    .iter()
+                    .map(|item| {
+                        assert_eq!(item.table, table, "schema benchmark receipt table must match");
+                        assert_eq!(
+                            item.version,
+                            Version::Upsert(transaction_uid.clone()),
+                            "schema benchmark receipt must contain this transaction's UID",
+                        );
+                        item.key.clone()
+                    })
+                    .collect();
+                assert_eq!(receipt_keys.len(), key_count, "schema benchmark keys must be unique");
+                for write in &writes {
+                    assert!(
+                        receipt_keys.contains(&write.key),
+                        "schema benchmark receipt must contain every written Key",
+                    );
+                }
+                key_count
+            })
+            .expect("key-version benchmark runtime must execute the schema sample")
     }
 
     /// 为 cache-hit qwv 创建一个真实现存值，并返回稳定的值/版本基线。

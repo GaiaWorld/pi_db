@@ -25,7 +25,7 @@ use std::collections::{VecDeque, HashMap, BTreeMap};
 use std::io::{Error, Result as IOResult, ErrorKind};
 use std::sync::{Arc,
                 OnceLock,
-                atomic::{AtomicBool, AtomicU64, Ordering}};
+                atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering}};
 
 use futures::{future::{FutureExt, BoxFuture}, stream::BoxStream, StreamExt};
 use crossbeam_channel::bounded;
@@ -109,6 +109,30 @@ const DB_INITING_STATUS: u64 = 1;
 /// 数据库已初始化状态
 ///
 const DB_INITED_STATUS: u64 = 2;
+
+/// 根事务当前选择的业务协议。
+///
+/// Schema Meta 子节点不构成第四种协议；它可在 Unselected 阶段预先建立，并随之后唯一选择的
+/// Ordinary 或 Versioned 协议进入同一棵 2PC 树。该状态只保护树装配，不替代 2PC 生命周期。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+enum RootTransactionProtocol {
+    Unselected = 0,
+    Ordinary = 1,
+    Versioned = 2,
+}
+
+impl RootTransactionProtocol {
+    #[inline]
+    fn from_u8(value: u8) -> Self {
+        match value {
+            0 => Self::Unselected,
+            1 => Self::Ordinary,
+            2 => Self::Versioned,
+            _ => unreachable!("invalid root transaction protocol: {value}"),
+        }
+    }
+}
 
 ///
 /// 数据库正在关闭状态
@@ -650,6 +674,7 @@ impl<
             cid,
             status,
             writable: is_writable,
+            protocol: AtomicU8::new(RootTransactionProtocol::Unselected as u8),
             persistence: AtomicBool::new(false), //默认键值对数据库的根事务不持久化
             prepare_timeout,
             commit_timeout,
@@ -2160,7 +2185,22 @@ impl<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>,
 > KVDBTransaction<C, Log> {
-    /// 异步获取表的元信息
+    /// 在根事务中观察指定表的元信息，但不选择普通或版本业务协议。
+    ///
+    /// `name` 按所有权传入；存在定义时返回 owned [`KVTableMeta`]，不存在或内部 Meta 表未注册
+    /// 时返回 `None`。当前入口不单独校验空名或 4096 字节上限，调用方仍应遵守表名契约。
+    /// 只能对 [`KVDBTransaction::RootTr`] 调用；对子表 variant 调用会 panic。
+    ///
+    /// 若同一根的专用 DDL 已建立 Meta 子事务，本方法读取该事务的私有 COW 根，因此既可观察
+    /// 本根刚创建的表，也可观察普通协议 `remove_table` 尚未提交的删除；否则直接点读当前已
+    /// 提交 Meta 根。这不开放调用方直接通过普通/版本 KV API 操作内部 Meta 表。两条路径都不
+    /// 登记 Ordinary Read、不加入版本 `read_set`、不创建新的 2PC 子节点、不分配 TID、不修改
+    /// 根持久化标志，也不返回 Key 版本。它可位于普通动作或 [`Self::prepare_with_version`] 前；
+    /// 结果本身不保证到后续 prepare 期间保持不变。
+    ///
+    /// 方法会短暂取得根 `childs_map` 同步锁，或等待数据库表注册表异步读锁，再对一个 COW 根
+    /// 做 O(log m) 点读；同步 guard 不跨 `.await`，不执行文件 I/O、用户回调或全表扫描。完整
+    /// 协议边界见 `docs/SCHEMA_PROTOCOL_NEUTRAL_DESIGN.md#schema-protocol-neutral-table-meta`。
     pub async fn table_meta(&self, name: Atom) -> Option<KVTableMeta> {
         match self {
             KVDBTransaction::RootTr(tr) => {
@@ -2170,7 +2210,30 @@ impl<
         }
     }
 
-    /// 异步创建表，需要指定表名和表的元信息
+    /// 以显式存储选项在尚未选择业务协议的根事务中创建或幂等确认一张表。
+    ///
+    /// `name` 的 UTF-8 长度必须为 `1..=4096` 字节并满足现有表名契约；`meta` 决定表类型、
+    /// persistence 和 Key/Value 类型，`options` 只在实际构造 LogOrdered/Btree 时分别接受对应
+    /// variant。已存在且元信息相同的表按既有语义直接成功，不重新解释 `options`。
+    /// `enable_accelerated_repair` 只传给实际新建的 Btree 存储构造路径，其它表不使用。
+    ///
+    /// 本方法只允许 RootTr，子表 variant 会 panic。合法调用必须发生在任何非空普通/dirty
+    /// KV、lock/unlock、remove、普通 prepare 或版本 prepare 之前；根已经选择 Ordinary 或
+    /// Versioned 时，在新增建表副作用前返回 `io::ErrorKind::InvalidInput`。多次建表复用唯一
+    /// `SchemaCreate` Meta 子事务，随后既可走普通 2PC，也可走
+    /// [`Self::prepare_with_version`] / [`Self::commit_with_version`]。内部 Meta 写参与同一 TID、
+    /// 冲突、WAL、发布和最终确认，但永远不进入版本提交的公开业务回执。
+    ///
+    /// 当前 DDL 仍不具完整事务/取消原子性：表对象和全局注册项在 prepare 前即可见，rollback
+    /// 不移除它们，构造 future 中途取消也可能留下部分资源；只有 Meta 定义和后续业务动作受
+    /// 2PC/WAL 约束。调用方必须使用可写根并等待明确结果，失败后不得把注册表可见性当作提交
+    /// 成功。`remove_table` 不属于该前导阶段，禁止在同一根与 create 混用。
+    ///
+    /// 方法等待全局表注册表异步写锁，当前仍可能在存储构造期间长期持有它；根
+    /// `childs_map -> childs` 只用于 O(1) schema owner 安装且绝不跨 `.await`。Memory 构造为
+    /// O(1)，持久化表还包含目录/文件初始化成本。本轮不增加全局协议锁、unsafe 或后台任务。
+    /// 完整状态机、WAL 顺序和非目标见
+    /// `docs/SCHEMA_PROTOCOL_NEUTRAL_DESIGN.md#schema-protocol-neutral-create`。
     pub async fn create_table_with_options(&self,
                                            name: Atom,
                                            meta: KVTableMeta,
@@ -2189,7 +2252,11 @@ impl<
         }
     }
 
-    /// 异步创建表，需要指定表名和表的元信息
+    /// 使用当前默认存储选项创建或幂等确认一张表。
+    ///
+    /// LogOrdered 默认使用 `512MiB/2MiB/2MiB`，Btree 默认使用 `16MiB` cache 并启用 compact，
+    /// 其它表使用空选项。协议选择、SchemaCreate、错误、DDL 非原子性、锁和提交语义与
+    /// [`Self::create_table_with_options`] 完全相同。
     pub async fn create_table(&self,
                               name: Atom,
                               meta: KVTableMeta,
@@ -2543,10 +2610,12 @@ impl<
 
     /// 以外部实际读取的版本集合和最终写集合执行完整冲突预提交。
     ///
-    /// 只能对未注册普通 2PC 子节点的可写 RootTr 调用，并且只能与
-    /// [`Self::commit_with_version`] 组成独立协议；禁止与普通/dirty 动作、DDL、普通
-    /// prepare/commit 混用。纯 `keys/values` 流例外：它们使用脱离根 2PC 的快照事务，不选择
-    /// 协议，也不会自动加入 `read_set`，因此允许先创建并保持到版本提交完成。`read_set` 和
+    /// 只能对尚未选择普通业务协议的可写 RootTr 调用，并且只能与
+    /// [`Self::commit_with_version`] 组成独立协议；禁止与普通/dirty KV、lock/unlock、
+    /// `remove_table`、普通 prepare/commit 混用。协议选择前调用 [`Self::table_meta`] 及零到多次
+    /// [`Self::create_table`] / [`Self::create_table_with_options`] 是唯一 DDL 例外：其内部
+    /// SchemaCreate Meta 子节点会原样保留并与版本业务子节点共同提交。纯 `keys/values` 流也
+    /// 不选择协议、不会自动加入 `read_set`，因此允许先创建并保持到版本提交完成。`read_set` 和
     /// `write_set` 均可为空；各集合内部不允许重复 `(table, key)`，跨集合重叠合法且最终动作以
     /// write 为准。`Some(value)` 是 upsert，`None` 是 delete；LogWrite 不支持 delete。
     ///
@@ -2599,9 +2668,11 @@ impl<
 
     /// 提交已经由 [`Self::prepare_with_version`] 成功预提交的根事务，并返回本事务发布的版本。
     ///
-    /// token 必须来自同一事务且只能使用一次。返回项只描述本事务自己的最终写入，不会在方法尾
-    /// 重新读取可能已被后续事务推进的全局最新版本；顺序不属于稳定契约。Ok 表示根 WAL 已按需
-    /// 落地且表数据/版本已经发布，不表示异步数据文件全部持久化或 WAL 已确认为 `.bak`。
+    /// token 必须来自同一事务且只能使用一次。返回项只描述 `prepare_with_version` 最终业务
+    /// write-set 中的写入；同根 `SchemaCreate` Meta 动作会正常发布版本，但不会进入公开回执。
+    /// 本方法不会在末尾重新读取可能已被后续事务推进的全局最新版本，返回顺序也不属于稳定
+    /// 契约。Ok 表示根 WAL 已按需落地且表数据/版本已经发布，不表示异步数据文件全部持久化或
+    /// WAL 已确认为 `.bak`。
     /// 任一提交错误只返回 Err 并丢弃部分回执；WAL 成功后的错误不可 rollback。
     /// 根 WAL 自身的环境/runtime I/O 失败不属于当前事务安全保证，不能从 Err 或回执为空推断
     /// WAL 未写入；其边界与 [`Self::commit_modified`] 完全相同。
@@ -2717,9 +2788,10 @@ impl<
 /// 一棵数据库事务树的共享根节点。
 ///
 /// 根节点保存 source、事务/提交 UID、2PC 状态、可写/持久化标志、当前未执行的 timeout、按
-/// 表名索引的子事务 map、按首次触表顺序排列的子事务 list，以及 manager clone。普通动作首次
-/// 触表或版本 prepare 批量装配时才注册 2PC 子事务，同表后续普通动作复用同一节点；纯
-/// `keys/values` 在没有同表普通节点时使用脱离根容器的快照事务，不参与这两个索引。
+/// 表名索引的子事务 map、按首次触表顺序排列的子事务 list、原子业务协议三态以及 manager
+/// clone。公开建表可先登记唯一 SchemaCreate Meta 节点而不选择业务协议；第一次非空普通动作
+/// 或版本 prepare 再原子选择 Ordinary/Versioned。纯 `table_meta/keys/values` 不选择协议，后
+/// 两者在没有可复用 Ordinary 节点时使用脱离根容器的快照事务。
 ///
 /// 应用通常不直接构造或匹配本类型，而通过 [`KVDBTransaction::RootTr`] 使用。clone 共享同一
 /// 状态机和子事务，不创建独立事务。根持有 manager，prepare 后 manager registry 又持有根；
@@ -2730,8 +2802,9 @@ pub struct RootTransaction<
     Log: AsyncCommitLog<C = C, Cid = Guid>,
 >(Arc<InnerRootTransaction<C, Log>>);
 
-// SAFETY: InnerRootTransaction 的可变 UID/status/子事务容器由 SpinLock 保护，持久化标志为
-// AtomicBool，其余字段构造后只读；manager 自身满足 Send。移动 Arc 不改变内部地址或别名。
+// SAFETY: InnerRootTransaction 的可变 UID/status/子事务容器由 SpinLock 保护，协议和持久化
+// 标志分别由 AtomicU8/AtomicBool 保护，其余字段构造后只读；manager 自身满足 Send。移动
+// Arc 不改变内部地址或别名。
 unsafe impl<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>,
@@ -2975,6 +3048,90 @@ impl<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>,
 > RootTransaction<C, Log> {
+    #[inline]
+    fn protocol(&self) -> RootTransactionProtocol {
+        RootTransactionProtocol::from_u8(self.0.protocol.load(Ordering::Acquire))
+    }
+
+    /// 为非空普通动作原子选择 Ordinary；已选 Versioned 时在任何子节点或表副作用前拒绝。
+    fn select_ordinary_protocol(&self,
+                                operation: &'static str)
+        -> Result<(), KVTableTrError> {
+        loop {
+            match self.protocol() {
+                RootTransactionProtocol::Ordinary => return Ok(()),
+                RootTransactionProtocol::Versioned => {
+                    return Err(KVTableTrError::new_transaction_error(
+                        ErrorLevel::Normal,
+                        format!("{operation} failed, reason: root transaction already selected version protocol")));
+                },
+                RootTransactionProtocol::Unselected => {
+                    match self.0.protocol.compare_exchange(
+                        RootTransactionProtocol::Unselected as u8,
+                        RootTransactionProtocol::Ordinary as u8,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    ) {
+                        Ok(_) => return Ok(()),
+                        Err(_) => continue,
+                    }
+                },
+            }
+        }
+    }
+
+    /// 在版本子节点最终安装临界区内选择 Versioned；任何既有选择都表示重复或混用。
+    fn select_versioned_protocol(&self) -> Result<(), KVTableTrError> {
+        match self.0.protocol.compare_exchange(
+            RootTransactionProtocol::Unselected as u8,
+            RootTransactionProtocol::Versioned as u8,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => Ok(()),
+            Err(protocol) => Err(KVTableTrError::new_transaction_error(
+                ErrorLevel::Normal,
+                format!("Prepare with version failed, reason: root transaction already selected {:?} protocol",
+                        RootTransactionProtocol::from_u8(protocol)))),
+        }
+    }
+
+    /// 建表只能发生在协议选择前；调用方还会在持有 childs_map 时复核，封闭并发选择窗口。
+    fn ensure_schema_prelude_protocol(&self) -> IOResult<()> {
+        match self.protocol() {
+            RootTransactionProtocol::Unselected => Ok(()),
+            protocol => Err(Error::new(
+                ErrorKind::InvalidInput,
+                format!("Create table failed, reason: root transaction already selected {:?} protocol",
+                        protocol))),
+        }
+    }
+
+    #[inline]
+    fn is_schema_create_child(name: &Atom,
+                              child: &KVDBTransaction<C, Log>) -> bool {
+        name.as_str() == DEFAULT_DB_TABLES_META_DIR
+            && matches!(child,
+                        KVDBTransaction::MetaTabTr(tr)
+                            if tr.prepare_mode() == PrepareMode::SchemaCreate)
+    }
+
+    /// 判断当前根容器是否只包含零个或一个合法 SchemaCreate Meta 节点。
+    ///
+    /// 调用方必须同时持有 childs_map 和 childs，并先检查两者长度相等。当前构造器保证二者按
+    /// 同一临界区同步插入；这里只验证允许版本协议继承的唯一节点，不扫描或修改表状态。
+    fn contains_only_schema_create_child(
+        childes_map: &XHashMap<Atom, KVDBTransaction<C, Log>>,
+        childes_len: usize,
+    ) -> bool {
+        if childes_map.len() != childes_len || childes_map.len() > 1 {
+            return false;
+        }
+        childes_map
+            .iter()
+            .all(|(name, child)| Self::is_schema_create_child(name, child))
+    }
+
     // 获取根确认器期待的成功信号数：每个 persistence=true 子事务恰好计一次，根事务不计。
     // 只有读动作的可写事务会得到 0；此时确认器只作为 inert 参数传过事务树，任何节点都不得
     // 调用它，也不存在需要确认的根 WAL。该值的协议边界详见 CONTRACT-CFM-001：
@@ -2990,6 +3147,64 @@ impl<
         len
     }
 
+    /// 创建或复用公开建表前导阶段唯一的 SchemaCreate Meta 子事务。
+    ///
+    /// 调用方必须持有 tables registry guard 和 childs_map guard；本函数只短暂取得 childs，
+    /// 不 await、不执行 I/O。已有节点只有在表名、variant 和 prepare mode 全部匹配时才可复用，
+    /// 防止同一根 TID 被两个 Meta owner 共同消费。
+    fn schema_meta_transaction(
+        &self,
+        name: Atom,
+        table: &RegisteredTable<C, Log>,
+        is_persistent: bool,
+        childes_map: &mut XHashMap<Atom, KVDBTransaction<C, Log>>,
+    ) -> IOResult<KVDBTransaction<C, Log>> {
+        self.ensure_schema_prelude_protocol()?;
+        if let Some(existing) = childes_map.get(&name) {
+            if Self::is_schema_create_child(&name, existing) {
+                if is_persistent {
+                    existing.require_persistence();
+                }
+                return Ok(existing.clone());
+            }
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                format!("Create table failed, reason: root already contains a non-schema Meta transaction for {:?}",
+                        name.as_str()),
+            ));
+        }
+        if !childes_map.is_empty() || name.as_str() != DEFAULT_DB_TABLES_META_DIR {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "Create table failed, reason: root already contains non-schema transaction children",
+            ));
+        }
+
+        let KVDBTable::MetaTab(tab) = &table.table else {
+            return Err(Error::new(
+                ErrorKind::Other,
+                "Create table failed, reason: invalid internal Meta table registration",
+            ));
+        };
+        let tr = MetaTabTr::new_managed(
+            self.get_source(),
+            self.is_writable(),
+            is_persistent,
+            self.get_prepare_timeout(),
+            self.get_commit_timeout(),
+            tab.clone(),
+            table.versions.clone(),
+            PrepareMode::SchemaCreate,
+            XHashMap::default(),
+            None,
+            XHashMap::default(),
+        );
+        let table_tr = KVDBTransaction::MetaTabTr(tr);
+        childes_map.insert(name, table_tr.clone());
+        self.0.childs.lock().join(table_tr.clone());
+        Ok(table_tr)
+    }
+
     // 创建指定名称表的子事务
     // 注意表事务是否持久化，表示事务是否允许持久化，允许事务持久化表示这个事务的所有写操作会被写入提交日志
     fn table_transaction(&self,
@@ -2998,13 +3213,13 @@ impl<
                          is_persistent: bool,
                          childes_map: &mut XHashMap<Atom, KVDBTransaction<C, Log>>)
                          -> KVDBTransaction<C, Log> {
-        // 调用方已经持有 childs_map；版本树安装也使用 childs_map -> childs ->
-        // version_context 的固定顺序。只要版本上下文存在，就不允许再向同一根事务树加入
-        // 普通子事务。协议族混用由外部禁止，此处 fail-fast 是防止非法调用破坏树结构的
-        // 最后一道不变量保护，不会限制不同根事务在同一张表上的并发。
-        assert!(self.0.version_context.lock().is_none(),
-                "Create ordinary table transaction failed, table: {:?}, reason: root transaction already selected version protocol",
-                name.as_str());
+        // 调用方已经持有 childs_map；版本最终安装也使用同一锁，并在释放前把协议切为
+        // Versioned。普通动作入口先原子选择 Ordinary，因此这里只做不变量防御，不允许通过
+        // 直接内部调用把 Ordinary 节点插入 Unselected/Versioned 树。
+        assert_eq!(self.protocol(),
+                   RootTransactionProtocol::Ordinary,
+                   "Create ordinary table transaction failed, table: {:?}, reason: root transaction did not select ordinary protocol",
+                   name.as_str());
         match &table.table {
             KVDBTable::MetaTab(tab) => {
                 //创建元信息表的表事务，并作为子事务注册到根事务上
@@ -3297,14 +3512,33 @@ impl<
     #[inline]
     async fn table_meta(&self, table: Atom) -> Option<KVTableMeta> {
         let meta_table = Atom::from(DEFAULT_DB_TABLES_META_DIR);
-        let result = self.query(vec![TableKV::new(meta_table.clone(),
-                                                  table_to_binary(&table),
-                                                  None)]).await;
-        if let Some(binary) = &result[0] {
-            //指定名称的表，已注册元信息
-            Some(KVTableMeta::from(binary.clone()))
-        } else {
-            None
+        let key = table_to_binary(&table);
+
+        // 同根专用 DDL 已经建立 Meta 私有 COW 根时，必须观察该根才能读到尚未提交的创建或
+        // 删除；clone 后立即释放 childs_map，禁止 SpinLock guard 跨 await。dirty_query 只读
+        // root_mut，不把本次专用元信息检查登记成 Ordinary Read 或版本 read-set。外部协议仍
+        // 禁止直接通过普通/版本 KV API 操作内部 Meta 表。
+        let child = self.0.childs_map.lock().get(&meta_table).cloned();
+        if let Some(KVDBTransaction::MetaTabTr(tr)) = child {
+            return tr.dirty_query(key).await.map(KVTableMeta::from);
+        }
+
+        // 没有同根 Meta 子事务时只克隆已注册 Meta 表句柄；registry guard 在点读 COW 根前释放。
+        // 一次 root lock 读取是内存安全且自洽的，但不是跨后续动作保持的数据库级快照。
+        let registered = self
+            .0
+            .db_mgr
+            .0
+            .tables
+            .read()
+            .await
+            .get(&meta_table)
+            .cloned();
+        match registered.map(|registered| registered.table) {
+            Some(KVDBTable::MetaTab(meta)) => {
+                meta.query_committed(&key).map(KVTableMeta::from)
+            },
+            _ => None,
         }
     }
 
@@ -3318,73 +3552,118 @@ impl<
     {
         // 必须先于根持久化标记、注册表写锁、Meta 修改及文件/目录创建拒绝非法名称。
         validate_table_name(&name, ErrorKind::InvalidInput, "create table")?;
+        // schema prelude 只允许发生在普通/版本协议选择前；该快检没有共享副作用，取得
+        // childs_map 后还会再次检查，防止版本最终安装与本调用交错形成混合树。
+        self.ensure_schema_prelude_protocol()?;
 
         //检查待创建的指定名称的表是否存在
         let meta_table_name = Atom::from(DEFAULT_DB_TABLES_META_DIR);
         let mut tables = self.0.db_mgr.0.tables.write().await;
+        let meta_table = tables.get(&meta_table_name).cloned().ok_or_else(|| {
+            Error::new(ErrorKind::Other,
+                       "Create table failed, reason: internal Meta table is not registered")
+        })?;
+        let mut meta_table_tr = None;
 
-        self.require_persistence(); //创建表的操作，一定会创建元信息表事务，而元信息表事务是需要持久化的事务，则根事务也设置为需要持久化
         if tables.contains_key(&name) {
             //指定名称的表已存在
-            if let Some(meta_table) = tables.get(&meta_table_name) {
-                //元信息表存在，则获取元信息表事务，并查询指定表的元信息
+            {
+                // 已存在表先创建非持久化 SchemaCreate owner 并读取定义；幂等成功不产生 Meta
+                // 写和确认。同步根锁只覆盖节点复用/插入，必须在 query await 前释放。
                 let mut childes_map = self.0.childs_map.lock();
-                let meta_table_tr = if let Some(table_tr) = childes_map.get(&meta_table_name) {
-                    //元信息表的子事务存在
-                    table_tr.clone()
-                } else {
-                    //元信息表的子事务不存在，则创建元信息表的事务，因为可能只是查询操作，所以初始化指定表的子事务为非持久化事务
-                    self.table_transaction(meta_table_name.clone(), meta_table, false, &mut *childes_map)
-                };
+                meta_table_tr = Some(self.schema_meta_transaction(meta_table_name.clone(),
+                                                                  &meta_table,
+                                                                  false,
+                                                                  &mut *childes_map)?);
+            }
+            // schema owner 已在根协议仍为 Unselected 时安装；此后才允许改变根持久化属性。
+            self.require_persistence();
 
-                if let KVDBTransaction::MetaTabTr(tr) = &meta_table_tr {
-                    if let Some(value) = tr.query(table_to_binary(&name)).await {
-                        //指定名称的表的元信息存在
-                        let table_meta = KVTableMeta::from(value);
-                        if table_meta == meta {
-                            //待创建表的名称与已存在的表相同，且元信息相同，则立即返回创建成功
-                            return Ok(());
-                        } else {
-                            //待创建表的名称与已存在的表相同，但元信息不同
-                            if table_meta.is_persistence() {
-                                match tables.get(&name).map(|registered| &registered.table) {
-                                    Some(KVDBTable::LogOrdTab(tab)) => {
-                                        if tab.len() > 0 {
-                                            //已存在的同名表是持久化表，且元信息不同，且表中有记录，则表名冲突
-                                            return Err(Error::new(ErrorKind::AlreadyExists,
-                                                                  format!("Create table failed, name: {:?}, meta: {:?}, reason: name conflict", name, meta)));
-                                        }
-                                    },
-                                    Some(KVDBTable::LogWTab(tab)) => {
-                                        if tab.len() > 0 {
-                                            //已存在的同名表是持久化表，且元信息不同，且表中有记录，则表名冲突
-                                            return Err(Error::new(ErrorKind::AlreadyExists,
-                                                                  format!("Create table failed, name: {:?}, meta: {:?}, reason: name conflict", name, meta)));
-                                        }
-                                    },
-                                    Some(KVDBTable::BtreeOrdTab(tab)) => {
-                                        if tab.len() > 0 {
-                                            //已存在的同名表是持久化表，且元信息不同，且表中有记录，则表名冲突
-                                            return Err(Error::new(ErrorKind::AlreadyExists,
-                                                                  format!("Create table failed, name: {:?}, meta: {:?}, reason: name conflict", name, meta)));
-                                        }
-                                    },
-                                    _ => (),
-                                }
+            if let Some(KVDBTransaction::MetaTabTr(tr)) = meta_table_tr.as_ref() {
+                if let Some(value) = tr.query(table_to_binary(&name)).await {
+                    //指定名称的表的元信息存在
+                    let table_meta = KVTableMeta::from(value);
+                    if table_meta == meta {
+                        //待创建表的名称与已存在的表相同，且元信息相同，则立即返回创建成功
+                        return Ok(());
+                    } else {
+                        //待创建表的名称与已存在的表相同，但元信息不同
+                        if table_meta.is_persistence() {
+                            match tables.get(&name).map(|registered| &registered.table) {
+                                Some(KVDBTable::LogOrdTab(tab)) => {
+                                    if tab.len() > 0 {
+                                        //已存在的同名表是持久化表，且元信息不同，且表中有记录，则表名冲突
+                                        return Err(Error::new(ErrorKind::AlreadyExists,
+                                                              format!("Create table failed, name: {:?}, meta: {:?}, reason: name conflict", name, meta)));
+                                    }
+                                },
+                                Some(KVDBTable::LogWTab(tab)) => {
+                                    if tab.len() > 0 {
+                                        //已存在的同名表是持久化表，且元信息不同，且表中有记录，则表名冲突
+                                        return Err(Error::new(ErrorKind::AlreadyExists,
+                                                              format!("Create table failed, name: {:?}, meta: {:?}, reason: name conflict", name, meta)));
+                                    }
+                                },
+                                Some(KVDBTable::BtreeOrdTab(tab)) => {
+                                    if tab.len() > 0 {
+                                        //已存在的同名表是持久化表，且元信息不同，且表中有记录，则表名冲突
+                                        return Err(Error::new(ErrorKind::AlreadyExists,
+                                                              format!("Create table failed, name: {:?}, meta: {:?}, reason: name conflict", name, meta)));
+                                    }
+                                },
+                                _ => (),
                             }
                         }
-                    } else {
-                        //指定名称的表的元信息不存在，则立即返回错误原因
-                        return Err(Error::new(ErrorKind::AlreadyExists,
-                                              format!("Create table failed, name: {:?}, meta: {:?}, reason: name conflict and table meta not exist", name, meta)));
                     }
                 } else {
-                    //不是元信息表事务，则立即返回错误原因
+                    //指定名称的表的元信息不存在，则立即返回错误原因
                     return Err(Error::new(ErrorKind::AlreadyExists,
-                                          format!("Create table failed, name: {:?}, meta: {:?}, reason: invalid meta table transaction", name, meta)));
+                                          format!("Create table failed, name: {:?}, meta: {:?}, reason: name conflict and table meta not exist", name, meta)));
                 }
+            } else {
+                //不是元信息表事务，则立即返回错误原因
+                return Err(Error::new(ErrorKind::AlreadyExists,
+                                      format!("Create table failed, name: {:?}, meta: {:?}, reason: invalid meta table transaction", name, meta)));
             }
         }
+
+        // 只在确实进入物理构造分支时校验类型专用 options，保持“已存在且同 meta”提前成功时
+        // 不观察 options 的既有语义。无效 options 仍使用原 ErrorKind/消息，且不会新增 schema
+        // 子节点（已存在表为完成幂等定义检查而创建的只读节点除外）。
+        let invalid_options = match meta.table_type {
+            KVDBTableType::LogOrdTab => {
+                !matches!(&options, CreateTableOptions::LogOrdTab(_, _, _))
+            },
+            KVDBTableType::BtreeOrdTab => {
+                !matches!(&options, CreateTableOptions::BtreeOrdTab(_, _))
+            },
+            _ => false,
+        };
+        if invalid_options {
+            return Err(Error::new(ErrorKind::Other,
+                                  format!("Create table failed, name: {:?}, meta: {:?}, options: {:?}, reason: invalid options",
+                                          name,
+                                          meta,
+                                          options)));
+        }
+
+        // 缺表时必须在注册新表前安装 SchemaCreate，使 child list 中 Meta WAL 永远先于新表数据。
+        // 已存在但需要替换定义时复用上面的 owner，并只在实际 upsert 前提升持久化标志。
+        let meta_table_tr = match meta_table_tr {
+            Some(table_tr) => {
+                table_tr.require_persistence();
+                table_tr
+            },
+            None => {
+                let mut childes_map = self.0.childs_map.lock();
+                self.schema_meta_transaction(meta_table_name.clone(),
+                                             &meta_table,
+                                             true,
+                                             &mut *childes_map)?
+            },
+        };
+        //创建表的 Meta 写需要进入根 WAL，因此 schema owner 安装成功后聚合根持久化标志。
+        self.require_persistence();
 
         //待创建的指定名称的表不存在，则创建指定名称的表，并将表的元信息注册到元信息表
         match meta.table_type {
@@ -3484,30 +3763,18 @@ impl<
             },
         }
 
-        //注册表的元信息
-        if let Some(meta_table) = tables.get(&meta_table_name) {
-            let mut childes_map = self.0.childs_map.lock();
-            let meta_table_tr = if let Some(table_tr) = childes_map.get(&meta_table_name) {
-                //元信息表的子事务存在，则设置子事务为需要持久化
-                table_tr.require_persistence();
-                table_tr.clone()
-            } else {
-                //元信息表的子事务不存在，则创建元信息表的事务，因为需要创建表，所以初始化元信息表的子事务为持久化事务
-                self.table_transaction(meta_table_name, meta_table, true, &mut *childes_map)
-            };
-
-            if let KVDBTransaction::MetaTabTr(tr) = &meta_table_tr {
-                if let Err(e) = tr.upsert(table_to_binary(&name),
-                                               Binary::from(meta.clone())).await {
-                    //写入表的元信息失败，则立即返回错误原因
-                    return Err(Error::new(ErrorKind::Other,
-                                          format!("Create table failed, name: {:?}, meta: {:?}, reason: {:?}", name, meta, e)));
-                }
-            } else {
-                //不是元信息表事务，则立即返回错误原因
+        // schema owner 已在物理注册前安装；这里只修改其私有 Meta 根，不再持有 childs_map。
+        if let KVDBTransaction::MetaTabTr(tr) = &meta_table_tr {
+            if let Err(e) = tr.upsert(table_to_binary(&name),
+                                      Binary::from(meta.clone())).await {
+                //写入表的元信息失败，则立即返回错误原因
                 return Err(Error::new(ErrorKind::Other,
-                                      format!("Create table failed, name: {:?}, meta: {:?}, reason: invalid meta table transaction", name, meta)));
+                                      format!("Create table failed, name: {:?}, meta: {:?}, reason: {:?}", name, meta, e)));
             }
+        } else {
+            //不是元信息表事务，则立即返回错误原因
+            return Err(Error::new(ErrorKind::Other,
+                                  format!("Create table failed, name: {:?}, meta: {:?}, reason: invalid meta table transaction", name, meta)));
         }
 
         Ok(())
@@ -3563,6 +3830,8 @@ impl<
                                 ErrorKind::InvalidData,
                                 "load multiple table metadata")?;
         }
+        self.select_ordinary_protocol("Load multiple table metadata")
+            .map_err(|error| Error::new(ErrorKind::Other, format!("{error:?}")))?;
 
         //创建表的操作，一定会创建元信息表事务，而元信息表事务是需要持久化的事务，则根事务也设置为需要持久化
         self.require_persistence();
@@ -3834,6 +4103,8 @@ impl<
     {
         // 名称来自已落地根 WAL；非法长度表示持久化数据损坏，而不是本次调用参数错误。
         validate_table_name(&name, ErrorKind::InvalidData, "repair table creation")?;
+        self.select_ordinary_protocol("Repair table creation")
+            .map_err(|error| Error::new(ErrorKind::Other, format!("{error:?}")))?;
 
         //检查待创建的指定名称的表是否存在
         let meta_table_name = Atom::from(DEFAULT_DB_TABLES_META_DIR);
@@ -3957,6 +4228,22 @@ impl<
     async fn remove_table(&self, table: Atom) -> IOResult<()> {
         // 必须先于注册表移除和 Meta tombstone 拒绝非法名称，保证 InvalidInput 无副作用。
         validate_removable_table_name(&table, ErrorKind::InvalidInput, "remove table")?;
+        // SchemaCreate 与 remove_table 的 Meta tombstone 不能在同一根中混用；必须在移除注册表
+        // 和设置持久化标志前拒绝，避免把中立建表节点转义为普通删表 owner。协议 CAS 在同一
+        // childs_map 临界区内完成，不能与版本最终安装交错。
+        {
+            let childes_map = self.0.childs_map.lock();
+            if childes_map
+                .iter()
+                .any(|(name, child)| Self::is_schema_create_child(name, child)) {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    "Remove table failed, reason: root transaction already contains schema-create actions",
+                ));
+            }
+            self.select_ordinary_protocol("Remove table")
+                .map_err(|error| Error::new(ErrorKind::InvalidInput, format!("{error:?}")))?;
+        }
 
         // 删表会持久化 Meta tombstone，因此根事务必须参与 WAL。该标记必须先于注册表移除；
         // 否则 Meta 子事务虽会异步写数据文件，根 prepare 却会丢弃子日志，commit 返回成功后
@@ -4016,6 +4303,12 @@ impl<
     #[inline]
     async fn dirty_query(&self,
                          table_kv_list: Vec<TableKV>) -> Vec<Option<Binary>> {
+        if table_kv_list.is_empty() {
+            return Vec::new();
+        }
+        if let Err(error) = self.select_ordinary_protocol("Dirty query") {
+            panic!("Dirty query failed before table access: {error:?}");
+        }
         let mut result = Vec::new();
 
         for table_kv in table_kv_list {
@@ -4074,6 +4367,12 @@ impl<
     #[inline]
     async fn query(&self,
                    table_kv_list: Vec<TableKV>) -> Vec<Option<Binary>> {
+        if table_kv_list.is_empty() {
+            return Vec::new();
+        }
+        if let Err(error) = self.select_ordinary_protocol("Query") {
+            panic!("Query failed before table access: {error:?}");
+        }
         let mut result = Vec::new();
 
         for table_kv in table_kv_list {
@@ -4132,6 +4431,10 @@ impl<
     #[inline]
     async fn dirty_upsert(&self,
                           table_kv_list: Vec<TableKV>) -> Result<(), KVTableTrError> {
+        if table_kv_list.is_empty() {
+            return Ok(());
+        }
+        self.select_ordinary_protocol("Dirty upsert")?;
         for table_kv in table_kv_list {
             if let Some(table) = self.0.db_mgr.0.tables.read().await.get(&table_kv.table) {
                 //指定名称的表存在，则获取表事务，并开始插入或更新表的指定关键字的值
@@ -4225,6 +4528,10 @@ impl<
     #[inline]
     async fn upsert(&self,
                     table_kv_list: Vec<TableKV>) -> Result<(), KVTableTrError> {
+        if table_kv_list.is_empty() {
+            return Ok(());
+        }
+        self.select_ordinary_protocol("Upsert")?;
         for table_kv in table_kv_list {
             if let Some(table) = self.0.db_mgr.0.tables.read().await.get(&table_kv.table) {
                 //指定名称的表存在，则获取表事务，并开始插入或更新表的指定关键字的值
@@ -4325,6 +4632,10 @@ impl<
     #[inline]
     async fn dirty_delete(&self,
                           table_kv_list: Vec<TableKV>) -> Result<Vec<Option<Binary>>, KVTableTrError> {
+        if table_kv_list.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.select_ordinary_protocol("Dirty delete")?;
         let mut result = Vec::new();
 
         for table_kv in table_kv_list {
@@ -4438,6 +4749,10 @@ impl<
     #[inline]
     async fn delete(&self,
                     table_kv_list: Vec<TableKV>) -> Result<Vec<Option<Binary>>, KVTableTrError> {
+        if table_kv_list.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.select_ordinary_protocol("Delete")?;
         let mut result = Vec::new();
 
         for table_kv in table_kv_list {
@@ -4555,11 +4870,12 @@ impl<
                       descending: bool) -> Option<BoxStream<'a, Binary>> {
         let table = self.0.db_mgr.0.tables.read().await.get(&table_name).cloned();
         if let Some(table) = table {
-            // childs_map 与 version_context 在同一短临界区内观察。版本树安装持有 childs_map
-            // 直到 context 可见，所以这里不可能误把已安装的版本子事务当成普通事务复用。
+            // 只有根已经选择 Ordinary 才复用同表普通子事务。Unselected 下可能已存在中立
+            // SchemaCreate Meta owner，Versioned 下则存在版本子事务；两者都必须使用 detached
+            // 快照，保证纯 iterator 不加入 2PC、不选择协议，也不误用其它 prepare mode。
             let ordinary_table_tr = {
                 let childes_map = self.0.childs_map.lock();
-                if self.0.version_context.lock().is_none() {
+                if self.protocol() == RootTransactionProtocol::Ordinary {
                     childes_map.get(&table_name).cloned()
                 } else {
                     None
@@ -4609,11 +4925,11 @@ impl<
                         descending: bool) -> Option<BoxStream<'a, (Binary, Binary)>> {
         let table = self.0.db_mgr.0.tables.read().await.get(&table_name).cloned();
         if let Some(table) = table {
-            // 与 keys 使用相同的树隔离：只复用普通子事务；纯 iterator 和版本树都使用独立
-            // 快照事务，不改变根 2PC 子节点数量或协议模式。
+            // 与 keys 使用相同的树隔离：只复用 Ordinary 子事务；中立 schema 和版本树都使用
+            // 独立快照事务，不改变根 2PC 子节点数量或协议模式。
             let ordinary_table_tr = {
                 let childes_map = self.0.childs_map.lock();
-                if self.0.version_context.lock().is_none() {
+                if self.protocol() == RootTransactionProtocol::Ordinary {
                     childes_map.get(&table_name).cloned()
                 } else {
                     None
@@ -4660,6 +4976,7 @@ impl<
     async fn lock_key(&self,
                       table_name: Atom,
                       key: Binary) -> Result<(), KVTableTrError> {
+        self.select_ordinary_protocol("Lock table key")?;
         if let Some(table) = self.0.db_mgr.0.tables.read().await.get(&table_name) {
             //指定名称的表存在，则获取表事务，并开始锁住指定表的指定关键字
             let mut childes_map = self.0.childs_map.lock();
@@ -4708,6 +5025,7 @@ impl<
     async fn unlock_key(&self,
                         table_name: Atom,
                         key: Binary) -> Result<(), KVTableTrError> {
+        self.select_ordinary_protocol("Unlock table key")?;
         if let Some(table) = self.0.db_mgr.0.tables.read().await.get(&table_name) {
             //指定名称的表存在，则获取表事务，并开始解锁指定表的指定关键字
             let mut childes_map = self.0.childs_map.lock();
@@ -4763,10 +5081,9 @@ impl<
         }
         validate_prepare_with_version_inputs(&read_set, &write_set)?;
 
-        // 版本协议只能选择一棵尚未安装任何 2PC 子节点的根事务树。创建根句柄时协议仍是
-        // Neutral；普通 query/upsert/delete/DDL 首次触表后树即为 Ordinary。纯 iterator 不在
-        // 两个容器中注册，因此不影响选择。这里先做无共享副作用的快检，避免协议误用仍去
-        // 租用表版本快照；安装前还会在同一固定锁序下复检，封闭并发装配窗口。
+        // 版本协议只能选择 Unselected 根；容器允许为空，或只包含公开 create 建立的唯一
+        // SchemaCreate Meta 节点。纯 iterator 不注册，因此不影响选择。这里先做无共享副作用
+        // 快检，避免协议误用仍去租用表版本快照；最终安装还会在固定锁序下复检并 CAS。
         {
             let childes_map = self.0.childs_map.lock();
             let childes = self.0.childs.lock();
@@ -4776,10 +5093,12 @@ impl<
                     format!("Prepare with version failed, reason: inconsistent root child containers, map_len: {}, list_len: {}",
                             childes_map.len(), childes.len())));
             }
-            if !childes_map.is_empty() || self.0.version_context.lock().is_some() {
+            if self.protocol() != RootTransactionProtocol::Unselected
+                || !Self::contains_only_schema_create_child(&childes_map, childes.len())
+                || self.0.version_context.lock().is_some() {
                 return Err(KVTableTrError::new_transaction_error(
                     ErrorLevel::Normal,
-                    "Prepare with version failed, reason: root transaction already contains ordinary or version 2PC children"));
+                    "Prepare with version failed, reason: root transaction already selected a business protocol or contains non-schema 2PC children"));
             }
         }
 
@@ -4902,8 +5221,8 @@ impl<
 
         // 子事务构造可能锁各表数据根并租用版本快照，所以必须发生在根锁之外。安装阶段只做
         // HashMap/VecDeque/Option 的内存操作，固定锁序为 childs_map -> childs ->
-        // version_context，锁内没有 await、I/O、publication/table 锁或回调。context 在释放
-        // childs_map 前可见，保证后续普通子事务构造只能观察到完整版本树并 fail-fast。
+        // version_context，锁内没有 await、I/O、publication/table 锁或回调。协议 CAS、全部
+        // 版本节点和 context 在释放 childs_map 前同时可见，后续普通动作只能 fail-fast。
         {
             let mut childes_map = self.0.childs_map.lock();
             let mut childes = self.0.childs.lock();
@@ -4914,11 +5233,21 @@ impl<
                     format!("Prepare with version failed, reason: inconsistent root child containers during install, map_len: {}, list_len: {}",
                             childes_map.len(), childes.len())));
             }
-            if !childes_map.is_empty() || context.is_some() {
+            if !Self::contains_only_schema_create_child(&childes_map, childes.len())
+                || context.is_some() {
                 return Err(KVTableTrError::new_transaction_error(
                     ErrorLevel::Normal,
                     "Prepare with version failed, reason: root transaction protocol changed during version child assembly"));
             }
+            if let Some((name, _)) = children
+                .iter()
+                .find(|(name, _)| childes_map.contains_key(name)) {
+                return Err(KVTableTrError::new_transaction_error(
+                    ErrorLevel::Normal,
+                    format!("Prepare with version failed, table: {:?}, reason: version input collides with existing schema transaction owner",
+                            name.as_str())));
+            }
+            self.select_versioned_protocol()?;
             for (name, table_tr) in children {
                 childes_map.insert(name, table_tr.clone());
                 childes.join(table_tr);
@@ -4957,6 +5286,7 @@ impl<
     /// 异步预提交本次事务对键值对数据库的所有修改，成功返回预提交的输出
     #[inline]
     async fn prepare_modified(&self) -> Result<Vec<u8>, KVTableTrError> {
+        self.select_ordinary_protocol("Prepare modified")?;
         if self.get_status() != Transaction2PcStatus::Rollbacked {
             //本次事务的当前状态只要不为回滚成功，则先初始化键值对数据库的根事务
             if let Err(e) = self
@@ -5011,6 +5341,7 @@ impl<
     /// 异步预提交本次事务对键值对数据库的所有修改，成功返回预提交的输出，失败返回预提交冲突的首个表名和关键字
     #[inline]
     async fn prepare_modified_conflicts(&self) -> Result<Vec<u8>, KVTableTrError> {
+        self.select_ordinary_protocol("Prepare modified conflicts")?;
         if self.get_status() != Transaction2PcStatus::Rollbacked {
             //本次事务的当前状态只要不为回滚成功，则先初始化键值对数据库的根事务
             if let Err(e) = self
@@ -5065,6 +5396,11 @@ impl<
     /// 异步提交本次事务对键值对数据库的所有修改
     #[inline]
     async fn commit_modified(&self, prepare_output: Vec<u8>) -> Result<(), KVTableTrError> {
+        if self.protocol() != RootTransactionProtocol::Ordinary {
+            return Err(KVTableTrError::new_transaction_error(
+                ErrorLevel::Normal,
+                "Commit modified failed, reason: root transaction did not select ordinary protocol"));
+        }
         self.commit_core(prepare_output).await
     }
 
@@ -5072,6 +5408,11 @@ impl<
     async fn commit_with_version(&self,
                                  prepare_output: Vec<u8>)
         -> Result<Vec<TableKeyVersion>, KVTableTrError> {
+        if self.protocol() != RootTransactionProtocol::Versioned {
+            return Err(KVTableTrError::new_transaction_error(
+                ErrorLevel::Normal,
+                "Commit with version failed, reason: root transaction did not select version protocol"));
+        }
         let context = self
             .0
             .version_context
@@ -5357,6 +5698,7 @@ struct InnerRootTransaction<
     cid:                SpinLock<Option<Guid>>,                             //事务提交唯一id
     status:             SpinLock<Transaction2PcStatus>,                     //事务状态
     writable:           bool,                                               //事务是否可写
+    protocol:           AtomicU8,                                           //根业务协议，SchemaCreate 不单独选择模式
     persistence:        AtomicBool,                                         //事务是否持久化
     prepare_timeout:    u64,                                                //事务预提交超时时长，单位毫秒
     commit_timeout:     u64,                                                //事务提交超时时长，单位毫秒

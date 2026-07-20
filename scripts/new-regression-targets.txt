@@ -1,0 +1,29 @@
+# 新回归 integration target 及可选 exact 测试名。
+# `-` 表示运行该 target 中全部非 ignored 测试；本清单永久排除 tests/test.rs。
+btree_delete_old_value -
+btree_redb_prepare_baseline -
+commit_confirmation_contract -
+commit_confirmation_real_environment -
+core_types_contract -
+ddl_remove_crash_durability -
+ddl_reserved_meta_safety -
+empty_wal_commit -
+iterator_snapshot_safety -
+key_version_api_contract -
+key_version_btree_empty_query -
+key_version_btree_restart_consistency -
+key_version_concurrency_safety -
+key_version_conflict_real -
+key_version_iterator_protocol_isolation -
+key_version_publication_real -
+key_version_snapshot_lifecycle -
+key_version_ttl_early_expiry -
+key_version_ttl_index -
+kv_action_contract -
+manager_contract -
+prepare_conflict_regression test_prepare_conflict_active_tables
+root_transaction_lifecycle -
+schema_protocol_neutral -
+schema_protocol_recovery -
+table_name_contract -
+utils_contract -

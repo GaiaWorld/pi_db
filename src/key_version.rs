@@ -854,6 +854,12 @@ impl Drop for SnapshotLease {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PrepareMode {
     Ordinary,
+    /// 公开建表 API 在根协议选择前登记的内部 Meta 动作。
+    ///
+    /// 该模式可随之后选择的 Ordinary 或 Versioned 根一起 prepare/commit，但自身不属于业务
+    /// 协议，也不产生公开版本回执。它必须使用与 Versioned 相同的严格 Key 冲突规则，防止
+    /// 并发 DDL 被 Ordinary DirtyWrite 的放宽语义穿透。
+    SchemaCreate,
     Versioned,
 }
 
@@ -928,9 +934,10 @@ impl VersionReceipt {
 
 /// 一个由 `KVDBManager` 装配的表事务所需的版本协议上下文。
 ///
-/// `versions` 绑定精确表实例；`snapshot` 固定事务创建时 revision；`expected` 是外部真实读缓存
-/// 提交的显式版本；`mode` 决定 prepare 预留兼容矩阵；`receipt` 只在版本 API 族存在。上下文随
-/// 表事务 Arc 存活，显式终结遗漏时 SnapshotLease 的 Drop 仍负责最终资源释放。
+/// `versions` 绑定精确表实例；`snapshot` 固定事务创建时 revision；Versioned 的 `expected` 是
+/// 外部真实读缓存提交的显式版本，SchemaCreate 固定为空；`mode` 决定 prepare 预留兼容矩阵；
+/// `receipt` 只在需要返回业务写版本的 Versioned 子事务中存在，内部 schema 固定为 None。
+/// 上下文随表事务 Arc 存活，显式终结遗漏时 SnapshotLease 的 Drop 仍负责最终资源释放。
 pub(crate) struct TableVersionContext {
     versions: KeyVersions,
     snapshot: SnapshotLease,
@@ -984,7 +991,7 @@ pub(crate) fn prepared_actions_conflict(existing_mode: PrepareMode,
                                          existing: &KVActionLog,
                                          current_mode: PrepareMode,
                                          current: &KVActionLog) -> bool {
-    if existing_mode == PrepareMode::Versioned || current_mode == PrepareMode::Versioned {
+    if existing_mode != PrepareMode::Ordinary || current_mode != PrepareMode::Ordinary {
         return !matches!((existing, current), (KVActionLog::Read, KVActionLog::Read));
     }
 
@@ -1045,7 +1052,40 @@ mod tests {
                 deadline_tick,
                 duration_to_ticks,
                 has_prepared_transaction,
+                prepared_actions_conflict,
                 take_prepared_for_commit};
+
+    /// SchemaCreate 和 Versioned 都必须使用严格矩阵；Ordinary 的既有 dirty 写放宽保持不变。
+    #[test]
+    fn test_schema_create_uses_strict_prepared_conflict_matrix() {
+        let read = KVActionLog::Read;
+        let write = KVActionLog::Write(Some(binary_from_u32(1)));
+        let dirty_write = KVActionLog::DirtyWrite(Some(binary_from_u32(2)));
+
+        for strict_mode in [PrepareMode::SchemaCreate, PrepareMode::Versioned] {
+            assert!(!prepared_actions_conflict(strict_mode,
+                                               &read,
+                                               PrepareMode::Ordinary,
+                                               &read));
+            assert!(prepared_actions_conflict(strict_mode,
+                                              &read,
+                                              PrepareMode::Ordinary,
+                                              &write));
+            assert!(prepared_actions_conflict(PrepareMode::Ordinary,
+                                              &dirty_write,
+                                              strict_mode,
+                                              &write));
+            assert!(prepared_actions_conflict(strict_mode,
+                                              &write,
+                                              PrepareMode::Ordinary,
+                                              &dirty_write));
+        }
+
+        assert!(!prepared_actions_conflict(PrepareMode::Ordinary,
+                                           &dirty_write,
+                                           PrepareMode::Ordinary,
+                                           &write));
+    }
 
     /// 重复根 TID 检查必须精确区分已登记和未登记项，且不得修改既有冻结动作。
     #[test]

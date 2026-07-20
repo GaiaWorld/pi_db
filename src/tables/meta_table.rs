@@ -197,7 +197,11 @@ impl<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>,
 > MetaTable<C, Log> {
-    /// 在不创建事务的前提下读取当前已提交 COW 根；调用方负责 publication 同步。
+    /// 在不创建事务的前提下点读当前已提交 COW 根。
+    ///
+    /// 单独读取 value 只需本方法内部的 root mutex，可得到调用瞬间旧或新但自洽的值；需要把
+    /// value 与 Key 版本原子配对的 `query_with_version` 仍必须由调用方持有 publication read。
+    /// 本方法不登记事务动作、不租用 snapshot、不执行 I/O。
     pub(crate) fn query_committed(&self, key: &Binary) -> Option<Binary> {
         self.0.root.lock().get(key).cloned()
     }
@@ -956,6 +960,19 @@ impl<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>,
 > MetaTabTr<C, Log> {
+    /// 返回 manager 装配的 prepare 模式，供根事务验证 schema/业务子树结构。
+    ///
+    /// 非 managed 内部事务没有版本上下文，继续视为 Ordinary。该只读操作不加锁、不修改
+    /// snapshot lease，也不暴露给库外调用方。
+    pub(crate) fn prepare_mode(&self) -> PrepareMode {
+        self
+            .0
+            .version_context
+            .as_ref()
+            .map(TableVersionContext::mode)
+            .unwrap_or(PrepareMode::Ordinary)
+    }
+
     // 构建一个元信息表事务
     #[inline]
     fn new(source: Atom,

@@ -22,8 +22,8 @@ rollback/finish`。`prepare_len` 和 `commit_len` 只表示当前正在运行的
 不写 WAL，仍会执行完整子表 commit。
 
 显式只读事务不需要 commit 回调。可写事务即使只有读动作、prepare 输出为空，也必须执行完整
-事务树 commit，以释放 prepare 阶段建立的读预留；空输出只会跳过 WAL append/flush。建表和删表
-应各自使用独立根事务，不与业务表读写混用，创建成功后再用新事务操作该表。
+事务树 commit，以释放 prepare 阶段建立的读预留；空输出只会跳过 WAL append/flush。删表仍应
+使用独立普通根事务，不能与同根建表前导或版本事务混用。
 
 当前事务安全保证以根 WAL append/flush 能在健康存储和可用 runtime 上完成为环境前提。根 WAL
 自身因磁盘空间/配额不足、只读或故障文件系统、设备 I/O、runtime 拒绝任务、文件大小限制而失败
@@ -32,6 +32,24 @@ rollback/finish`。`prepare_len` 和 `commit_len` 只表示当前正在运行的
 这些阶段外情形中证明 WAL 完全没有落盘。该边界不是空 WAL：空 prepare 输出会直接跳过物理 WAL
 写入。根 WAL 已成功后发生的子表数据文件持久化失败仍保留未确认 WAL，并继续适用既有启动恢复
 语义。
+
+### 协议中立建表前导
+
+一个全新的可写根事务在选择业务协议前，可以先调用 `table_meta` 检查定义，并在缺表时调用
+`create_table/create_table_with_options`；随后可以在同一根事务中操作新表并二选一进入普通 2PC
+或 `prepare_with_version/commit_with_version`。纯 `keys/values` 流和空动作也不会选择业务协议。
+建表必须先于任何非空普通/dirty KV、`remove_table`、普通 prepare 或版本 prepare；普通和版本
+业务 API 仍禁止在同一事务树中混用。
+
+`table_meta` 是协议中立点读，不登记普通 Read，也不加入版本 read-set。`create_table*` 使用内部
+唯一的 Schema Meta 子事务，参与同一根 TID、冲突、WAL、commit、异步确认、rollback prepared
+清理和 Key 版本发布，但不会出现在 `commit_with_version` 返回的业务 `TableKeyVersion` 中。
+`table_meta` 本身也可在尚未 prepare 的普通事务中读取当前 Meta 私有/已提交视图；它不因此改变
+根协议。外部不得通过普通或版本 KV API 直接读写/删除内部 `.tables_meta`。
+
+建表成功返回不等于事务提交；调用方仍须完成所选 2PC。当前 DDL 尚不具完整 rollback/取消
+原子性，prepare 失败、rollback 或取消后，进程 registry、目录或文件可能已经存在；本能力不提供
+补偿删除或同根事务重试。
 
 ### 迭代器快照
 
