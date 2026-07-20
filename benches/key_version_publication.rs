@@ -4,7 +4,8 @@
 //! 本文件成对测量 Meta、持久化 Memory 和 Btree：普通协议以 1/16/256 个 Key 执行
 //! `upsert -> prepare_modified_conflicts -> commit_modified`；版本协议对同规模 Key 执行
 //! `query_with_version -> prepare_with_version -> commit_with_version`。Memory 另测量幂等建表前导
-//! 后的版本提交，以量化协议中立 Schema 子节点的固定成本；三类表另有稳定 cache-hit qwv。
+//! 后的版本提交，以量化协议中立 Schema 子节点的固定成本；三类表另有稳定 cache-hit qwv，
+//! 并单独测量根事务对象创建和最终 Drop。
 //! 数据库、4-worker runtime、事务管理器、根 `CommitLogger`、redb 和临时文件系统均为真实组件；
 //! 数据库启动、首次 DDL 和热读基线写入位于采样区间之外。
 //!
@@ -139,6 +140,20 @@ schema_version_benchmark!(bench_schema_version_memory_16_keys, 16);
 query_benchmark!(bench_qwv_meta_cached, BenchTable::Meta);
 query_benchmark!(bench_qwv_memory_cached, BenchTable::Memory);
 query_benchmark!(bench_qwv_btree_overlay_cached, BenchTable::Btree);
+
+/// 测量只读根事务对象的完整构造和最终 owner Drop，不进入 prepare/manager/WAL 路径。
+#[bench]
+fn bench_root_transaction_create_drop(b: &mut Bencher) {
+    let _time_loop = startup_global_time_loop(10);
+    let fixture = Fixture::new(BenchTable::Memory, 1);
+    b.iter(|| {
+        let transaction = fixture
+            .db
+            .transaction(fixture.source.clone(), false, 10_000, 10_000)
+            .expect("root transaction benchmark must create a transaction");
+        black_box(transaction);
+    });
+}
 
 /// 保持数据库、runtime 和临时目录在一次基准的全部采样期间存活。
 struct Fixture {

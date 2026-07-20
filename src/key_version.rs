@@ -9,6 +9,8 @@ use std::io::{Error, ErrorKind, Result as IOResult};
 use std::mem;
 use std::sync::{Arc, Weak,
                 atomic::{AtomicBool, AtomicU64, Ordering}};
+#[cfg(feature = "trace")]
+use std::sync::atomic::AtomicUsize;
 use std::time::{Duration, Instant};
 
 use async_channel::{Receiver, Sender, bounded};
@@ -164,12 +166,93 @@ fn timeout_ticks(ticks: u64) -> usize {
 #[derive(Clone)]
 pub(crate) struct KeyVersionRegistry(Arc<InnerKeyVersionRegistry>);
 
+/// trace 构建中公开版本 API 的固定低基数操作种类。
+#[cfg(feature = "trace")]
+#[derive(Clone, Copy)]
+pub(crate) enum KeyVersionApiOperation {
+    Query,
+    Prepare,
+    Commit,
+}
+
+/// tracing loop 一次读取的版本 API 累计计数快照。
+#[cfg(feature = "trace")]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub(crate) struct KeyVersionApiMetricsSnapshot {
+    pub(crate) query_success: u64,
+    pub(crate) query_failure: u64,
+    pub(crate) prepare_success: u64,
+    pub(crate) prepare_failure: u64,
+    pub(crate) commit_success: u64,
+    pub(crate) commit_failure: u64,
+}
+
+#[cfg(feature = "trace")]
+impl KeyVersionApiMetricsSnapshot {
+    /// 计算两次累计快照之间的 Counter 增量；wrapping 使单次 u64 回绕仍保持模运算正确。
+    pub(crate) fn delta_since(self, previous: Self) -> Self {
+        Self {
+            query_success: self.query_success.wrapping_sub(previous.query_success),
+            query_failure: self.query_failure.wrapping_sub(previous.query_failure),
+            prepare_success: self.prepare_success.wrapping_sub(previous.prepare_success),
+            prepare_failure: self.prepare_failure.wrapping_sub(previous.prepare_failure),
+            commit_success: self.commit_success.wrapping_sub(previous.commit_success),
+            commit_failure: self.commit_failure.wrapping_sub(previous.commit_failure),
+        }
+    }
+}
+
+/// 每个合法版本 API 调用只向 success/failure 中一个原子提交一次结果。
+///
+/// guard 不持有 registry owner 或任何锁；未显式完成即表示 future 被取消或发生 unwind，Drop
+/// 将其归入 failure。指标是旁路观测，不参与 API 错误和事务状态判断。
+#[cfg(feature = "trace")]
+pub(crate) struct KeyVersionApiCallGuard<'a> {
+    success: &'a AtomicU64,
+    failure: &'a AtomicU64,
+    completed: bool,
+}
+
+#[cfg(feature = "trace")]
+impl KeyVersionApiCallGuard<'_> {
+    pub(crate) fn finish(mut self, success: bool) {
+        self.completed = true;
+        if success {
+            self.success.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.failure.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+#[cfg(feature = "trace")]
+impl Drop for KeyVersionApiCallGuard<'_> {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.failure.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+#[cfg(feature = "trace")]
+#[derive(Default)]
+struct KeyVersionApiMetrics {
+    query_success: AtomicU64,
+    query_failure: AtomicU64,
+    prepare_success: AtomicU64,
+    prepare_failure: AtomicU64,
+    commit_success: AtomicU64,
+    commit_failure: AtomicU64,
+}
+
 struct InnerKeyVersionRegistry {
     tables: DashMap<Atom, KeyVersions>,
     ttl_ticks: Option<u64>,
     poll_interval_ticks: u64,
     origin: Instant,
     shutdown_tx: Option<Sender<()>>,
+    #[cfg(feature = "trace")]
+    api_metrics: KeyVersionApiMetrics,
 }
 
 impl KeyVersionRegistry {
@@ -186,6 +269,8 @@ impl KeyVersionRegistry {
             poll_interval_ticks: config.poll_interval_ticks(),
             origin: Instant::now(),
             shutdown_tx,
+            #[cfg(feature = "trace")]
+            api_metrics: KeyVersionApiMetrics::default(),
         };
         (Self(Arc::new(inner)), shutdown_rx)
     }
@@ -203,6 +288,44 @@ impl KeyVersionRegistry {
             .0
             .tables
             .remove_if(table, |_name, current| current.ptr_eq(versions));
+    }
+
+    /// 创建一次公开版本 API 结果 guard；只在 trace 构建中存在且不获取任何锁。
+    #[cfg(feature = "trace")]
+    pub(crate) fn begin_api_call(&self,
+                                 operation: KeyVersionApiOperation)
+        -> KeyVersionApiCallGuard<'_> {
+        let metrics = &self.0.api_metrics;
+        let (success, failure) = match operation {
+            KeyVersionApiOperation::Query => {
+                (&metrics.query_success, &metrics.query_failure)
+            },
+            KeyVersionApiOperation::Prepare => {
+                (&metrics.prepare_success, &metrics.prepare_failure)
+            },
+            KeyVersionApiOperation::Commit => {
+                (&metrics.commit_success, &metrics.commit_failure)
+            },
+        };
+        KeyVersionApiCallGuard {
+            success,
+            failure,
+            completed: false,
+        }
+    }
+
+    /// 原子读取当前累计 API 计数；不同字段是最终收敛的观测值，不构成事务型成对快照。
+    #[cfg(feature = "trace")]
+    pub(crate) fn api_metrics_snapshot(&self) -> KeyVersionApiMetricsSnapshot {
+        let metrics = &self.0.api_metrics;
+        KeyVersionApiMetricsSnapshot {
+            query_success: metrics.query_success.load(Ordering::Relaxed),
+            query_failure: metrics.query_failure.load(Ordering::Relaxed),
+            prepare_success: metrics.prepare_success.load(Ordering::Relaxed),
+            prepare_failure: metrics.prepare_failure.load(Ordering::Relaxed),
+            commit_success: metrics.commit_success.load(Ordering::Relaxed),
+            commit_failure: metrics.commit_failure.load(Ordering::Relaxed),
+        }
     }
 
     /// 修复完成后清空外部不可见的恢复期版本记录，但保留单调 revision。
@@ -450,8 +573,46 @@ impl TtlKeyIndex {
     }
 }
 
+/// 估算一个活动版本记录可归属于版本缓存的动态字节数。
+///
+/// 该 O(1) 公式使用 Key 的实际 Vec capacity，并计算 Map 逻辑 entry、Arc<Vec> 控制字段及
+/// TTL 开启时的 FIFO owner/slot 状态。它不读取 DashMap capacity，也不声称包含 allocator、
+/// shard 空闲 bucket 或 channel 空闲 block；完整口径见
+/// `docs/KEY_VERSION_CACHE_METRICS_DESIGN.md#key-version-metrics-memory`。
+#[cfg(feature = "trace")]
+fn estimated_record_memory_bytes(key: &Binary, ttl_enabled: bool) -> u64 {
+    let map_entry = mem::size_of::<(Binary, VersionRecord)>();
+    let arc_vec = mem::size_of::<AtomicUsize>()
+        .saturating_mul(2)
+        .saturating_add(mem::size_of::<Vec<u8>>())
+        .saturating_add(key.0.capacity());
+    let ttl_slot = if ttl_enabled {
+        mem::size_of::<(Binary, AtomicUsize)>()
+    } else {
+        0
+    };
+    map_entry
+        .saturating_add(arc_vec)
+        .saturating_add(ttl_slot) as u64
+}
+
 #[derive(Clone)]
 pub(crate) struct KeyVersions(Arc<InnerKeyVersions>);
+
+/// tracing loop 一次读取的每表版本缓存状态。
+#[cfg(feature = "trace")]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub(crate) struct KeyVersionCacheMetricsSnapshot {
+    pub(crate) record_count: u64,
+    pub(crate) estimated_memory_bytes: u64,
+}
+
+#[cfg(feature = "trace")]
+#[derive(Default)]
+struct KeyVersionCacheMetrics {
+    record_count: AtomicU64,
+    estimated_memory_bytes: AtomicU64,
+}
 
 /// 单个已注册表实例的版本状态。
 ///
@@ -473,6 +634,8 @@ struct InnerKeyVersions {
     has_blocked_expiry: AtomicBool,
     blocked_lease_epoch: AtomicU64,
     registry: Weak<InnerKeyVersionRegistry>,
+    #[cfg(feature = "trace")]
+    metrics: KeyVersionCacheMetrics,
 }
 
 impl KeyVersions {
@@ -488,6 +651,8 @@ impl KeyVersions {
             has_blocked_expiry: AtomicBool::new(false),
             blocked_lease_epoch: AtomicU64::new(0),
             registry,
+            #[cfg(feature = "trace")]
+            metrics: KeyVersionCacheMetrics::default(),
         }))
     }
 
@@ -513,6 +678,45 @@ impl KeyVersions {
             .versions
             .get(key)
             .map(|record| record.version.clone())
+    }
+
+    /// 返回无锁、O(1) 的 trace 指标快照；不得把该观测值用于事务或 TTL 正确性判断。
+    #[cfg(feature = "trace")]
+    pub(crate) fn metrics_snapshot(&self) -> KeyVersionCacheMetricsSnapshot {
+        KeyVersionCacheMetricsSnapshot {
+            record_count: self.0.metrics.record_count.load(Ordering::Relaxed),
+            estimated_memory_bytes: self
+                .0
+                .metrics
+                .estimated_memory_bytes
+                .load(Ordering::Relaxed),
+        }
+    }
+
+    /// 只在持有 Vacant entry、确定即将新增结构记录时调用；已有 Key 替换不改变容量指标。
+    /// 调用必须先于 entry guard 释放，使 TTL 不可能在指标建立前看到并删除该记录。
+    #[cfg(feature = "trace")]
+    fn record_inserted(&self, estimated_memory_bytes: u64) {
+        self.0
+            .metrics
+            .estimated_memory_bytes
+            .fetch_add(estimated_memory_bytes, Ordering::Relaxed);
+        self.0.metrics.record_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 只在 exact-remove 确实移除结构记录后调用，与首次插入严格一一配平。
+    #[cfg(feature = "trace")]
+    fn record_removed(&self, estimated_memory_bytes: u64) {
+        let old_count = self.0.metrics.record_count.fetch_sub(1, Ordering::Relaxed);
+        let old_memory = self
+            .0
+            .metrics
+            .estimated_memory_bytes
+            .fetch_sub(estimated_memory_bytes, Ordering::Relaxed);
+        debug_assert!(old_count >= 1,
+                      "key version metric record count underflow");
+        debug_assert!(old_memory >= estimated_memory_bytes,
+                      "key version metric estimated memory underflow");
     }
 
     /// 返回当前逻辑值对应的现有版本，或为首次观察原子创建一个版本。
@@ -551,7 +755,14 @@ impl KeyVersions {
                 } else {
                     Some(entry.key().clone())
                 };
-                // 必须先释放 DashMap entry guard，再执行索引操作；scanner 也从不反向重叠两者。
+                #[cfg(feature = "trace")]
+                let estimated_memory_bytes = estimated_record_memory_bytes(
+                    entry.key(),
+                    deadline != NO_DEADLINE);
+                // 指标必须在记录对 TTL scanner 可见前建立，否则 scanner 可能先删除并递减尚未
+                // 增加的计数。原子更新不取锁；FIFO 操作仍必须等 entry guard 释放后执行。
+                #[cfg(feature = "trace")]
+                self.record_inserted(estimated_memory_bytes);
                 drop(entry.insert(record));
                 if let Some(ttl_key) = ttl_key {
                     self.0.ttl_keys.push(ttl_key);
@@ -648,16 +859,37 @@ impl KeyVersions {
             .get(&key)
             .map(|record| record.generation.saturating_add(1))
             .unwrap_or(1);
-        let inserted = self.0.versions.insert(key.clone(), VersionRecord {
+        let record = VersionRecord {
             version: version.clone(),
             source: VersionSource::CommittedWrite,
             revision,
             deadline_tick: deadline,
             generation,
-        }).is_none();
+        };
+        // 默认构建保留原始 DashMap::insert 路径，不为指标改变业务代码。trace 构建使用等价
+        // entry 更新，只让 Vacant 记录在释放同 Key 分片 guard 前建立指标，使 TTL exact-remove
+        // 不可能先于指标递增；Occupied 更新不触碰容量原子或既有 Key allocation。
+        #[cfg(not(feature = "trace"))]
+        let inserted = self.0.versions.insert(key.clone(), record).is_none();
+        #[cfg(feature = "trace")]
+        let inserted = match self.0.versions.entry(key.clone()) {
+            Entry::Occupied(mut entry) => {
+                entry.insert(record);
+                false
+            },
+            Entry::Vacant(entry) => {
+                self.record_inserted(estimated_record_memory_bytes(
+                    entry.key(),
+                    deadline != NO_DEADLINE));
+                drop(entry.insert(record));
+                true
+            },
+        };
         // 已有 Key 的唯一 token 可能正在 scanner 本地批次中；只有首次插入才创建新 token。
-        if inserted && deadline != NO_DEADLINE {
-            self.0.ttl_keys.push(key.clone());
+        if inserted {
+            if deadline != NO_DEADLINE {
+                self.0.ttl_keys.push(key.clone());
+            }
         }
         self.register_deadline(deadline);
         TableKeyVersion {
@@ -668,10 +900,19 @@ impl KeyVersions {
     }
 
     pub(crate) fn clear_records(&self) {
-        // 恢复期清理发生在 TTL task 启动前。先清索引再清 Map，即使未来出现并发插入也只可能
-        // 留下可自清理的 stale token，不会留下没有 token 的活动记录。
+        // 该入口只允许在 repair 完成、外部事务尚不可创建且 TTL task 尚未启动的静默启动期调用。
+        // 先清索引再清 Map，随后把旁路指标归零；若未来放宽为并发调用，必须重新设计 Map/指标
+        // 的原子清空协议，不能直接复用当前实现。
         self.0.ttl_keys.clear();
         self.0.versions.clear();
+        #[cfg(feature = "trace")]
+        {
+            self.0.metrics.record_count.store(0, Ordering::Relaxed);
+            self.0
+                .metrics
+                .estimated_memory_bytes
+                .store(0, Ordering::Relaxed);
+        }
         self.0.earliest_deadline.store(NO_DEADLINE, Ordering::Release);
         self.0.has_blocked_expiry.store(false, Ordering::Release);
         self.0.blocked_lease_epoch.store(
@@ -756,6 +997,12 @@ impl KeyVersions {
                     .versions
                     .remove_if(&key, |_key, current| current.exact_eq(&candidate));
                 if removed.is_some() {
+                    #[cfg(feature = "trace")]
+                    if let Some((removed_key, removed_record)) = removed.as_ref() {
+                        self.record_removed(estimated_record_memory_bytes(
+                            removed_key,
+                            removed_record.deadline_tick != NO_DEADLINE));
+                    }
                     statistics.removed_records += 1;
                     match candidate.source {
                         VersionSource::FirstObservation => {
@@ -1054,6 +1301,11 @@ mod tests {
                 has_prepared_transaction,
                 prepared_actions_conflict,
                 take_prepared_for_commit};
+    #[cfg(feature = "trace")]
+    use super::{KeyVersionApiMetricsSnapshot,
+                KeyVersionApiOperation,
+                NO_DEADLINE,
+                estimated_record_memory_bytes};
 
     /// SchemaCreate 和 Versioned 都必须使用严格矩阵；Ordinary 的既有 dirty 写放宽保持不变。
     #[test]
@@ -1370,12 +1622,201 @@ mod tests {
         assert_eq!(versions.checked_next_revision(), None);
     }
 
+    /// 估值必须使用 payload capacity 而不是 len，并且 TTL 只增加一个 FIFO owner/slot。
+    #[cfg(feature = "trace")]
+    #[test]
+    fn test_trace_record_memory_estimate_uses_capacity_and_ttl_owner() {
+        let small = binary_with_capacity(1, 32);
+        let large = binary_with_capacity(1, 256);
+        let small_without_ttl = estimated_record_memory_bytes(&small, false);
+        let large_without_ttl = estimated_record_memory_bytes(&large, false);
+        let large_with_ttl = estimated_record_memory_bytes(&large, true);
+
+        assert_eq!(large_without_ttl - small_without_ttl,
+                   (large.0.capacity() - small.0.capacity()) as u64);
+        assert_eq!(large_with_ttl - large_without_ttl,
+                   std::mem::size_of::<(Binary, std::sync::atomic::AtomicUsize)>() as u64);
+    }
+
+    /// 只有 Map 结构新增/删除改变容量指标；命中和已有 Key 的版本替换不得重复累计。
+    #[cfg(feature = "trace")]
+    #[test]
+    fn test_trace_cache_metrics_track_insert_replace_remove_and_clear() {
+        let config = KeyVersionConfig::new(Duration::from_secs(1),
+                                           Duration::from_millis(10)).unwrap();
+        let (registry, _shutdown) = KeyVersionRegistry::new(config);
+        let versions = registry.create_table_versions();
+        let first_key = binary_with_capacity(11, 64);
+        let second_key = binary_with_capacity(22, 128);
+        let value = binary_from_u32(99);
+        let first_bytes = estimated_record_memory_bytes(&first_key, true);
+        let second_bytes = estimated_record_memory_bytes(&second_key, true);
+
+        assert_eq!(versions.metrics_snapshot(), Default::default());
+        let first_version = versions.first_observation(first_key.clone(), false, || Guid(1));
+        assert_eq!(versions.metrics_snapshot(), super::KeyVersionCacheMetricsSnapshot {
+            record_count: 1,
+            estimated_memory_bytes: first_bytes,
+        });
+        assert_eq!(versions.first_observation(first_key.clone(), false, || {
+            panic!("cache hit must not allocate a new Guid")
+        }), first_version);
+        assert_eq!(versions.metrics_snapshot().record_count, 1);
+
+        let _ = versions.publish(Atom::from("trace-metrics"),
+                                 first_key.clone(),
+                                 Some(&value),
+                                 Guid(2),
+                                 1);
+        assert_eq!(versions.metrics_snapshot(), super::KeyVersionCacheMetricsSnapshot {
+            record_count: 1,
+            estimated_memory_bytes: first_bytes,
+        });
+        let _ = versions.publish(Atom::from("trace-metrics"),
+                                 second_key.clone(),
+                                 None,
+                                 Guid(3),
+                                 2);
+        assert_eq!(versions.metrics_snapshot(), super::KeyVersionCacheMetricsSnapshot {
+            record_count: 2,
+            estimated_memory_bytes: first_bytes + second_bytes,
+        });
+
+        let candidate = versions.current(&first_key).unwrap();
+        let removed = versions
+            .0
+            .versions
+            .remove_if(&first_key, |_key, current| current.exact_eq(&candidate))
+            .expect("exact current record must be removable");
+        versions.record_removed(estimated_record_memory_bytes(
+            &removed.0,
+            removed.1.deadline_tick != NO_DEADLINE));
+        assert_eq!(versions.metrics_snapshot(), super::KeyVersionCacheMetricsSnapshot {
+            record_count: 1,
+            estimated_memory_bytes: second_bytes,
+        });
+
+        versions.clear_records();
+        assert_eq!(versions.metrics_snapshot(), Default::default());
+        assert_eq!(versions.len(), 0);
+        assert_eq!(index_len(&versions), 0);
+    }
+
+    /// 并发首次观察的 entry 线性化必须让同 Key 只计一次，不同 Key 全部精确计入。
+    #[cfg(feature = "trace")]
+    #[test]
+    fn test_trace_cache_metrics_match_quiescent_map_after_concurrent_insertions() {
+        const THREADS: usize = 4;
+        const KEYS_PER_THREAD: usize = 128;
+
+        let config = KeyVersionConfig::new(Duration::ZERO, Duration::ZERO).unwrap();
+        let (registry, _shutdown) = KeyVersionRegistry::new(config);
+        let versions = registry.create_table_versions();
+        let shared_key = binary_with_capacity(7, 96);
+        thread::scope(|scope| {
+            for worker in 0..THREADS {
+                let versions = versions.clone();
+                let shared_key = shared_key.clone();
+                scope.spawn(move || {
+                    let _ = versions.first_observation(shared_key, false, || {
+                        Guid((worker + 1) as u128)
+                    });
+                    for offset in 0..KEYS_PER_THREAD {
+                        let value = 1_000 + worker * KEYS_PER_THREAD + offset;
+                        let key = encode_usize(value);
+                        let _ = versions.first_observation(key, false, || {
+                            Guid((10_000 + value) as u128)
+                        });
+                    }
+                });
+            }
+        });
+
+        let expected_count = 1 + THREADS * KEYS_PER_THREAD;
+        let expected_memory = versions
+            .0
+            .versions
+            .iter()
+            .map(|entry| estimated_record_memory_bytes(
+                entry.key(),
+                entry.value().deadline_tick != NO_DEADLINE))
+            .sum::<u64>();
+        assert_eq!(versions.len(), expected_count);
+        assert_eq!(versions.metrics_snapshot(), super::KeyVersionCacheMetricsSnapshot {
+            record_count: expected_count as u64,
+            estimated_memory_bytes: expected_memory,
+        });
+    }
+
+    /// 每次合法调用只能归入一个 outcome；未 finish 的 guard 模拟 future 取消并计为失败。
+    #[cfg(feature = "trace")]
+    #[test]
+    fn test_trace_api_call_guard_records_one_terminal_outcome() {
+        let config = KeyVersionConfig::new(Duration::ZERO, Duration::ZERO).unwrap();
+        let (registry, _shutdown) = KeyVersionRegistry::new(config);
+
+        registry.begin_api_call(KeyVersionApiOperation::Query).finish(true);
+        registry.begin_api_call(KeyVersionApiOperation::Query).finish(false);
+        drop(registry.begin_api_call(KeyVersionApiOperation::Query));
+        registry.begin_api_call(KeyVersionApiOperation::Prepare).finish(true);
+        drop(registry.begin_api_call(KeyVersionApiOperation::Prepare));
+        registry.begin_api_call(KeyVersionApiOperation::Commit).finish(false);
+
+        assert_eq!(registry.api_metrics_snapshot(), KeyVersionApiMetricsSnapshot {
+            query_success: 1,
+            query_failure: 2,
+            prepare_success: 1,
+            prepare_failure: 1,
+            commit_success: 0,
+            commit_failure: 1,
+        });
+    }
+
+    /// tracing loop 只上报累计快照差值；单次 u64 回绕必须按模运算得到正确 delta。
+    #[cfg(feature = "trace")]
+    #[test]
+    fn test_trace_api_metrics_delta_handles_counter_wrap() {
+        let previous = KeyVersionApiMetricsSnapshot {
+            query_success: u64::MAX,
+            query_failure: 7,
+            prepare_success: 8,
+            prepare_failure: 9,
+            commit_success: 10,
+            commit_failure: 11,
+        };
+        let current = KeyVersionApiMetricsSnapshot {
+            query_success: 1,
+            query_failure: 10,
+            prepare_success: 12,
+            prepare_failure: 14,
+            commit_success: 16,
+            commit_failure: 18,
+        };
+        assert_eq!(current.delta_since(previous), KeyVersionApiMetricsSnapshot {
+            query_success: 2,
+            query_failure: 3,
+            prepare_success: 4,
+            prepare_failure: 5,
+            commit_success: 6,
+            commit_failure: 7,
+        });
+    }
+
     fn index_len(versions: &super::KeyVersions) -> usize {
         versions.0.ttl_keys.len()
     }
 
     fn binary_from_u32(value: u32) -> Binary {
         Binary::new(value.to_le_bytes().to_vec())
+    }
+
+    #[cfg(feature = "trace")]
+    fn binary_with_capacity(value: u32, capacity: usize) -> Binary {
+        let mut encoded = WriteBuffer::new();
+        (value as usize).encode(&mut encoded);
+        let mut bytes = Vec::with_capacity(capacity.max(encoded.len()));
+        bytes.extend_from_slice(&encoded.bytes);
+        Binary::new(bytes)
     }
 
     fn encode_usize(value: usize) -> Binary {

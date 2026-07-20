@@ -1560,45 +1560,52 @@ async fn exercise_cross_runtime_lifecycle(
 
 /// 通过公开 DDL 修改内部 Meta 表，并验证旧目录流保持创建时状态。
 async fn exercise_meta_ddl_snapshot(db: &RealDb) -> TestResult<()> {
-    let transaction = db
-        .transaction(Atom::from("meta iterator DDL"), true, 10_000, 10_000)
-        .ok_or_else(|| "database rejected Meta DDL transaction".to_owned())?;
     let expected_meta = KVTableMeta::new(
         KVDBTableType::MemOrdTab,
         false,
         EnumType::Usize,
         EnumType::Usize,
     );
-    transaction
-        .create_table(
-            Atom::from(META_SNAPSHOT_TABLE_NAME),
-            expected_meta.clone(),
-            false,
-        )
-        .await
-        .map_err(|error| format!("creating first Meta entry failed: {error}"))?;
+    create_typed_test_table(
+        db,
+        META_SNAPSHOT_TABLE_NAME,
+        KVDBTableType::MemOrdTab,
+        false,
+        EnumType::Usize,
+        EnumType::Usize,
+    )
+    .await?;
 
-    let mut keys = transaction
+    let snapshot = db
+        .transaction(Atom::from("meta iterator snapshot"), false, 10_000, 10_000)
+        .ok_or_else(|| "database rejected Meta snapshot transaction".to_owned())?;
+    let mut keys = snapshot
         .keys(Atom::from(META_TABLE_NAME), None, false)
         .await
         .ok_or_else(|| "Meta keys returned no stream".to_owned())?;
-    let mut values = transaction
+    let mut values = snapshot
         .values(Atom::from(META_TABLE_NAME), None, false)
         .await
         .ok_or_else(|| "Meta values returned no stream".to_owned())?;
 
-    transaction
+    // 建表与删表不能在同一根事务中混用；快照 owner、删表和替换建表必须各自独立。
+    let remover = db
+        .transaction(Atom::from("meta iterator remover"), true, 10_000, 10_000)
+        .ok_or_else(|| "database rejected Meta remove transaction".to_owned())?;
+    remover
         .remove_table(Atom::from(META_SNAPSHOT_TABLE_NAME))
         .await
         .map_err(|error| format!("removing first Meta entry failed: {error}"))?;
-    transaction
-        .create_table(
-            Atom::from(META_REPLACEMENT_TABLE_NAME),
-            expected_meta.clone(),
-            false,
-        )
-        .await
-        .map_err(|error| format!("creating replacement Meta entry failed: {error}"))?;
+    commit_transaction(&remover, "Meta snapshot table remover").await?;
+    create_typed_test_table(
+        db,
+        META_REPLACEMENT_TABLE_NAME,
+        KVDBTableType::MemOrdTab,
+        false,
+        EnumType::Usize,
+        EnumType::Usize,
+    )
+    .await?;
 
     let mut observed_keys = Vec::new();
     while let Some(key) = keys.next().await {
@@ -1629,7 +1636,7 @@ async fn exercise_meta_ddl_snapshot(db: &RealDb) -> TestResult<()> {
     {
         return Err("Meta DDL did not alter the live registry as arranged".to_owned());
     }
-    discard_start_transaction(transaction, "Meta DDL snapshot");
+    discard_start_transaction(snapshot, "Meta DDL snapshot");
     Ok(())
 }
 

@@ -28,6 +28,29 @@ try {
     }
     Invoke-CargoChecked $LibArguments
 
+    # trace-only 指标/原子测试和真实 TTL 交错属于永久新回归；其它 integration 保持默认 feature。
+    $TraceLibArguments = @(
+        "+$Toolchain", "test", "--locked", "--offline", "-p", "pi_db",
+        "--features", "trace", "--lib", "--"
+    )
+    if ($Mode -eq "list") {
+        $TraceLibArguments += @("--list", "--format", "terse")
+    } else {
+        $TraceLibArguments += "--test-threads=1"
+    }
+    Invoke-CargoChecked $TraceLibArguments
+
+    $TraceTtlArguments = @(
+        "+$Toolchain", "test", "--locked", "--offline", "-p", "pi_db",
+        "--features", "trace", "--test", "key_version_ttl_index", "--"
+    )
+    if ($Mode -eq "list") {
+        $TraceTtlArguments += @("--list", "--format", "terse")
+    } else {
+        $TraceTtlArguments += "--test-threads=1"
+    }
+    Invoke-CargoChecked $TraceTtlArguments
+
     foreach ($Line in Get-Content $TargetFile) {
         $Trimmed = $Line.Trim()
         if (-not $Trimmed -or $Trimmed.StartsWith("#")) {

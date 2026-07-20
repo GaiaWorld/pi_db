@@ -22,6 +22,8 @@ use std::convert::TryInto;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::collections::{VecDeque, HashMap, BTreeMap};
+#[cfg(feature = "trace")]
+use std::collections::HashSet;
 use std::io::{Error, Result as IOResult, ErrorKind};
 use std::sync::{Arc,
                 OnceLock,
@@ -39,7 +41,7 @@ use log::{info, error};
 use libc::malloc_trim;
 #[cfg(feature = "trace")]
 use opentelemetry::{global,
-                    metrics::Meter,
+                    metrics::{Counter, Gauge, Meter},
                     KeyValue};
 #[cfg(feature = "trace")]
 use pi_logger;
@@ -84,6 +86,10 @@ use crate::{Binary,
                      b_tree_ord_table::{DEFAULT_CACHE_SIZE, BtreeOrderedTable,
                                         BtreeOrdTabTr}},
             utils::{CreateTableOptions, KVDBEvent}};
+#[cfg(feature = "trace")]
+use crate::key_version::{KeyVersionApiMetricsSnapshot,
+                         KeyVersionApiOperation,
+                         KeyVersionCacheMetricsSnapshot};
 
 ///
 /// 默认的数据库表元信息目录名
@@ -161,6 +167,19 @@ const DEFAULT_KEY_VERSION_TTL_POLL_INTERVAL: Duration = Duration::from_secs(3 * 
 #[cfg(feature = "trace")]
 static TABLE_CACHE_SIZE_METER: OnceLock<Meter> = OnceLock::new();
 
+#[cfg(feature = "trace")]
+const TABLE_CACHE_SIZE_METRIC: &str = "pi_db.db.table_cache_size";
+#[cfg(feature = "trace")]
+const KEY_VERSION_RECORD_COUNT_METRIC: &str = "pi_db.db.key_version_cache_record_count";
+#[cfg(feature = "trace")]
+const KEY_VERSION_ESTIMATED_MEMORY_METRIC: &str = "pi_db.db.key_version_cache_estimated_memory_bytes";
+#[cfg(feature = "trace")]
+const KEY_VERSION_QUERY_CALLS_METRIC: &str = "pi_db.db.key_version_query_calls";
+#[cfg(feature = "trace")]
+const KEY_VERSION_2PC_CALLS_METRIC: &str = "pi_db.db.key_version_2pc_calls";
+#[cfg(feature = "trace")]
+const TRANSACTION_LIFECYCLE_METRIC: &str = "pi_db.db.transaction_lifecycle";
+
 // 获取表缓存大小仪表
 #[cfg(feature = "trace")]
 pub(crate) async fn get_table_cache_size_meter<'a, R>(rt: R) -> &'a Meter
@@ -172,6 +191,134 @@ pub(crate) async fn get_table_cache_size_meter<'a, R>(rt: R) -> &'a Meter
     }
 
     TABLE_CACHE_SIZE_METER.get_or_init(|| global::meter("table_cache_size"))
+}
+
+/// 复用既有 Meter 的 trace-only 指标集合；数据库热路径只写内部原子，不直接调用 Meter。
+#[cfg(feature = "trace")]
+struct DatabaseTraceInstruments {
+    table_cache: Gauge<u64>,
+    key_version_records: Gauge<u64>,
+    key_version_memory: Gauge<u64>,
+    key_version_query_calls: Counter<u64>,
+    key_version_2pc_calls: Counter<u64>,
+    transaction_lifecycle: Counter<u64>,
+    query_success: [KeyValue; 1],
+    query_failure: [KeyValue; 1],
+    prepare_success: [KeyValue; 2],
+    prepare_failure: [KeyValue; 2],
+    commit_success: [KeyValue; 2],
+    commit_failure: [KeyValue; 2],
+    transaction_created: [KeyValue; 1],
+    transaction_closed: [KeyValue; 1],
+}
+
+#[cfg(feature = "trace")]
+impl DatabaseTraceInstruments {
+    fn new(meter: &Meter) -> Self {
+        Self {
+            table_cache: meter.u64_gauge(TABLE_CACHE_SIZE_METRIC).build(),
+            key_version_records: meter
+                .u64_gauge(KEY_VERSION_RECORD_COUNT_METRIC)
+                .build(),
+            key_version_memory: meter
+                .u64_gauge(KEY_VERSION_ESTIMATED_MEMORY_METRIC)
+                .build(),
+            key_version_query_calls: meter
+                .u64_counter(KEY_VERSION_QUERY_CALLS_METRIC)
+                .build(),
+            key_version_2pc_calls: meter
+                .u64_counter(KEY_VERSION_2PC_CALLS_METRIC)
+                .build(),
+            transaction_lifecycle: meter
+                .u64_counter(TRANSACTION_LIFECYCLE_METRIC)
+                .build(),
+            query_success: [KeyValue::new("result", "success")],
+            query_failure: [KeyValue::new("result", "failure")],
+            prepare_success: [KeyValue::new("phase", "prepare"),
+                              KeyValue::new("result", "success")],
+            prepare_failure: [KeyValue::new("phase", "prepare"),
+                              KeyValue::new("result", "failure")],
+            commit_success: [KeyValue::new("phase", "commit"),
+                             KeyValue::new("result", "success")],
+            commit_failure: [KeyValue::new("phase", "commit"),
+                             KeyValue::new("result", "failure")],
+            transaction_created: [KeyValue::new("event", "created")],
+            transaction_closed: [KeyValue::new("event", "closed")],
+        }
+    }
+
+    fn record_table(&self,
+                    table: &Atom,
+                    table_cache_size: u64,
+                    version_metrics: KeyVersionCacheMetricsSnapshot) {
+        let attributes = [KeyValue::new("table", table.as_str().to_string())];
+        self.table_cache.record(table_cache_size, &attributes);
+        self.key_version_records.record(version_metrics.record_count, &attributes);
+        self.key_version_memory
+            .record(version_metrics.estimated_memory_bytes, &attributes);
+    }
+
+    fn record_removed_table(&self, table: &Atom) {
+        let attributes = [KeyValue::new("table", table.as_str().to_string())];
+        self.key_version_records.record(0, &attributes);
+        self.key_version_memory.record(0, &attributes);
+    }
+
+    fn record_api_delta(&self, delta: KeyVersionApiMetricsSnapshot) {
+        if delta.query_success > 0 {
+            self.key_version_query_calls.add(delta.query_success, &self.query_success);
+        }
+        if delta.query_failure > 0 {
+            self.key_version_query_calls.add(delta.query_failure, &self.query_failure);
+        }
+        if delta.prepare_success > 0 {
+            self.key_version_2pc_calls.add(delta.prepare_success, &self.prepare_success);
+        }
+        if delta.prepare_failure > 0 {
+            self.key_version_2pc_calls.add(delta.prepare_failure, &self.prepare_failure);
+        }
+        if delta.commit_success > 0 {
+            self.key_version_2pc_calls.add(delta.commit_success, &self.commit_success);
+        }
+        if delta.commit_failure > 0 {
+            self.key_version_2pc_calls.add(delta.commit_failure, &self.commit_failure);
+        }
+    }
+
+    fn record_transaction_delta(&self, delta: TransactionLifecycleMetricsSnapshot) {
+        if delta.created > 0 {
+            self.transaction_lifecycle.add(delta.created, &self.transaction_created);
+        }
+        if delta.closed > 0 {
+            self.transaction_lifecycle.add(delta.closed, &self.transaction_closed);
+        }
+    }
+}
+
+/// tracing loop 一次读取的根事务对象生命周期累计计数。
+#[cfg(feature = "trace")]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+struct TransactionLifecycleMetricsSnapshot {
+    created: u64,
+    closed: u64,
+}
+
+#[cfg(feature = "trace")]
+impl TransactionLifecycleMetricsSnapshot {
+    fn delta_since(self, previous: Self) -> Self {
+        Self {
+            created: self.created.wrapping_sub(previous.created),
+            closed: self.closed.wrapping_sub(previous.closed),
+        }
+    }
+}
+
+/// 只在 trace 构建中存在；不参与事务 manager 的注册、状态或资源释放判断。
+#[cfg(feature = "trace")]
+#[derive(Default)]
+struct TransactionLifecycleMetrics {
+    created: AtomicU64,
+    closed: AtomicU64,
 }
 
 /// 键值对数据库管理器的一次性构建器。
@@ -342,6 +489,8 @@ impl<
             status,
             listener,
             notifier,
+            #[cfg(feature = "trace")]
+            transaction_metrics: TransactionLifecycleMetrics::default(),
         };
         let db_mgr = KVDBManager(Arc::new(inner));
 
@@ -684,7 +833,15 @@ impl<
             version_context: SpinLock::new(None),
         };
 
-        Some(KVDBTransaction::RootTr(RootTransaction(Arc::new(inner))))
+        let transaction = KVDBTransaction::RootTr(RootTransaction(Arc::new(inner)));
+        // 创建指标的线性化点必须位于完整对象构造之后、Some 返回之前。状态拒绝的 None 路径
+        // 不计数；关闭由最后一个 InnerRootTransaction owner 的 trace-only Drop 配平。
+        #[cfg(feature = "trace")]
+        self.0
+            .transaction_metrics
+            .created
+            .fetch_add(1, Ordering::Relaxed);
+        Some(transaction)
     }
 
     /// 请求当前进程的 glibc allocator 归还可释放页。
@@ -725,6 +882,15 @@ impl<
             self.0.status.store(DB_CLOSEING_STATUS, Ordering::SeqCst);
         }
     }
+
+    /// 无锁读取根事务对象 created/closed 累计值；只供 tracing loop 差量采集。
+    #[cfg(feature = "trace")]
+    fn transaction_metrics_snapshot(&self) -> TransactionLifecycleMetricsSnapshot {
+        TransactionLifecycleMetricsSnapshot {
+            created: self.0.transaction_metrics.created.load(Ordering::Relaxed),
+            closed: self.0.transaction_metrics.closed.load(Ordering::Relaxed),
+        }
+    }
 }
 
 /*
@@ -748,6 +914,13 @@ impl<
                                     table: Atom,
                                     key: Binary)
         -> Result<(Option<Binary>, Version), KVTableTrError> {
+        // 只在 trace 构建中持有两个原子的借用；所有 `?`、取消和 unwind 都由 guard Drop 归入
+        // failure，不改变原错误返回、publication 临界区或默认构建热路径。
+        #[cfg(feature = "trace")]
+        let metric_guard = self
+            .0
+            .key_versions
+            .begin_api_call(KeyVersionApiOperation::Query);
         validate_version_table_key(&table, &key, "query with version")?;
         let registered = {
             self.0
@@ -779,6 +952,8 @@ impl<
                                value.is_some(),
                                || self.0.tr_mgr.alloc_transaction_uid());
 
+        #[cfg(feature = "trace")]
+        metric_guard.finish(true);
         Ok((value, version))
     }
 
@@ -988,6 +1163,26 @@ impl<
                 Some(table.size())
             },
         }
+    }
+
+    /// 在一次现有 table registry 读临界区内取得旧表缓存指标和版本缓存原子快照。
+    ///
+    /// 该 trace-only helper 不迭代或锁住版本 DashMap；返回后 registry guard 已释放。两个版本
+    /// 原子可能来自相邻并发时刻，只用于最终收敛观测，不能作为事务或回收门禁。
+    #[cfg(feature = "trace")]
+    async fn table_tracing_metrics(&self,
+                                   table_name: &Atom)
+        -> Option<(u64, KeyVersionCacheMetricsSnapshot)> {
+        let tables = self.0.tables.read().await;
+        let registered = tables.get(table_name)?;
+        let table_cache_size = match &registered.table {
+            KVDBTable::MetaTab(table) => table.size(),
+            KVDBTable::MemOrdTab(table) => table.size(),
+            KVDBTable::LogOrdTab(table) => table.size(),
+            KVDBTable::LogWTab(table) => table.size(),
+            KVDBTable::BtreeOrdTab(table) => table.size(),
+        };
+        Some((table_cache_size, registered.versions.metrics_snapshot()))
     }
 
     /// 强制根 commit logger 轮换到一个新的 checkpoint。
@@ -1343,6 +1538,8 @@ struct InnerKVDBManager<
     status:             AtomicU64,                                      //数据库状态
     listener:           Option<Receiver<KVDBEvent<Guid>>>,              //数据库事件监听器
     notifier:           Option<Sender<KVDBEvent<Guid>>>,                //数据库事件通知器
+    #[cfg(feature = "trace")]
+    transaction_metrics: TransactionLifecycleMetrics,                   //根事务对象创建与最终析构计数
 }
 
 #[derive(Clone)]
@@ -2628,7 +2825,17 @@ impl<
         -> Result<Vec<u8>, KVTableTrError> {
         match self {
             KVDBTransaction::RootTr(tr) => {
-                tr.prepare_with_version(read_set, write_set).await
+                #[cfg(feature = "trace")]
+                let metric_guard = tr
+                    .0
+                    .db_mgr
+                    .0
+                    .key_versions
+                    .begin_api_call(KeyVersionApiOperation::Prepare);
+                let result = tr.prepare_with_version(read_set, write_set).await;
+                #[cfg(feature = "trace")]
+                metric_guard.finish(result.is_ok());
+                result
             },
             _ => panic!("Prepare with version failed, reason: invalid root transaction"),
         }
@@ -2681,7 +2888,17 @@ impl<
         -> Result<Vec<TableKeyVersion>, KVTableTrError> {
         match self {
             KVDBTransaction::RootTr(tr) => {
-                tr.commit_with_version(prepare_output).await
+                #[cfg(feature = "trace")]
+                let metric_guard = tr
+                    .0
+                    .db_mgr
+                    .0
+                    .key_versions
+                    .begin_api_call(KeyVersionApiOperation::Commit);
+                let result = tr.commit_with_version(prepare_output).await;
+                #[cfg(feature = "trace")]
+                metric_guard.finish(result.is_ok());
+                result
             },
             _ => panic!("Commit with version failed, reason: invalid root transaction"),
         }
@@ -5708,6 +5925,25 @@ struct InnerRootTransaction<
     version_context:    SpinLock<Option<RootVersionContext>>,               //版本协议表身份和提交回执
 }
 
+/// trace 构建以最终 owner 析构作为事务对象关闭的唯一观测点。
+///
+/// 此时 `db_mgr` 字段仍有效；Drop 只执行一次 Relaxed 原子增量，随后 Rust 继续按原顺序释放全部
+/// 字段。它不调用 manager.finish、不改变事务状态；事务 clone 和 manager registry owner 会推迟
+/// 本 Drop。迭代器流只持表子事务/快照而不持根 owner，合法协议必须先结束流再释放根事务。
+#[cfg(feature = "trace")]
+impl<
+    C: Clone + Send + 'static,
+    Log: AsyncCommitLog<C = C, Cid = Guid>,
+> Drop for InnerRootTransaction<C, Log> {
+    fn drop(&mut self) {
+        self.db_mgr
+            .0
+            .transaction_metrics
+            .closed
+            .fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 /// 数据库注册表中五种物理/逻辑表实现的类型擦除句柄。
 ///
 /// clone 只克隆内部表句柄，不复制数据。应用层从 [`KVDBManager`] 的公开方法操作表；直接
@@ -5767,25 +6003,50 @@ async fn loop_tracing<R, C, Log>(rt: R,
           C: Clone + Send + 'static,
           Log: AsyncCommitLog<C = C, Cid = Guid>,
 {
-    let table_cache_meter = get_table_cache_size_meter(rt.clone())
-        .await
-        .u64_gauge("pi_db.db.table_cache_size")
-        .build();
+    let meter = get_table_cache_size_meter(rt.clone()).await;
+    let instruments = DatabaseTraceInstruments::new(meter);
+    let mut previous_tables = HashSet::new();
+    let mut previous_api_metrics = KeyVersionApiMetricsSnapshot::default();
+    let mut previous_transaction_metrics = TransactionLifecycleMetricsSnapshot::default();
     loop {
         rt.timeout(interval).await;
         let now = Instant::now();
+        let mut current_tables = HashSet::new();
         for table in db_mgr.tables().await {
-            if let Some(size) = db_mgr.table_cache_size(&table).await {
-                table_cache_meter.record(size, &[KeyValue::new("table",
-                                                               table.as_str().to_string())]);
+            if let Some((table_cache_size, version_metrics)) =
+                db_mgr.table_tracing_metrics(&table).await {
+                instruments.record_table(&table, table_cache_size, version_metrics);
+                current_tables.insert(table);
                 rt.timeout(0).await;
             }
         }
+        // Synchronous Gauge 的后端可能保留最后值；为本轮消失的表记录一次 0，但不改变 DDL、
+        // retired KeyVersions 生命周期或既有 table_cache_size 指标的历史行为。
+        for table in previous_tables.difference(&current_tables) {
+            instruments.record_removed_table(table);
+        }
+        previous_tables = current_tables;
+
+        // 调用点只写 AtomicU64；这里把累计快照转换为 Counter delta，禁止每轮重复上报累计值。
+        let current_api_metrics = db_mgr.0.key_versions.api_metrics_snapshot();
+        let api_delta = current_api_metrics.delta_since(previous_api_metrics);
+        previous_api_metrics = current_api_metrics;
+        instruments.record_api_delta(api_delta);
+
+        let current_transaction_metrics = db_mgr.transaction_metrics_snapshot();
+        let transaction_delta = current_transaction_metrics
+            .delta_since(previous_transaction_metrics);
+        previous_transaction_metrics = current_transaction_metrics;
+        instruments.record_transaction_delta(transaction_delta);
         info!("Loop tracing succeeded, interval: {:?}ms, time: {:?}",
             interval,
             now.elapsed());
     }
 }
+
+#[cfg(all(test, feature = "trace"))]
+#[path = "db_metrics_tests.rs"]
+mod metrics_tests;
 
 // 将表名序列化为二进制数据
 pub(crate) fn table_to_binary(table_name: &Atom) -> Binary {

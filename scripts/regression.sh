@@ -27,6 +27,28 @@ run_lib() {
     fi
 }
 
+# trace-only 指标、原子配平和真实 TTL 指标测试必须进入永久新回归，但不扩大到全部 integration。
+run_trace_lib() {
+    if [[ "$mode" == "list" ]]; then
+        "$cargo_bin" "+$toolchain" test --locked --offline -p pi_db --features trace --lib -- \
+            --list --format terse
+    else
+        "$cargo_bin" "+$toolchain" test --locked --offline -p pi_db --features trace --lib -- \
+            --test-threads=1
+    fi
+}
+
+# 真实跨 runtime TTL/publication 交错用于保护 trace 容量原子与 scanner 的并发配平。
+run_trace_ttl_interleaving() {
+    if [[ "$mode" == "list" ]]; then
+        "$cargo_bin" "+$toolchain" test --locked --offline -p pi_db --features trace \
+            --test key_version_ttl_index -- --list --format terse
+    else
+        "$cargo_bin" "+$toolchain" test --locked --offline -p pi_db --features trace \
+            --test key_version_ttl_index -- --test-threads=1
+    fi
+}
+
 run_integration() {
     local target="$1"
     local exact="$2"
@@ -45,6 +67,8 @@ run_integration() {
 
 cd "$repo_dir"
 run_lib
+run_trace_lib
+run_trace_ttl_interleaving
 while read -r target exact; do
     if [[ -z "${target:-}" || "$target" == \#* ]]; then
         continue

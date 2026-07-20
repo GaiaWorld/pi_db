@@ -155,6 +155,30 @@ token 会在让出 runtime 前返回索引。因此额外空间为 O(当前活�
 的建表/删表，并依赖当前“DDL 不与业务事务读写混用”协议边界。该索引只影响内存版本回收，不改变
 表数据、WAL、提交确认或恢复语义。
 
+### Trace 指标观测
+
+启用 `trace` feature 后，既有 15 秒 tracing loop 会通过同一 OpenTelemetry Meter 上报以下指标：
+
+- `pi_db.db.key_version_cache_record_count{table}`：当前注册表中每张表的活动 Key 版本记录数。
+- `pi_db.db.key_version_cache_estimated_memory_bytes{table}`：活动记录可归属的动态内存估值。
+- `pi_db.db.key_version_query_calls{result=success|failure}`：`query_with_version` 调用结果。
+- `pi_db.db.key_version_2pc_calls{phase=prepare|commit,result=success|failure}`：版本 2PC 阶段结果。
+- `pi_db.db.transaction_lifecycle{event=created|closed}`：成功创建与最终 owner 析构的根事务数。
+
+版本记录数和内存估值在结构插入、TTL exact-remove 和启动恢复清空处通过 `Relaxed` 原子增减；
+采集不迭代表内版本 `DashMap`，也不进入 publication/prepare 临界区。API 和事务热路径只更新
+内部原子，tracing loop 再按累计快照差量写 Counter。取消或 unwind 的已进入调用计为 failure；
+数据库状态拒绝并返回 `None` 的事务创建不计 created。`closed` 只表示最后一个根事务 owner 已
+析构，不等于数据库 close、事务管理器 finish、提交确认或迭代器释放。
+
+内存 Gauge 使用 Key 的实际 `Vec::capacity()`，并估算 Map 逻辑 entry、`Arc<Vec<u8>>` 控制字段
+及 TTL FIFO owner/slot；它不包含 allocator 舍入、DashMap 空闲 bucket、channel 空闲 block、
+表数据、WAL、redb 页面缓存或 RSS，因此只能解释为稳定的活动缓存动态内存估值。删表后 loop
+会为消失的表写一次零值。当前默认部署单进程只启动一个 `pi_db` 实例，指标沿用既有 `table`
+单标签；同进程多实例的同名表会合并为同一 time series，这是观测边界，不影响数据库语义。
+
+未启用 `trace` 时，上述字段、原子读写和采集代码均由条件编译移除，不增加默认构建运行时成本。
+
 ## 运行时验收范围
 
 本轮线程安全验收实际解析并测试了 `pi-async-rt 0.5.2`，包括正确 ABI 的 TSan 和 ASan。

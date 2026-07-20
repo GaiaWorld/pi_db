@@ -1,6 +1,6 @@
 [package]
 name = "pi_db"
-version = "0.19.3"
+version = "0.19.5"
 authors = ["vmos <vmosone007@gmail.com>"]
 edition = "2021"
 description = "Full cache based database，support transaction"
@@ -46,6 +46,9 @@ env_logger = "~0.11"
 fastrand = "~1.5"
 pi_time = "~0.5"
 chrono = "0.4"
+opentelemetry_sdk = { version = "~0.30", features = ["metrics", "testing"] }
+# indexmap 1.x 的 build.rs 在 -Zbuild-std 下无法探测 sysroot std；测试图显式统一该 feature。
+indexmap = { version = "~1.9", features = ["std"] }
 
 #[patch.crates-io]
 #pi_ordmap = { path = "../pi_ordmap" }
