@@ -43,8 +43,6 @@ use libc::malloc_trim;
 use opentelemetry::{global,
                     metrics::{Counter, Gauge, Meter},
                     KeyValue};
-#[cfg(feature = "trace")]
-use pi_logger;
 use pi_atom::Atom;
 use pi_bon::{WriteBuffer, ReadBuffer, Encode, Decode, ReadBonErr};
 use pi_guid::Guid;
@@ -189,9 +187,12 @@ const REPAIR_DB_SOURCE: &str = "Repair db";
 const DEFAULT_KEY_VERSION_TTL: Duration = Duration::from_secs(60 * 60);
 const DEFAULT_KEY_VERSION_TTL_POLL_INTERVAL: Duration = Duration::from_secs(3 * 60);
 
-// 表缓存大小仪表
+// 整个进程内的 pi_db 实例共享同一个数据库指标 Meter，避免各指标组使用含义不同的 scope。
 #[cfg(feature = "trace")]
-static TABLE_CACHE_SIZE_METER: OnceLock<Meter> = OnceLock::new();
+static DATABASE_METER: OnceLock<Meter> = OnceLock::new();
+
+#[cfg(feature = "trace")]
+const DATABASE_METER_SCOPE: &str = "pi_db";
 
 #[cfg(feature = "trace")]
 const TABLE_CACHE_SIZE_METRIC: &str = "pi_db.db.table_cache_size";
@@ -206,20 +207,19 @@ const KEY_VERSION_2PC_CALLS_METRIC: &str = "pi_db.db.key_version_2pc_calls";
 #[cfg(feature = "trace")]
 const TRANSACTION_LIFECYCLE_METRIC: &str = "pi_db.db.transaction_lifecycle";
 
-// 获取表缓存大小仪表
+/// 获取进程级共享的数据库指标 Meter。
+///
+/// 调用方必须在启动数据库前通过 OpenTelemetry `global` 安装 MeterProvider；该顺序由
+/// `pi_launcher` 的启动流程保证。这里不能依赖 `pi_logger::opentelemetry::is_init()`：新版
+/// observability 初始化会直接设置全局 Provider，却不会设置旧兼容模块的初始化标记。
+/// 如果外部没有启用指标 Provider，OpenTelemetry 会按其标准语义返回 no-op Meter；本函数
+/// 不等待、不轮询，也不会阻塞数据库 trace loop。
 #[cfg(feature = "trace")]
-pub(crate) async fn get_table_cache_size_meter<'a, R>(rt: R) -> &'a Meter
-    where R: AsyncRuntime
-{
-    while !pi_logger::opentelemetry::is_init() {
-        //跟踪系统还未初始化，则稍候重试
-        rt.timeout(10000).await;
-    }
-
-    TABLE_CACHE_SIZE_METER.get_or_init(|| global::meter("table_cache_size"))
+pub(crate) fn get_database_meter() -> &'static Meter {
+    DATABASE_METER.get_or_init(|| global::meter(DATABASE_METER_SCOPE))
 }
 
-/// 复用既有 Meter 的 trace-only 指标集合；数据库热路径只写内部原子，不直接调用 Meter。
+/// 复用进程级数据库 Meter 的 trace-only 指标集合；数据库热路径只写内部原子，不直接调用 Meter。
 #[cfg(feature = "trace")]
 struct DatabaseTraceInstruments {
     table_cache: Gauge<u64>,
@@ -6109,7 +6109,7 @@ async fn loop_tracing<R, C, Log>(rt: R,
           C: Clone + Send + 'static,
           Log: AsyncCommitLog<C = C, Cid = Guid>,
 {
-    let meter = get_table_cache_size_meter(rt.clone()).await;
+    let meter = get_database_meter();
     let instruments = DatabaseTraceInstruments::new(meter);
     let mut previous_tables = HashSet::new();
     let mut previous_api_metrics = KeyVersionApiMetricsSnapshot::default();
