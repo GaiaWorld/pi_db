@@ -406,8 +406,9 @@ pub trait KVAction: Send + Sync + 'static {
     /// 已有 tombstone/重复删除返回 `None` 且不回读；缓存完全缺席时同步建立 redb 读事务
     /// 并返回该调用时快照中的旧值。redb `begin_read/open_table/get` 错误记录详细 error
     /// 日志并降级为 `Ok(None)`，但 tombstone 保留且删除仍可提交。redb 读取不写
-    /// `cache_ref`，不代表事务创建时快照，也不参与冲突基线。Btree 当前复用普通 `delete`
-    /// 路径，本契约不把其 dirty 冲突行为冻结为最终设计。
+    /// `cache_ref`；成功取得的值或逻辑不存在会进入独立 KeyState 冲突基线，读取错误只能保留
+    /// `OverlayMissing`。Btree 当前复用普通 `delete` 路径，本契约不把其 dirty 冲突行为冻结为
+    /// 最终设计。
     ///
     /// 跨表返回矩阵见
     /// [`CONTRACT-ACTION-001`](../docs/SEMANTIC_CONTRACTS.md#contract-action-001) 与
@@ -425,8 +426,9 @@ pub trait KVAction: Send + Sync + 'static {
     /// `None` 且不回读，缓存完全缺席时同步读取本次调用时的 redb 快照。
     ///
     /// `key` 的所有权移入返回的 future。Btree 的 redb `begin_read/open_table/get` 错误会
-    /// 记录详细 error 日志并降级为 `Ok(None)`；读取不写 `cache_ref`、不参与冲突检测，
-    /// 删除 tombstone 仍保留并可继续提交。该同步 redb 读取可能短暂阻塞当前异步 worker，
+    /// 记录详细 error 日志并降级为 `Ok(None)`；读取不写 `cache_ref`。成功读取的值或逻辑不存在
+    /// 会进入独立 KeyState 冲突基线，错误降级只保留 `OverlayMissing`；删除 tombstone 仍保留并
+    /// 可继续提交。该同步 redb 读取可能短暂阻塞当前异步 worker，
     /// 批量删除当前为每个缓存缺席 Key 建立独立读事务。Meta/Memory/LogOrdered 使用
     /// `pi_ordmap::OrdMap::delete(copy=false)`，避免为返回值增加一次 `Binary` 引用计数克隆；
     /// 它们仍执行同一次 O(log n) COW 删除，不因省略返回值改变提交或回滚语义。

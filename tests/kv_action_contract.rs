@@ -5,7 +5,8 @@
 //! `Transaction2PcManager`、`CommitLogger`、Meta/Memory/LogOrdered/LogWrite/Btree 表和真实
 //! 文件系统。测试覆盖：
 //!
-//! - 四类用户表的普通/dirty upsert、query 和 delete 的事务私有可见性与返回值顺序；
+//! - 四类用户表的普通/dirty upsert、query 和 delete 的事务私有可见性与返回值顺序；两套
+//!   非空动作严格使用不同根事务，避免用协议禁止的混用路径证明公开语义；
 //! - delete 返回值的逐表差异：Memory/LogOrdered 不返回旧值，Btree 返回可取得的旧值，
 //!   LogWrite 不执行删除；
 //! - LogWrite 当前只写边界；
@@ -127,12 +128,15 @@ async fn create_tables(db: &RealDb) -> TestResult<()> {
     commit_transaction(&transaction, "KVAction DDL").await
 }
 
-/// 验证事务私有点操作、输入顺序、旧值和 LogWrite 当前只写边界。
+/// 分别验证普通族和 dirty 族的事务私有点操作、输入顺序、旧值和 LogWrite 当前只写边界。
+///
+/// 两个非空操作族必须使用不同根事务。空批次另用第三个根验证其在协议选择前直接短路；该
+/// 特例不能推广为允许混用非空动作。
 async fn exercise_point_action_matrix(db: &RealDb) -> TestResult<()> {
-    let transaction = transaction(db, "KVAction point matrix", true)?;
     let ordered_tables = [MEMORY_TABLE, LOG_ORDERED_TABLE, BTREE_TABLE];
+    let ordinary = transaction(db, "KVAction ordinary point matrix", true)?;
 
-    transaction
+    ordinary
         .upsert(
             ordered_tables
                 .iter()
@@ -153,31 +157,22 @@ async fn exercise_point_action_matrix(db: &RealDb) -> TestResult<()> {
     ];
     assert_values(
         "ordinary query order",
-        transaction.query(query_input.clone()).await,
-        &[None, Some(110), Some(111), Some(112), None],
-    )?;
-    assert_values(
-        "dirty query order",
-        transaction.dirty_query(query_input).await,
+        ordinary.query(query_input).await,
         &[None, Some(110), Some(111), Some(112), None],
     )?;
 
     // `None` in an upsert input is ignored; it does not reuse delete semantics.
-    transaction
+    ordinary
         .upsert(vec![kv(MEMORY_TABLE, 10, None)])
         .await
         .map_err(|error| format!("None ordinary upsert returned an error: {error:?}"))?;
-    transaction
-        .dirty_upsert(vec![kv(MEMORY_TABLE, 10, None)])
-        .await
-        .map_err(|error| format!("None dirty upsert returned an error: {error:?}"))?;
     assert_values(
-        "None upsert must currently preserve the existing value",
-        transaction.query(vec![kv(MEMORY_TABLE, 10, None)]).await,
+        "None ordinary upsert must currently preserve the existing value",
+        ordinary.query(vec![kv(MEMORY_TABLE, 10, None)]).await,
         &[Some(110)],
     )?;
 
-    let deleted = transaction
+    let deleted = ordinary
         .delete(vec![
             kv(MISSING_TABLE, 99, None),
             kv(MEMORY_TABLE, 10, None),
@@ -196,7 +191,7 @@ async fn exercise_point_action_matrix(db: &RealDb) -> TestResult<()> {
     )?;
     assert_values(
         "ordinary delete post-state",
-        transaction
+        ordinary
             .query(vec![
                 kv(MEMORY_TABLE, 10, None),
                 kv(LOG_ORDERED_TABLE, 11, None),
@@ -206,8 +201,10 @@ async fn exercise_point_action_matrix(db: &RealDb) -> TestResult<()> {
             .await,
         &[None, None, None, None],
     )?;
+    drop(ordinary);
 
-    transaction
+    let dirty = transaction(db, "KVAction dirty point matrix", true)?;
+    dirty
         .dirty_upsert(
             ordered_tables
                 .iter()
@@ -218,7 +215,29 @@ async fn exercise_point_action_matrix(db: &RealDb) -> TestResult<()> {
         )
         .await
         .map_err(|error| format!("dirty upsert matrix failed: {error:?}"))?;
-    let dirty_deleted = transaction
+    let dirty_query_input = vec![
+        kv(MISSING_TABLE, 199, Some(19_999)),
+        kv(MEMORY_TABLE, 20, Some(19_999)),
+        kv(LOG_ORDERED_TABLE, 21, Some(19_999)),
+        kv(BTREE_TABLE, 22, Some(19_999)),
+        kv(LOG_WRITE_TABLE, 23, Some(19_999)),
+    ];
+    assert_values(
+        "dirty query order",
+        dirty.dirty_query(dirty_query_input).await,
+        &[None, Some(220), Some(221), Some(222), None],
+    )?;
+    dirty
+        .dirty_upsert(vec![kv(MEMORY_TABLE, 20, None)])
+        .await
+        .map_err(|error| format!("None dirty upsert returned an error: {error:?}"))?;
+    assert_values(
+        "None dirty upsert must currently preserve the existing value",
+        dirty.dirty_query(vec![kv(MEMORY_TABLE, 20, None)]).await,
+        &[Some(220)],
+    )?;
+
+    let dirty_deleted = dirty
         .dirty_delete(vec![
             kv(MEMORY_TABLE, 20, None),
             kv(LOG_ORDERED_TABLE, 21, None),
@@ -232,22 +251,59 @@ async fn exercise_point_action_matrix(db: &RealDb) -> TestResult<()> {
         dirty_deleted,
         &[None, None, Some(222), None],
     )?;
+    assert_values(
+        "dirty delete post-state",
+        dirty
+            .dirty_query(vec![
+                kv(MEMORY_TABLE, 20, None),
+                kv(LOG_ORDERED_TABLE, 21, None),
+                kv(BTREE_TABLE, 22, None),
+                kv(LOG_WRITE_TABLE, 23, None),
+            ])
+            .await,
+        &[None, None, None, None],
+    )?;
+    drop(dirty);
 
-    // Empty batches are exact no-ops and preserve result cardinality.
-    assert!(transaction.query(Vec::new()).await.is_empty());
-    assert!(transaction.dirty_query(Vec::new()).await.is_empty());
-    assert!(transaction
+    // Empty batches return before protocol selection, so this neutral root may exercise both names.
+    let empty = transaction(db, "KVAction protocol-neutral empty batches", true)?;
+    assert!(empty.query(Vec::new()).await.is_empty());
+    assert!(empty.dirty_query(Vec::new()).await.is_empty());
+    empty
+        .upsert(Vec::new())
+        .await
+        .map_err(|error| format!("empty upsert failed: {error:?}"))?;
+    empty
+        .dirty_upsert(Vec::new())
+        .await
+        .map_err(|error| format!("empty dirty upsert failed: {error:?}"))?;
+    assert!(empty
         .delete(Vec::new())
         .await
         .map_err(|error| format!("empty delete failed: {error:?}"))?
         .is_empty());
-    assert!(transaction
+    assert!(empty
         .dirty_delete(Vec::new())
         .await
         .map_err(|error| format!("empty dirty delete failed: {error:?}"))?
         .is_empty());
 
-    drop(transaction);
+    // 六个空点操作必须在协议选择前短路。随后能够合法选择并完成空版本 2PC，才是对该
+    // 中立性的公开可观察证明；仅断言普通/dirty 空调用都成功并不能排除它们选择了 Ordinary。
+    let version_prepare = empty
+        .prepare_with_version(Vec::new(), Vec::new())
+        .await
+        .map_err(|error| format!("empty point actions unexpectedly selected a protocol: {error:?}"))?;
+    let version_receipt = empty
+        .commit_with_version(version_prepare)
+        .await
+        .map_err(|error| format!("committing protocol-neutral empty action proof failed: {error:?}"))?;
+    if !version_receipt.is_empty() {
+        return Err(format!(
+            "protocol-neutral empty action proof returned unexpected version receipts: {version_receipt:?}"
+        ));
+    }
+    drop(empty);
     Ok(())
 }
 

@@ -155,6 +155,32 @@ const DB_CLOSED_STATUS: u64 = 4;
 ///
 const STARTUP_DB_SOURCE: &str = "Startup db";
 
+/// 启动时从 Meta 表分批装配用户表的单批上限。
+///
+/// 该值只约束启动阶段的临时内存和单次异步装配规模，不是公开表数量限制，也不改变 Meta、
+/// WAL、repair 或表存储格式。边界设计和真实 8193 表证据见
+/// `docs/STARTUP_TABLE_BATCH_BOUNDARY_BUG.md#startup-table-batch-boundary-index`。
+const STARTUP_TABLE_META_BATCH_LIMIT: usize = 8192;
+
+/// 将本轮 Meta 项放入启动缓冲，并在旧缓冲已满时返回完整旧批次。
+///
+/// 满批次必须先从 `buffer` 中换出，随后 `current` 无条件进入已清空的新缓冲；否则第 8193、
+/// 16385 等边界项会既不属于旧批次也不属于最终剩余批次。返回的旧批次由调用方按原流程
+/// 异步装配。`current` 在装配 await 前只存在于 startup future 的私有局部 `Vec` 中，旧批次
+/// 失败时会随返回路径释放，不会提前修改 registry、Meta、WAL 或后台任务。
+#[inline]
+fn stage_startup_table_meta<T>(buffer: &mut Vec<T>, current: T) -> Option<Vec<T>> {
+    let full_batch = if buffer.len() >= STARTUP_TABLE_META_BATCH_LIMIT {
+        let mut batch = Vec::with_capacity(buffer.len());
+        swap(buffer, &mut batch);
+        Some(batch)
+    } else {
+        None
+    };
+    buffer.push(current);
+    full_batch
+}
+
 ///
 /// 修复数据库时的源
 ///
@@ -527,7 +553,7 @@ impl<
                     false)
             .await
             .unwrap();
-        let mut table_metas_buf = Vec::with_capacity(8192);
+        let mut table_metas_buf = Vec::with_capacity(STARTUP_TABLE_META_BATCH_LIMIT);
         let default_log_table_options = CreateTableOptions::LogOrdTab(512 * 1024 * 1024,
                                                                       2 * 1024 * 1024,
                                                                       2 * 1024 * 1024);
@@ -556,23 +582,24 @@ impl<
             }
             let table_meta = KVTableMeta::from(value);
 
-            if table_metas_buf.len() < 8192 {
-                //填充表元信息，并继续迭代下一个表元信息
-                match table_meta.table_type() {
-                    KVDBTableType::LogOrdTab => {
-                        table_metas_buf.push((table_name, table_meta, Some(default_log_table_options.clone())));
-                    },
-                    KVDBTableType::BtreeOrdTab => {
-                        table_metas_buf.push((table_name, table_meta, Some(default_b_tree_table_options.clone())));
-                    },
-                    _ => {
-                        table_metas_buf.push((table_name, table_meta, None));
-                    },
-                }
-                continue;
-            }
-            let mut table_metas = Vec::with_capacity(table_metas_buf.len());
-            swap(&mut table_metas_buf, &mut table_metas);
+            let table_options = match table_meta.table_type() {
+                KVDBTableType::LogOrdTab => {
+                    Some(default_log_table_options.clone())
+                },
+                KVDBTableType::BtreeOrdTab => {
+                    Some(default_b_tree_table_options.clone())
+                },
+                _ => None,
+            };
+            // 先从已满缓冲取出旧批次，再无条件暂存当前项。这样恰好 8192 项仍由循环后的
+            // 剩余分支加载；第 8193 项则留在下一批，不会因本轮 flush 被跳过。
+            let table_metas = match stage_startup_table_meta(
+                &mut table_metas_buf,
+                (table_name, table_meta, table_options)
+            ) {
+                None => continue,
+                Some(table_metas) => table_metas,
+            };
 
             //异步批量加载表
             if let Err(e) = tr.create_multiple_tables(
@@ -2470,7 +2497,11 @@ impl<
         }
     }
 
-    /// 异步批量创建表，只允许在初始化加载表时使用
+    /// 异步批量创建表，只允许在初始化加载表时使用。
+    ///
+    /// 当前唯一生产调用点保证输入非空、表名来自 Meta 唯一 Key，且用户表尚未注册。该内部
+    /// 前置条件不是通用批量 DDL 契约；空输入或重复已注册项的既有健壮性缺陷归档于
+    /// `docs/REVIEW_FINDINGS.md#find-start-002`，本轮启动边界修复不改变其行为。
     pub(crate) async fn create_multiple_tables(&self,
                                                table_metas: Vec<(Atom, KVTableMeta, Option<CreateTableOptions>)>,
                                                is_checksum: bool,
@@ -2598,7 +2629,21 @@ impl<
         }
     }
 
-    /// 在键值对数据库事务的根事务内，异步查询多个表和键的值的结果集，可能会查询到旧值
+    /// 按输入顺序查询当前根事务中的多个 Table/Key，并采用各表当前的 dirty 读记录策略。
+    ///
+    /// 返回 Vec 与输入严格等长、同序；缺表和 LogWrite 均占一个 `None` 槽位，输入中的 `value`
+    /// 完全不参与查询。空输入在协议选择前直接返回空 Vec。非空输入会选择根的 Ordinary 协议，
+    /// 已选择 Versioned 时当前因本签名没有错误通道而 panic；对子表事务 variant 调用也 panic。
+    ///
+    /// 本方法不代表统一的“脏读”：Meta/Memory/LogOrdered 不登记普通 Read，Btree 当前委托普通
+    /// query 并记录 Read，LogWrite 固定返回 `None`。外部协议要求一个事务要么只使用全部
+    /// `dirty_*` 点操作，要么只使用普通 `query/upsert/delete`，非空动作不得混用；当前库不以
+    /// 独立 guard 强制该约定，违规后的事务安全性没有保证。只读根可以合法查询。
+    ///
+    /// 调用按项串行查 registry 并惰性创建/复用非持久化子事务；Btree overlay 缺席时可能同步
+    /// 读取 redb 并短暂阻塞 worker。方法不写用户值、根 WAL 或数据文件，但可能改变子事务的
+    /// 读/冲突记录。当前无错误返回通道，逐表差异和合法测试入口见 `CONTRACT-ACTION-001`、
+    /// `Q-DIRTY-001` 与 `tests/kv_action_contract.rs`。
     pub async fn dirty_query(&self,
                              table_kv_list: Vec<TableKV>) -> Vec<Option<Binary>> {
         match self {
@@ -2609,7 +2654,17 @@ impl<
         }
     }
 
-    /// 在键值对数据库事务的根事务内，异步查询多个表和键的值的结果集
+    /// 按输入顺序查询当前根事务中的多个 Table/Key，并登记各表的普通读冲突状态。
+    ///
+    /// 返回 Vec 与输入严格等长、同序；缺表和 LogWrite 返回 `None`，`TableKV::value` 被忽略。
+    /// 空输入在协议选择前直接返回空 Vec；非空输入选择 Ordinary 协议，禁止与版本事务或同一
+    /// 根中的任意非空 `dirty_*` 点操作混用。已选择 Versioned 或对子表 variant 调用时当前会
+    /// panic。只读根可使用本方法，但只读事务不得随后执行写操作。
+    ///
+    /// Meta/Memory/LogOrdered/Btree 会登记普通 Read，并可能影响 prepare 冲突；LogWrite 固定
+    /// 返回 `None`。调用按项串行取得 registry 读锁和短期子事务索引锁，惰性创建非持久化表
+    /// 子事务；Btree 可能同步读取 redb 并阻塞 worker。方法不写根 WAL/数据文件，当前签名也
+    /// 无法结构化返回底层读取错误。合法矩阵见 `tests/kv_action_contract.rs`。
     pub async fn query(&self,
                        table_kv_list: Vec<TableKV>) -> Vec<Option<Binary>> {
         match self {
@@ -2620,7 +2675,20 @@ impl<
         }
     }
 
-    /// 在键值对数据库事务的根事务内，异步插入或更新指定多个表和键的值，插入或更新可能会被覆蓋
+    /// 按输入顺序在事务私有视图中执行 dirty upsert。
+    ///
+    /// 空输入在协议选择前返回 `Ok(())`。非空输入选择 Ordinary 根协议，但外部必须让该事务
+    /// 只使用 `dirty_*` 点操作；与普通点操作混用不保证事务安全。对子表 variant 调用会 panic，
+    /// 已选择 Versioned 返回 Normal 协议错误。当前入口不拒绝只读根；只读事务写入会在 prepare
+    /// 快路中被丢弃，属于禁止用法而非受支持语义。
+    ///
+    /// `Some(value)` 才写入；`None` 不是 delete，不改变用户值，但对已存在表仍会创建/复用子事务
+    /// 并可能提升根持久化标志。缺表被静默跳过。批次逐项执行，后项失败不会撤销此前的事务私有
+    /// 动作；成功只表示动作已登记，根 WAL、发布、数据文件持久化和确认仍由后续普通 2PC 完成。
+    /// 当前未统一拒绝长度为 0 的 Value，调用方必须遵守禁止持久化空值的契约。
+    ///
+    /// 每项平均包含一次 registry 查找和表内 O(log n) COW/overlay 更新；LogWrite 只登记动作，
+    /// Btree dirty 当前复用普通 upsert。同步 guard 不用于文件 I/O，本方法自身不写磁盘。
     pub async fn dirty_upsert(&self,
                               table_kv_list: Vec<TableKV>) -> Result<(), KVTableTrError> {
         match self {
@@ -2631,7 +2699,21 @@ impl<
         }
     }
 
-    /// 在键值对数据库事务的根事务内，异步插入或更新指定多个表和键的值
+    /// 按输入顺序在事务私有视图中执行普通 upsert。
+    ///
+    /// 空输入在协议选择前返回 `Ok(())`。非空输入选择 Ordinary 根协议，只能与普通
+    /// `query/upsert/delete` 点操作联合使用；禁止与版本事务或非空 `dirty_*` 点操作混用。
+    /// 对子表 variant 调用会 panic，已选择 Versioned 返回 Normal 协议错误。当前入口不拒绝
+    /// 只读根；只读写入随后会被 prepare 快路静默丢弃，因此调用方必须使用可写根。
+    ///
+    /// `Some(value)` 才执行写入；`None` 不是 delete，但仍可能创建子事务并提升持久化标志。
+    /// 缺表返回 Fatal；由于批次按项执行，缺表前已登记的私有动作不会由本方法撤销，而 Fatal
+    /// 又禁止 rollback，所以合法调用必须预先保证全部表存在。表内错误按其原等级返回。成功只
+    /// 表示私有动作已登记，后续仍须完整 prepare/commit。长度为 0 的 Value 当前未在入口统一
+    /// 拒绝，但不属于可持久化合法域。
+    ///
+    /// 每项平均包含 registry 查找和 O(log n) COW/overlay 更新；同步 guard 不跨文件 I/O，动作
+    /// 阶段不写根 WAL 或数据文件。真实返回、缺表和逐表差异见 `tests/kv_action_contract.rs`。
     pub async fn upsert(&self,
                         table_kv_list: Vec<TableKV>) -> Result<(), KVTableTrError> {
         match self {
@@ -2652,7 +2734,11 @@ impl<
     /// 再按 allocation 身份快路和 bytes 回退比较逻辑状态。每个缓存缺席 Key 的独立读取可能
     /// 短暂阻塞 worker。完整边界见 `CONTRACT-BTREE-DELETE-001`、
     /// `CONTRACT-BTREE-PREPARE-BASELINE-001`、`tests/btree_delete_old_value.rs` 和
-    /// `tests/btree_redb_prepare_baseline.rs`。只能对根事务调用，否则 panic。
+    /// `tests/btree_redb_prepare_baseline.rs`。
+    ///
+    /// 返回 Vec 与输入同序等长；缺表返回一个 `None`，`TableKV::value` 被忽略。空输入不选择
+    /// 协议；非空输入选择 Ordinary，但外部必须让该根只使用 `dirty_*` 点操作。当前入口不拒绝
+    /// 只读根，且批次后项错误不撤销此前私有删除。只能对根事务调用，否则 panic。
     pub async fn dirty_delete(&self,
                         table_kv_list: Vec<TableKV>)
                         -> Result<Vec<Option<Binary>>, KVTableTrError> {
@@ -2674,7 +2760,11 @@ impl<
     /// 再按 allocation 身份快路和 bytes 回退比较逻辑状态。每个缓存缺席 Key 的独立读取可能
     /// 短暂阻塞 worker。完整边界见 `CONTRACT-BTREE-DELETE-001`、
     /// `CONTRACT-BTREE-PREPARE-BASELINE-001`、`tests/btree_delete_old_value.rs` 和
-    /// `tests/btree_redb_prepare_baseline.rs`。只能对根事务调用，否则 panic。
+    /// `tests/btree_redb_prepare_baseline.rs`。
+    ///
+    /// 返回 Vec 与输入同序等长；缺表返回一个 `None`，`TableKV::value` 被忽略。空输入不选择
+    /// 协议；非空输入选择 Ordinary，只能与普通 `query/upsert/delete` 点操作联合使用。当前
+    /// 入口不拒绝只读根，且批次后项错误不撤销此前私有删除。只能对根事务调用，否则 panic。
     pub async fn delete(&self,
                         table_kv_list: Vec<TableKV>)
                         -> Result<Vec<Option<Binary>>, KVTableTrError> {
@@ -2739,7 +2829,16 @@ impl<
         }
     }
 
-    /// 在键值对数据库事务的根事务内，锁住指定表的指定关键字
+    /// 调用指定表当前的 Key 锁钩子。
+    ///
+    /// **当前五类内置表的钩子均为立即成功的 no-op**：不建立排他锁、不等待、不校验 owner 或
+    /// 重入，也不提供内存可见性和事务隔离保证；不得用本 API 保护业务临界区。缺表同样返回
+    /// `Ok(())`。存在表时仍会创建/复用一个非持久化子事务，因此调用不是完全无状态的纯函数。
+    ///
+    /// 本方法选择 Ordinary 协议，属于普通操作族；禁止与版本事务或 dirty-only 根混用。已选择
+    /// Versioned 时返回 Normal 协议错误，对子表 variant 调用会 panic。操作不写用户值、WAL 或
+    /// 数据文件，除 registry/子事务选择外为 O(1)；当前设计状态见 `FIND-LOCK-001` 和
+    /// `tests/kv_action_contract.rs`。
     pub async fn lock_key(&self,
                           table_name: Atom,
                           key: Binary) -> Result<(), KVTableTrError> {
@@ -2751,7 +2850,12 @@ impl<
         }
     }
 
-    /// 在键值对数据库事务的根事务内，解锁指定表的指定关键字
+    /// 调用指定表当前的 Key 解锁钩子。
+    ///
+    /// 当前五类实现与 [`Self::lock_key`] 一样都是 no-op：未锁、非 owner、重复解锁和缺表均返回
+    /// `Ok(())`，不会释放任何真实同步原语。存在表时仍可能创建非持久化子事务。该方法选择
+    /// Ordinary 协议，禁止与版本事务或 dirty-only 根混用；对子表 variant 调用会 panic。
+    /// 不得把成功返回解释为临界区所有权已经释放或其它线程已可见。
     pub async fn unlock_key(&self,
                             table_name: Atom,
                             key: Binary) -> Result<(), KVTableTrError> {
@@ -4040,8 +4144,10 @@ impl<
                                     enable_accelerated_repair: bool)
         -> IOResult<()>
     {
-        // 启动加载是该内部批量入口的唯一生产调用方。先校验完整输入，避免合法项已注册后
-        // 才在后项发现损坏名称，造成部分加载副作用。
+        // 启动加载是该内部批量入口的唯一生产调用方，并保证输入非空、Meta Key 唯一且用户表
+        // 尚未注册。空输入和重复已注册项的现有行为不是对内契约，详见
+        // docs/REVIEW_FINDINGS.md#find-start-002；BUG-STARTUP-BATCH-001 不扩大到这些分支。
+        // 先校验完整输入，避免合法项已注册后才在后项发现损坏名称，造成部分加载副作用。
         for (name, _, _) in &table_metas {
             validate_table_name(name,
                                 ErrorKind::InvalidData,
@@ -6047,6 +6153,10 @@ async fn loop_tracing<R, C, Log>(rt: R,
 #[cfg(all(test, feature = "trace"))]
 #[path = "db_metrics_tests.rs"]
 mod metrics_tests;
+
+#[cfg(test)]
+#[path = "db_startup_tests.rs"]
+mod startup_tests;
 
 // 将表名序列化为二进制数据
 pub(crate) fn table_to_binary(table_name: &Atom) -> Binary {

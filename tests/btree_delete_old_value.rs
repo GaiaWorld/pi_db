@@ -1,6 +1,7 @@
 //! Btree 删除旧值与三态只写缓存语义的真实环境专项测试。
 //!
-//! 本 target 只通过公开 `KVDBManager -> KVDBTransaction::{upsert,delete,dirty_delete,query}`
+//! 本 target 只通过公开 `KVDBManager -> KVDBTransaction::{upsert,dirty_upsert,delete,
+//! dirty_delete,query,dirty_query}`
 //! 生产调用链访问真实 Btree、redb、根 WAL、事务管理器、运行时和文件系统，不使用 mock、
 //! 私有构造或旧测试。它保护 FIND-BTREE-001 的冻结边界：
 //!
@@ -12,13 +13,15 @@
 //!   tombstone 仍须保留且事务仍可提交；真实环境使用新建空表稳定覆盖 `open_table` 错误；
 //! - `dirty_delete` 当前复用普通 Btree 删除路径，本测试只冻结相同的旧值返回边界，不把
 //!   dirty 冲突行为认定为最终设计。
+//! - 普通与 dirty 非空动作始终位于不同根事务；测试不会用协议禁止的混用路径证明公开语义。
 //! - 返回旧 `Binary` 必须可以跨线程读取；redb-only 普通删除还必须在事务存活期间保留同一
 //!   payload 的首次读取基线，以供 prepare 做值冲突比较。调用方释放返回值后只允许该基线
 //!   一个 owner，事务提交消费动作后必须归零，禁止形成超出事务生命周期的隐藏引用。
 //!
-//! 持久化场景使用超过生产 1 MiB 刷新阈值的合法 `Str -> Usize` 数据集，等待公开缓存
-//! 大小归零后再删除，以客观证明 Key 只存在于 redb；删除批次的 Key 总大小同样超过阈值，
-//! 因而无需依赖 60 秒定时器即可验证 redb 删除和缓存清理。整个测试由同步通道施加硬截止。
+//! 持久化场景保留 320 个 4 KiB Key，并增加 17 个 62 KiB 的合法 `Str -> Usize` Key；等待
+//! 公开缓存大小归零后再删除，以客观证明 Key 只存在于 redb。普通根和 dirty 根各自的删除
+//! Key 总大小都独立超过生产 1 MiB 刷新阈值，并在两次提交之间等待缓存归零；测试不依赖
+//! detached 入队任务的调度顺序，也无需等待 60 秒定时器。整个测试由同步通道施加硬截止。
 //!
 //! 双向文档入口：`docs/REVIEW_FINDINGS.md#find-btree-001`、
 //! `docs/SEMANTIC_CONTRACTS.md#contract-btree-delete-old-value`、
@@ -65,6 +68,9 @@ const RUNTIME_DEADLINE: Duration = Duration::from_secs(120);
 const PERSISTENCE_DEADLINE: Duration = Duration::from_secs(30);
 const PERSISTED_KEYS: usize = 320;
 const PERSISTED_KEY_BYTES: usize = 4 * 1024;
+const ORDINARY_COLLECTOR_KEYS: usize = 17;
+const ORDINARY_COLLECTOR_KEY_BYTES: usize = 62 * 1024;
+const BTREE_WAITS_LIMIT_BYTES: usize = 1024 * 1024;
 const REDB_READ_ERROR_MARKER: &str = "Btree delete redb old-value read failed";
 
 static CAPTURE_LOGGER: CaptureLogger = CaptureLogger {
@@ -171,9 +177,9 @@ async fn exercise_dirty_private_cache(db: &RealDb) -> TestResult<()> {
     create_btree_table(db, DIRTY_TABLE, false, EnumType::Usize, EnumType::Usize).await?;
     let transaction = writable_transaction(db, "dirty private cache delete")?;
     transaction
-        .upsert(vec![table_kv(DIRTY_TABLE, 7, Some(707))])
+        .dirty_upsert(vec![table_kv(DIRTY_TABLE, 7, Some(707))])
         .await
-        .map_err(|error| format!("upserting dirty-delete baseline failed: {error:?}"))?;
+        .map_err(|error| format!("dirty-upserting dirty-delete baseline failed: {error:?}"))?;
 
     let first = transaction
         .dirty_delete(vec![table_kv(DIRTY_TABLE, 7, None)])
@@ -283,20 +289,35 @@ async fn exercise_returned_value_lifecycle(db: &RealDb) -> TestResult<()> {
 async fn exercise_redb_only_boundary(rt: &MultiTaskRuntime<()>, db: &RealDb) -> TestResult<()> {
     create_btree_table(db, REDB_TABLE, true, EnumType::Str, EnumType::Usize).await?;
     let keys: Vec<_> = (0..PERSISTED_KEYS).map(persisted_key).collect();
+    let ordinary_collector_keys: Vec<_> = (0..ORDINARY_COLLECTOR_KEYS)
+        .map(ordinary_collector_key)
+        .collect();
     let writer = writable_transaction(db, "redb-only writer")?;
+    let mut baseline_input: Vec<_> = keys
+        .iter()
+        .enumerate()
+        .map(|(index, key)| {
+            TableKV::new(
+                Atom::from(REDB_TABLE),
+                encode_string(key.clone()),
+                Some(encode_usize(index + 10_000)),
+            )
+        })
+        .collect();
+    baseline_input.extend(
+        ordinary_collector_keys
+            .iter()
+            .enumerate()
+            .map(|(index, key)| {
+                TableKV::new(
+                    Atom::from(REDB_TABLE),
+                    encode_string(key.clone()),
+                    Some(encode_usize(index + 20_000)),
+                )
+            }),
+    );
     writer
-        .upsert(
-            keys.iter()
-                .enumerate()
-                .map(|(index, key)| {
-                    TableKV::new(
-                        Atom::from(REDB_TABLE),
-                        encode_string(key.clone()),
-                        Some(encode_usize(index + 10_000)),
-                    )
-                })
-                .collect(),
-        )
+        .upsert(baseline_input)
         .await
         .map_err(|error| format!("upserting redb-only baseline failed: {error:?}"))?;
     commit_transaction(&writer, "redb-only writer").await?;
@@ -318,33 +339,91 @@ async fn exercise_redb_only_boundary(rt: &MultiTaskRuntime<()>, db: &RealDb) -> 
         &expected_baseline,
         &baseline,
     )?;
+    let ordinary_collector_baseline = baseline_probe
+        .query(
+            ordinary_collector_keys
+                .iter()
+                .map(|key| {
+                    TableKV::new(
+                        Atom::from(REDB_TABLE),
+                        encode_string(key.clone()),
+                        None,
+                    )
+                })
+                .collect(),
+        )
+        .await;
+    assert_optional_usizes(
+        "redb-only ordinary collector baseline",
+        &(0..ORDINARY_COLLECTOR_KEYS)
+            .map(|index| Some(index + 20_000))
+            .collect::<Vec<_>>(),
+        &ordinary_collector_baseline,
+    )?;
     drop(baseline_probe);
 
-    let deleter = writable_transaction(db, "redb-only deleter")?;
-    let delete_input: Vec<_> = keys
+    let mut delete_input: Vec<_> = keys
         .iter()
         .map(|key| TableKV::new(Atom::from(REDB_TABLE), encode_string(key.clone()), None))
         .collect();
-    let normal_delete_input: Vec<_> = keys
+    delete_input.extend(ordinary_collector_keys.iter().map(|key| {
+        TableKV::new(Atom::from(REDB_TABLE), encode_string(key.clone()), None)
+    }));
+    let mut normal_delete_input = vec![TableKV::new(
+        Atom::from(REDB_TABLE),
+        encode_string(keys[0].clone()),
+        None,
+    )];
+    normal_delete_input.extend(ordinary_collector_keys.iter().map(|key| {
+        TableKV::new(Atom::from(REDB_TABLE), encode_string(key.clone()), None)
+    }));
+    if let Some(invalid) = normal_delete_input
         .iter()
-        .step_by(2)
-        .map(|key| TableKV::new(Atom::from(REDB_TABLE), encode_string(key.clone()), None))
-        .collect();
+        .find(|item| item.key.len() == 0 || item.key.len() > u16::MAX as usize) {
+        return Err(format!(
+            "ordinary collector fixture exceeds the WAL key boundary: key_bytes={}, valid_range=1..={}",
+            invalid.key.len(),
+            u16::MAX
+        ));
+    }
+    let normal_delete_bytes: usize = normal_delete_input.iter().map(|item| item.key.len()).sum();
+    if normal_delete_bytes <= BTREE_WAITS_LIMIT_BYTES {
+        return Err(format!(
+            "ordinary delete batch cannot independently trigger collector: bytes={normal_delete_bytes}, threshold={BTREE_WAITS_LIMIT_BYTES}"
+        ));
+    }
     let dirty_delete_input: Vec<_> = keys
         .iter()
         .skip(1)
-        .step_by(2)
         .map(|key| TableKV::new(Atom::from(REDB_TABLE), encode_string(key.clone()), None))
         .collect();
+    if let Some(invalid) = dirty_delete_input
+        .iter()
+        .find(|item| item.key.len() == 0 || item.key.len() > u16::MAX as usize) {
+        return Err(format!(
+            "dirty collector fixture exceeds the WAL key boundary: key_bytes={}, valid_range=1..={}",
+            invalid.key.len(),
+            u16::MAX
+        ));
+    }
+    let dirty_delete_bytes: usize = dirty_delete_input.iter().map(|item| item.key.len()).sum();
+    if dirty_delete_bytes <= BTREE_WAITS_LIMIT_BYTES {
+        return Err(format!(
+            "dirty delete batch cannot independently trigger collector: bytes={dirty_delete_bytes}, threshold={BTREE_WAITS_LIMIT_BYTES}"
+        ));
+    }
+
+    // 普通根处理第一个目标 Key 和 17 个合法大 Key。该批次自身超过 collector 阈值，提交后
+    // 可以先严格等待持久化闭环，再启动 dirty 根；测试不依赖两个 detached 入队任务的顺序。
+    let deleter = writable_transaction(db, "redb-only ordinary deleter")?;
     let mut deleted = deleter
-        .delete(normal_delete_input)
+        .delete(normal_delete_input.clone())
         .await
         .map_err(|error| format!("deleting redb-only values failed: {error:?}"))?;
     assert_optional_usizes(
         "redb-only normal delete returns persisted old values",
-        &(0..PERSISTED_KEYS)
-            .step_by(2)
-            .map(|index| Some(index + 10_000))
+        &std::iter::once(Some(10_000))
+            .chain((0..ORDINARY_COLLECTOR_KEYS).map(|index| Some(index + 20_000)))
             .collect::<Vec<_>>(),
         &deleted,
     )?;
@@ -379,45 +458,63 @@ async fn exercise_redb_only_boundary(rt: &MultiTaskRuntime<()>, db: &RealDb) -> 
         ));
     }
 
-    let dirty_deleted = deleter
-        .dirty_delete(dirty_delete_input)
+    let repeated = deleter
+        .delete(normal_delete_input.clone())
+        .await
+        .map_err(|error| format!("repeating normal redb-only delete failed: {error:?}"))?;
+    assert_optional_usizes(
+        "redb-only repeated normal delete stops at tombstone",
+        &vec![None; 1 + ORDINARY_COLLECTOR_KEYS],
+        &repeated,
+    )?;
+    assert_optional_usizes(
+        "redb-only normal tombstone hides persisted value",
+        &vec![None; 1 + ORDINARY_COLLECTOR_KEYS],
+        &deleter.query(normal_delete_input).await,
+    )?;
+    commit_transaction(&deleter, "redb-only ordinary deleter").await?;
+    if weak.upgrade().is_some() {
+        return Err(
+            "redb old value baseline remained owned after ordinary transaction commit".to_string(),
+        );
+    }
+    wait_for_empty_cache(rt, db, REDB_TABLE, PERSISTENCE_DEADLINE).await?;
+
+    // 其余 319 个 4 KiB Key 使用独立 dirty 根，且该批次自身超过 1 MiB collector 门槛。
+    let dirty_deleter = writable_transaction(db, "redb-only dirty deleter")?;
+    let dirty_deleted = dirty_deleter
+        .dirty_delete(dirty_delete_input.clone())
         .await
         .map_err(|error| format!("dirty-deleting redb-only values failed: {error:?}"))?;
     assert_optional_usizes(
         "redb-only dirty delete returns persisted old values",
         &(1..PERSISTED_KEYS)
-            .step_by(2)
             .map(|index| Some(index + 10_000))
             .collect::<Vec<_>>(),
         &dirty_deleted,
     )?;
 
-    let repeated = deleter
-        .delete(delete_input.clone())
+    let repeated_dirty = dirty_deleter
+        .dirty_delete(dirty_delete_input.clone())
         .await
-        .map_err(|error| format!("repeating redb-only delete failed: {error:?}"))?;
+        .map_err(|error| format!("repeating dirty redb-only delete failed: {error:?}"))?;
     assert_optional_usizes(
-        "redb-only repeated delete stops at tombstones",
-        &vec![None; PERSISTED_KEYS],
-        &repeated,
+        "redb-only repeated dirty delete stops at tombstones",
+        &vec![None; PERSISTED_KEYS - 1],
+        &repeated_dirty,
     )?;
     assert_optional_usizes(
-        "redb-only tombstones hide persisted values",
-        &vec![None; PERSISTED_KEYS],
-        &deleter.query(delete_input.clone()).await,
+        "redb-only dirty tombstones hide persisted values",
+        &vec![None; PERSISTED_KEYS - 1],
+        &dirty_deleter.dirty_query(dirty_delete_input).await,
     )?;
-    commit_transaction(&deleter, "redb-only deleter").await?;
-    if weak.upgrade().is_some() {
-        return Err(
-            "redb old value baseline remained owned after transaction commit".to_string(),
-        );
-    }
+    commit_transaction(&dirty_deleter, "redb-only dirty deleter").await?;
     wait_for_empty_cache(rt, db, REDB_TABLE, PERSISTENCE_DEADLINE).await?;
 
     let final_probe = writable_transaction(db, "redb-only final probe")?;
     assert_optional_usizes(
         "redb-only values removed after persistence",
-        &vec![None; PERSISTED_KEYS],
+        &vec![None; PERSISTED_KEYS + ORDINARY_COLLECTOR_KEYS],
         &final_probe.query(delete_input).await,
     )
 }
@@ -646,6 +743,18 @@ fn persisted_key(index: usize) -> String {
     let mut key = String::with_capacity(PERSISTED_KEY_BYTES);
     key.push_str(&prefix);
     for _ in prefix.len()..PERSISTED_KEY_BYTES {
+        key.push(fill);
+    }
+    key
+}
+
+fn ordinary_collector_key(index: usize) -> String {
+    let prefix = format!("ordinary-collector-key={index:020};");
+    assert!(prefix.len() <= ORDINARY_COLLECTOR_KEY_BYTES);
+    let fill = char::from(b'A' + (index % 26) as u8);
+    let mut key = String::with_capacity(ORDINARY_COLLECTOR_KEY_BYTES);
+    key.push_str(&prefix);
+    for _ in prefix.len()..ORDINARY_COLLECTOR_KEY_BYTES {
         key.push(fill);
     }
     key

@@ -25,5 +25,6 @@ prepare_conflict_regression test_prepare_conflict_active_tables
 root_transaction_lifecycle -
 schema_protocol_neutral -
 schema_protocol_recovery -
+startup_table_batch_boundary -
 table_name_contract -
 utils_contract -
