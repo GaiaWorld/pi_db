@@ -17,7 +17,7 @@ use pi_async_rt::rt::{AsyncRuntime,
 use pi_async_transaction::{Transaction2Pc, UnitTransaction,
                            manager_2pc::Transaction2PcStatus};
 use pi_atom::Atom;
-use pi_db::{Binary, TableKey, TableKeyVersion, Version,
+use pi_db::{Binary, TableKeyConflict, TableKeyVersion, Version, VersionConflictKind,
             tables::TableKV};
 
 use key_version_support::{MEMORY_TABLE, RealDb, RealTransaction, TestResult, TempRoot,
@@ -283,9 +283,10 @@ async fn verify_exactly_one_same_key_prepare(
                 }
             },
             Ok((transaction, Err(error))) => {
-                let expected = [TableKey {
+                let expected = [TableKeyConflict {
                     table: table.clone(),
                     key: key.clone(),
+                    kind: VersionConflictKind::TransactionConflict,
                 }];
                 if error.all_conflicts() != Some(&expected[..]) {
                     return Err(format!("contention writer {index} returned unexpected error {error:?}"));

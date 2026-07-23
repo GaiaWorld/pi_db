@@ -17,10 +17,11 @@ use std::{
     thread,
 };
 
-use pi_async_transaction::{ErrorLevel, TransactionError};
+use pi_async_transaction::{ErrorLevel, TransactionConflictError, TransactionError};
 use pi_atom::Atom;
 use pi_bon::{Encode, WriteBuffer};
-use pi_db::{Binary, KVActionLog, KVDBTableType, KVTableMeta, KVTableTrError, TableTrQos};
+use pi_db::{Binary, KVActionLog, KVDBTableType, KVTableMeta, KVTableTrError,
+            TableKeyConflict, TableTrQos, VersionConflictKind};
 use pi_ordmap::asbtree::TreeByteSize;
 use pi_sinfo::EnumType;
 
@@ -298,6 +299,41 @@ fn test_table_transaction_error_contract() {
         .expect("Conflicts must expose its owned context");
     assert_eq!(table.as_str(), "users");
     assert_eq!(key.as_ref(), expected_bytes.as_slice());
+    assert!(conflict.all_conflicts().is_none());
+
+    let all_conflicts =
+        <KVTableTrError as TransactionConflictError>::from_conflict_set(vec![
+            TableKeyConflict {
+                table: Atom::from("users"),
+                key: encode_bon(&43_u64),
+                kind: VersionConflictKind::TransactionConflict,
+            },
+            TableKeyConflict {
+                table: Atom::from("accounts"),
+                key: encode_bon(&7_u64),
+                kind: VersionConflictKind::TransactionConflict,
+            },
+            TableKeyConflict {
+                table: Atom::from("users"),
+                key: encode_bon(&43_u64),
+                kind: VersionConflictKind::ReadSetVersionMismatch,
+            },
+        ]);
+    assert!(all_conflicts.is_all_conflicts());
+    assert!(matches!(all_conflicts.level(), ErrorLevel::Normal));
+    let classified = all_conflicts
+        .all_conflicts()
+        .expect("AllConflicts must expose its classified complete set");
+    assert_eq!(classified.len(), 2);
+    assert_eq!(classified[0].table.as_str(), "accounts");
+    assert_eq!(classified[0].kind, VersionConflictKind::TransactionConflict);
+    assert_eq!(classified[1].table.as_str(), "users");
+    assert_eq!(classified[1].kind, VersionConflictKind::ReadSetVersionMismatch);
+    let first = all_conflicts
+        .conflicts()
+        .expect("AllConflicts must preserve the compatibility first position");
+    assert_eq!(first.0, &classified[0].table);
+    assert_eq!(first.1, &classified[0].key);
 }
 
 /// 验证显式 `Send/Sync` 错误类型可被多个真实 OS 线程并发只读。
@@ -307,6 +343,8 @@ fn test_table_transaction_error_contract() {
 #[test]
 fn test_table_transaction_error_cross_thread_read_contract() {
     assert_send_sync::<KVTableTrError>();
+    assert_send_sync::<TableKeyConflict>();
+    assert_send_sync::<VersionConflictKind>();
 
     let conflict = Arc::new(KVTableTrError::new_conflicts_error(
         Atom::from("accounts"),

@@ -49,6 +49,17 @@ run_trace_ttl_interleaving() {
     fi
 }
 
+# global MeterProvider 必须在数据库启动前生效；独立 target 同时校验六项指标和 loop INFO。
+run_trace_meter_initialization() {
+    if [[ "$mode" == "list" ]]; then
+        "$cargo_bin" "+$toolchain" test --locked --offline -p pi_db --features trace \
+            --test trace_meter_initialization -- --list --format terse
+    else
+        "$cargo_bin" "+$toolchain" test --locked --offline -p pi_db --features trace \
+            --test trace_meter_initialization -- --test-threads=1
+    fi
+}
+
 run_integration() {
     local target="$1"
     local exact="$2"
@@ -69,6 +80,7 @@ cd "$repo_dir"
 run_lib
 run_trace_lib
 run_trace_ttl_interleaving
+run_trace_meter_initialization
 while read -r target exact; do
     if [[ -z "${target:-}" || "$target" == \#* ]]; then
         continue

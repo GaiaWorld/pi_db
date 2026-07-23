@@ -4,6 +4,8 @@
 //! 内存根/Key 版本，再把动作加入表级待确认 FIFO；collector 批量写表日志成功后才调用根
 //! 确认器。表日志失败不会回滚已发布内存根，而是保留未确认根 WAL，重启时由 repair 重新
 //! 应用，这正是“提交成功”和“数据持久化确认成功”两个有序阶段的具体实现。
+//! 完整结构、锁序、状态机、恢复链与证据边界见
+//! `docs/LOG_ORDERED_TABLE_INTERNAL_CONTRACT.md#log-ordered-table-internal-contract-index`。
 
 use std::mem;
 use std::path::{Path, PathBuf};
@@ -42,7 +44,7 @@ use pi_store::log_store::log_file::{PairLoader,
                                     LogMethod,
                                     LogFile};
 
-use crate::{Binary, KVAction, TableTrQos, KVActionLog, KVDBCommitConfirm, KVTableTrError, TableKey, TransactionDebugEvent, transaction_debug_logger,
+use crate::{Binary, KVAction, TableTrQos, KVActionLog, KVDBCommitConfirm, KVTableTrError, TableKeyConflict, TransactionDebugEvent, transaction_debug_logger,
             db::{KVDBTransaction, KVDBChildTrList},
             key_version::{KeyVersions,
                           PrepareMode,
@@ -50,6 +52,7 @@ use crate::{Binary, KVAction, TableTrQos, KVActionLog, KVDBCommitConfirm, KVTabl
                           PreparedCommitError,
                           TableVersionContext,
                           Version,
+                          VersionConflictKind,
                           VersionReceipt,
                           binary_state_equal,
                           has_prepared_conflict,
@@ -94,27 +97,33 @@ impl<
     type Tr = LogOrdTabTr<C, Log>;
     type Error = KVTableTrError;
 
+    // 返回共享 Atom 的引用计数 clone，不读取表日志或 COW 根。
     fn name(&self) -> <Self as KVTable>::Name {
         self.0.name.clone()
     }
 
+    // 这是独立表日志目录；不是根 CommitLogger/WAL 路径。
     fn path(&self) -> Option<&Path> {
         Some(self.0.log_file.path())
     }
 
     #[inline]
+    // LogOrdered 始终拥有独立数据日志；正常写子事务必须参加根 WAL 和后续确认。
     fn is_persistent(&self) -> bool {
         true
     }
 
+    // COW 根保持按 Binary 字典序排列，并支持带起点的双向稳定快照流。
     fn is_ordered(&self) -> bool {
         true
     }
 
+    // 只统计当前已提交内存根，不扫描磁盘，也不包含事务私有未提交动作。
     fn len(&self) -> usize {
         self.0.root.lock().size()
     }
 
+    // full_bytes_size 统计当前 COW 根的逻辑占用；它不是日志目录实际磁盘大小。
     fn size(&self) -> u64 {
         let root_copy = self.0.root.lock().clone();
         root_copy.full_bytes_size()
@@ -126,6 +135,7 @@ impl<
                    is_persistent: bool,
                    prepare_timeout: u64,
                    commit_timeout: u64) -> Self::Tr {
+        // 直接表事务只固定当前根；数据库生产入口通常改用 new_managed 同时租用版本快照。
         LogOrdTabTr::new(source,
                          is_writable,
                          is_persistent,
@@ -138,6 +148,7 @@ impl<
         let table = self.clone();
 
         async move {
+            // split 强制封口当前可写表日志。它不等待或修改根 WAL 的事务确认计数。
             let now = Instant::now();
             match table.0.log_file.split().await {
                 Err(e) => {
@@ -165,6 +176,7 @@ impl<
         let table = self.clone();
 
         async move {
+            // collect 仅合并已经封口的只读表日志；当前可写文件和内存根仍由 LogFile/表维护。
             let now = Instant::now();
             match table.0.log_file.collect(1024 * 1024,
                                            32 * 1024,
@@ -206,6 +218,8 @@ impl<
     /// 参数分别控制日志文件上限/块大小、初始文件索引、启动加载缓冲与校验，以及待确认 FIFO
     /// 的 size/time 触发阈值。打开或加载失败会 panic，故仅供数据库启动路径使用。返回前
     /// COW 根已由日志恢复；后台任务没有显式 shutdown，并会持有表和 runtime clone。
+    /// `log_file_limit/block_limit/load_buf_len` 分别传给 `pi_store::LogFile` 控制文件轮换、日志
+    /// 块和启动读取；`waits_limit/wait_timeout` 只控制本表确认队列的 size/timer 触发。
     pub async fn new<P: AsRef<Path>>(rt: MultiTaskRuntime<()>,
                                      path: P,
                                      name: Atom,
@@ -413,6 +427,7 @@ impl<
 
         async move {
             // rollback 只撤销 prepared 预留并释放版本 lease；尚未发布的私有根随事务释放。
+            // 根 WAL 已成功后不会进入本路径；Fatal commit 错误同样禁止 rollback。
             let transaction_uid = tr.get_transaction_uid().unwrap();
             let _ = tr.0.table.0.prepare.lock().remove(&transaction_uid);
             if let Some(context) = tr.0.version_context.as_ref() {
@@ -454,6 +469,7 @@ impl<
     }
 
     fn get_transaction_uid(&self) -> Option<<Self as Transaction2Pc>::Tid> {
+        // TID 由根 manager 分配并由整棵事务树继承；表级 prepare map 以它作为 owner key。
         self.0.tid.lock().clone()
     }
 
@@ -470,6 +486,7 @@ impl<
     }
 
     fn get_commit_uid(&self) -> Option<<Self as Transaction2Pc>::Cid> {
+        // CID 只用于根 WAL 提交确认占位与回执，不是 Key 版本号或表日志 UID。
         self.0.cid.lock().clone()
     }
 
@@ -840,6 +857,7 @@ impl<
         let tr = self.clone();
 
         async move {
+            // 当前 dirty 族不登记 Read 动作；它只读创建事务后的私有 COW 根。
             if let Some(value) = tr.0.root_mut.lock().get(&key) {
                 //指定关键值存在
                 return Some(value.clone());
@@ -854,6 +872,7 @@ impl<
         let tr = self.clone();
 
         async move {
+            // actions 与 root_mut 使用独立短自旋锁；本分支不会跨 await 持有任一 guard。
             let mut actions_locked = tr.0.actions.lock();
 
             if let None = actions_locked.get(&key) {
@@ -877,6 +896,7 @@ impl<
         let tr = self.clone();
 
         async move {
+            // 同 Key 的多次动作覆盖为最后一个 DirtyWrite，根只保存最终私有状态。
             //记录对指定关键字的最新插入或更新操作
             let _ = tr.0.actions.lock().insert(key.clone(), KVActionLog::DirtyWrite(Some(value.clone())));
 
@@ -894,6 +914,7 @@ impl<
         let tr = self.clone();
 
         async move {
+            // 同 Key 的 Read/旧 Write 被最终 Write 覆盖；prepare 只编码最终写动作。
             //记录对指定关键字的最新插入或更新操作
             let _ = tr.0.actions.lock().insert(key.clone(), KVActionLog::Write(Some(value.clone())));
 
@@ -986,6 +1007,7 @@ impl<
 
     fn lock_key(&self, _key: <Self as KVAction>::Key)
                 -> BoxFuture<Result<(), <Self as KVAction>::Error>> {
+        // LogOrdered 当前没有逐 Key 锁；该 trait 入口是成功 no-op，不能当作排他同步原语。
         async move {
             Ok(())
         }.boxed()
@@ -993,6 +1015,7 @@ impl<
 
     fn unlock_key(&self, _key: <Self as KVAction>::Key)
                   -> BoxFuture<Result<(), <Self as KVAction>::Error>> {
+        // 与 lock_key 对称地保持成功 no-op，不维护可重入或 owner 状态。
         async move {
             Ok(())
         }.boxed()
@@ -1011,6 +1034,7 @@ impl<
            prepare_timeout: u64,
            commit_timeout: u64,
            table: LogOrderedTable<C, Log>) -> Self {
+        // 根锁内只做 O(1) COW clone；root_ref/root_mut 起初指向相同节点集合，后续写时分离。
         let root_ref = table.0.root.lock().clone();
 
         let inner = InnerLogOrdTabTr {
@@ -1044,6 +1068,9 @@ impl<
                               expected: XHashMap<Binary, Version>,
                               receipt: Option<VersionReceipt>,
                               actions: XHashMap<Binary, KVActionLog>) -> Self {
+        // 构造期在表根 guard 内创建 lease；lease_current 只短暂获取 active_snapshots mutex，
+        // 不获取 publication 门。commit 另按 publication -> 表根发布，三者没有反向嵌套。
+        // 根 guard 在应用传入动作前释放，避免扩大共享临界区。
         let root_locked = table.0.root.lock();
         let root_ref = root_locked.clone();
         let snapshot = versions.lease_current();
@@ -1097,9 +1124,10 @@ impl<
         let mut conflicts = Vec::new();
         for (key, expected) in context.expected() {
             if context.versions().current_version(key).as_ref() != Some(expected) {
-                conflicts.push(TableKey {
+                conflicts.push(TableKeyConflict {
                     table: self.0.table.name(),
                     key: key.clone(),
+                    kind: VersionConflictKind::ReadSetVersionMismatch,
                 });
             }
         }
@@ -1137,7 +1165,8 @@ impl<
                 // 防止第一阶段检查后、建立预留前发生的合法提交改变版本。
                 for (key, expected) in context.expected() {
                     if context.versions().current_version(key).as_ref() != Some(expected) {
-                        conflict_keys.push(key.clone());
+                        conflict_keys.push((key.clone(),
+                                            VersionConflictKind::ReadSetVersionMismatch));
                     }
                 }
             }
@@ -1153,12 +1182,14 @@ impl<
                 if context
                     .versions()
                     .has_committed_after(key, context.snapshot_revision()) {
-                    conflict_keys.push(key.clone());
+                    conflict_keys.push((key.clone(),
+                                        VersionConflictKind::TransactionConflict));
                     continue;
                 }
             }
             if !binary_state_equal(self.0.root_ref.get(key), current_root.get(key)) {
-                conflict_keys.push(key.clone());
+                conflict_keys.push((key.clone(),
+                                    VersionConflictKind::TransactionConflict));
             }
         }
 
@@ -1178,7 +1209,8 @@ impl<
         // prepared 检查和当前 TID 插入必须在同一锁临界区，封闭相同新 Key 并发插入窗口。
         for (key, action) in &actions {
             if has_prepared_conflict(&prepare, key, mode, action) {
-                conflict_keys.push(key.clone());
+                conflict_keys.push((key.clone(),
+                                    VersionConflictKind::TransactionConflict));
             }
         }
         if !conflict_keys.is_empty() {
@@ -1227,9 +1259,10 @@ impl<
 
     fn prepare_conflict_error(&self,
                               conflict_kind: PrepareConflictKind,
-                              keys: Vec<Binary>) -> KVTableTrError {
+                              keys: Vec<(Binary, VersionConflictKind)>) -> KVTableTrError {
         // keys 已保证非空；All 由根 manager 与其它表冲突合并、排序和去重。
-        let key = keys[0].clone();
+        // 分类与同 Key 优先级见 docs/VERSION_CONFLICT_KIND_DESIGN.md。
+        let key = keys[0].0.clone();
         match conflict_kind {
             PrepareConflictKind::Common => {
                 KVTableTrError::new_transaction_error(
@@ -1246,9 +1279,10 @@ impl<
             PrepareConflictKind::All => {
                 KVTableTrError::new_all_conflicts_error(keys
                     .into_iter()
-                    .map(|key| TableKey {
+                    .map(|(key, kind)| TableKeyConflict {
                         table: self.0.table.name(),
                         key,
+                        kind,
                     })
                     .collect())
             },
@@ -1329,6 +1363,7 @@ impl<
     Log: AsyncCommitLog<C = C, Cid = Guid>,
 > PairLoader for LogOrderedTableLoader<C, Log> {
     fn is_require(&self, _log_file: Option<&PathBuf>, key: &Vec<u8>) -> bool {
+        // LogFile::load 从最新记录向更旧记录遍历；root/removed 中任一命中都表示最终状态已定。
         //不在已删除关键字表中且不在有序日志表的内存表中的关键字，才允许被加载
         !self
             .removed
@@ -1348,6 +1383,7 @@ impl<
             _method: LogMethod,
             key: Vec<u8>,
             value: Option<Vec<u8>>) {
+        // 调用方已经通过 is_require；PairLoader 在单个启动 future 中串行调用，不存在并发 loader。
         if let Some(value) = value {
             //插入或更新指定关键字的值
             if let Some(path) = log_file {
@@ -1389,11 +1425,13 @@ impl<
 
     /// 获取已加载的文件数量
     pub fn log_files_len(&self) -> usize {
+        // 只统计至少贡献一个最终存活 value 的文件；仅含 tombstone/被遮蔽记录的文件不计入。
         self.statistics.len()
     }
 
     /// 获取已加载的关键字数量
     pub fn keys_len(&self) -> u64 {
+        // 这是实际从日志载入 root 的 value 记录数，不含 tombstone 和被更新记录。
         let mut len = 0;
 
         for statistics in self.statistics.values() {
@@ -1405,6 +1443,7 @@ impl<
 
     /// 获取已加载的字节数
     pub fn bytes_len(&self) -> u64 {
+        // 统计最终载入 value 的 key+value payload；不代表文件头、块头或目录实际字节数。
         let mut len = 0;
 
         for statistics in self.statistics.values() {
@@ -1459,6 +1498,7 @@ async fn collect_waits<
             .lock()
             .await;
 
+        // 空队列保持 log_uid=0；LogFile 会把已提交 UID 的请求作为幂等成功，不产生空业务值。
         while let Some((wait_tr, actions, confirm)) = locked.pop_front() {
             for (key, actions) in actions.iter() {
                 match actions {
@@ -1586,4 +1626,463 @@ async fn collect_waits<
     table.0.collecting.store(false, Ordering::Release); //设置为已整理结束
 
     Ok((now.elapsed(), (trs_len, keys_len, bytes_len)))
+}
+#[cfg(test)]
+mod log_ordered_local_contract_tests {
+    //! LogOrdered 表内部局部不变量测试。
+    //!
+    //! 测试夹具使用真实 `LogFile`，但直接构造表内层且不启动永久 collector，只用于观察私有
+    //! COW 根、动作、prepared map 和 loader。根 manager、根 WAL、异步确认、版本 publication、
+    //! 重启与 repair 的生产可达性仍由独立真实集成测试证明，不能由本模块测试替代。
+
+    use std::{fs,
+              path::PathBuf,
+              sync::{mpsc::sync_channel,
+                     atomic::{AtomicU64, Ordering as AtomicOrdering}},
+              time::{SystemTime, UNIX_EPOCH}};
+
+    use futures::executor::block_on;
+    use pi_async_rt::{prelude::AsyncRuntimeExt,
+                      rt::multi_thread::MultiTaskRuntimeBuilder};
+    use pi_bon::{Encode, WriteBuffer};
+    use pi_store::commit_logger::CommitLogger;
+
+    use super::*;
+
+    type TestTable = LogOrderedTable<usize, CommitLogger>;
+
+    static NEXT_TEST_ROOT: AtomicU64 = AtomicU64::new(0);
+
+    struct LocalLogOrderedFixture {
+        table: Option<TestTable>,
+        path: PathBuf,
+    }
+
+    impl LocalLogOrderedFixture {
+        fn new(label: &str) -> Self {
+            let sequence = NEXT_TEST_ROOT.fetch_add(1, AtomicOrdering::Relaxed);
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time must be after the Unix epoch")
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "pi_db_log_ordered_local_{label}_{}_{}_{}",
+                std::process::id(),
+                nanos,
+                sequence,
+            ));
+            let rt = MultiTaskRuntimeBuilder::default()
+                .init_worker_size(1)
+                .build();
+            let open_rt = rt.clone();
+            let open_path = path.clone();
+            let (sender, receiver) = sync_channel(1);
+            rt.block_on(async move {
+                let result = LogFile::open(open_rt,
+                                           open_path,
+                                           2 * 1024 * 1024,
+                                           64 * 1024 * 1024,
+                                           None).await;
+                sender.send(result)
+                    .expect("LogOrdered local LogFile receiver must remain alive");
+            })
+                .expect("LogOrdered local runtime must complete LogFile::open");
+            let log_file = receiver
+                .recv()
+                .expect("LogOrdered local LogFile result must be returned")
+                .expect("LogOrdered local LogFile must open");
+            let table = LogOrderedTable(Arc::new(InnerLogOrderedTable {
+                name: Atom::from("log_ordered_local"),
+                root: Mutex::new(OrdMap::new(None)),
+                prepare: Mutex::new(XHashMap::default()),
+                rt,
+                waits: AsyncMutex::new(VecDeque::new()),
+                waits_size: AtomicUsize::new(0),
+                waits_limit: 16 * 1024 * 1024,
+                wait_timeout: 60 * 1000,
+                collecting: AtomicBool::new(false),
+                log_file,
+                notifier: None,
+            }));
+
+            Self {
+                table: Some(table),
+                path,
+            }
+        }
+
+        fn table(&self) -> TestTable {
+            self.table.as_ref().expect("fixture table must exist").clone()
+        }
+    }
+
+    impl Drop for LocalLogOrderedFixture {
+        fn drop(&mut self) {
+            drop(self.table.take());
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn binary(value: &str) -> Binary {
+        assert!(!value.is_empty(), "test Binary must satisfy the non-empty value contract");
+        let mut buffer = WriteBuffer::new();
+        Atom::from(value).encode(&mut buffer);
+        Binary::new(buffer.bytes)
+    }
+
+    fn assert_binary(actual: Option<Binary>, expected: Option<&Binary>, label: &str) {
+        match (actual, expected) {
+            (Some(actual), Some(expected)) => {
+                assert_eq!(actual.as_ref(), expected.as_ref(), "{label}: value mismatch");
+            },
+            (None, None) => (),
+            (actual, expected) => {
+                panic!("{label}: presence mismatch, actual: {}, expected: {}",
+                       actual.is_some(),
+                       expected.is_some());
+            },
+        }
+    }
+
+    /// 表属性、叶节点拓扑、根身份字段、状态和 persistence 提升必须保持单义。
+    #[test]
+    fn test_log_ordered_metadata_leaf_identity_and_qos_contract() {
+        let fixture = LocalLogOrderedFixture::new("identity");
+        let table = fixture.table();
+        assert_eq!(table.name().as_str(), "log_ordered_local");
+        assert_eq!(table.path(), Some(fixture.path.as_path()));
+        assert!(table.is_persistent());
+        assert!(table.is_ordered());
+        assert_eq!(table.len(), 0);
+        assert_eq!(table.size(), 0);
+
+        let transaction = table.transaction(Atom::from("LogOrdered local identity source"),
+                                            true,
+                                            false,
+                                            1_234,
+                                            5_678);
+        assert!(transaction.is_writable());
+        assert!(!transaction.is_concurrent_prepare());
+        assert!(!transaction.is_concurrent_commit());
+        assert!(!transaction.is_concurrent_rollback());
+        assert!(transaction.is_enable_inherit_uid());
+        assert_eq!(transaction.get_source().as_str(), "LogOrdered local identity source");
+        assert_eq!(transaction.get_prepare_timeout(), 1_234);
+        assert_eq!(transaction.get_commit_timeout(), 5_678);
+        assert_eq!(transaction.get_status(), Transaction2PcStatus::Start);
+        assert!(transaction.is_unit());
+        assert!(!transaction.is_sequence());
+        assert!(!transaction.is_tree());
+        assert!(transaction.prev_item().is_none());
+        assert!(transaction.next_item().is_none());
+        assert_eq!(transaction.children_len(), 0);
+        assert_eq!(transaction.to_children().count(), 0);
+        assert_eq!(transaction.qos(), TableTrQos::ThreadSafe);
+        assert!(block_on(transaction.init()).is_ok());
+
+        let tid = Guid(101);
+        let cid = Guid(102);
+        transaction.set_transaction_uid(tid.clone());
+        transaction.set_commit_uid(cid.clone());
+        transaction.set_prepare_uid(Guid(103));
+        assert_eq!(transaction.get_transaction_uid(), Some(tid));
+        assert_eq!(transaction.get_commit_uid(), Some(cid));
+        assert!(transaction.get_prepare_uid().is_none());
+        transaction.set_status(Transaction2PcStatus::Actioning);
+        assert_eq!(transaction.get_status(), Transaction2PcStatus::Actioning);
+        transaction.require_persistence();
+        transaction.require_persistence();
+        assert!(transaction.is_require_persistence());
+        assert_eq!(transaction.qos(), TableTrQos::Safe);
+
+        let read_only = table.transaction(Atom::from("LogOrdered local read only"),
+                                          false,
+                                          true,
+                                          7,
+                                          9);
+        assert!(matches!(block_on(read_only.prepare()), Ok(None)));
+        assert!(table.0.prepare.lock().is_empty());
+    }
+
+    /// 动作只修改私有 COW 根，同 Key 后写只保留最终动作，流固定创建瞬间的私有根。
+    #[test]
+    fn test_log_ordered_private_cow_final_action_and_snapshot_contract() {
+        let fixture = LocalLogOrderedFixture::new("actions");
+        let table = fixture.table();
+        let retained_key = binary("log-ordered-local-retained");
+        let deleted_key = binary("log-ordered-local-deleted");
+        let committed_value = binary("committed-value");
+        let first_value = binary("first-private-value");
+        let final_value = binary("final-private-value");
+        table.0.root.lock().upsert(deleted_key.clone(), committed_value.clone(), false);
+
+        let transaction = table.transaction(Atom::from("LogOrdered local actions source"),
+                                            true,
+                                            true,
+                                            100,
+                                            200);
+        block_on(transaction.upsert(retained_key.clone(), first_value.clone()))
+            .expect("first private LogOrdered upsert must succeed");
+        let snapshot = transaction.values(None, false);
+        block_on(transaction.upsert(retained_key.clone(), final_value.clone()))
+            .expect("final private LogOrdered upsert must succeed");
+        let removed = block_on(transaction.delete(deleted_key.clone()))
+            .expect("private LogOrdered delete must succeed");
+        assert!(removed.is_none(), "LogOrdered delete must not expose the old value");
+
+        assert_binary(block_on(transaction.query(retained_key.clone())),
+                      Some(&final_value),
+                      "transaction must observe final private upsert");
+        assert_binary(table.query_committed(&retained_key),
+                      None,
+                      "uncommitted LogOrdered upsert must not reach shared root");
+        assert_binary(table.query_committed(&deleted_key),
+                      Some(&committed_value),
+                      "uncommitted LogOrdered delete must not reach shared root");
+
+        let snapshot_entries = block_on(snapshot.collect::<Vec<_>>());
+        assert_eq!(snapshot_entries.len(), 2);
+        assert!(snapshot_entries.iter().any(|(key, value)| {
+            key.as_ref() == retained_key.as_ref() && value.as_ref() == first_value.as_ref()
+        }));
+        assert!(snapshot_entries.iter().any(|(key, value)| {
+            key.as_ref() == deleted_key.as_ref() && value.as_ref() == committed_value.as_ref()
+        }));
+
+        let actions = transaction.0.actions.lock();
+        assert_eq!(actions.len(), 2);
+        assert!(matches!(actions.get(&retained_key),
+                         Some(KVActionLog::Write(Some(value)))
+                         if value.as_ref() == final_value.as_ref()));
+        assert!(matches!(actions.get(&deleted_key), Some(KVActionLog::Write(None))));
+    }
+
+    /// prepare 只编码最终写并转移动作；prepared 冲突必须原子拒绝，rollback 不发布私有根。
+    #[test]
+    fn test_log_ordered_prepare_wal_conflict_ownership_and_rollback_contract() {
+        let fixture = LocalLogOrderedFixture::new("prepare");
+        let table = fixture.table();
+        let upsert_key = binary("log-ordered-local-prepare-upsert");
+        let delete_key = binary("log-ordered-local-prepare-delete");
+        let read_key = binary("log-ordered-local-prepare-read");
+        let old_value = binary("old-committed-value");
+        let new_value = binary("new-private-value");
+        table.0.root.lock().upsert(delete_key.clone(), old_value.clone(), false);
+
+        let transaction = table.transaction(Atom::from("LogOrdered local prepare source"),
+                                            true,
+                                            true,
+                                            300,
+                                            400);
+        let tid = Guid(201);
+        transaction.set_transaction_uid(tid.clone());
+        block_on(transaction.upsert(upsert_key.clone(), new_value.clone()))
+            .expect("private LogOrdered upsert before prepare must succeed");
+        block_on(transaction.delete(delete_key.clone()))
+            .expect("private LogOrdered delete before prepare must succeed");
+        assert!(block_on(transaction.query(read_key.clone())).is_none());
+
+        let output = block_on(transaction.prepare_conflicts())
+            .expect("LogOrdered prepare must succeed")
+            .expect("LogOrdered writes must produce a WAL fragment");
+        let (table_name, write_count, offset) =
+            <TestTable as KVTable>::get_init_table_prepare_output(&output, 0);
+        let (writes, end) =
+            <TestTable as KVTable>::get_all_key_value_from_table_prepare_output(
+                &output,
+                &table_name,
+                write_count,
+                offset);
+        assert_eq!(table_name.as_str(), "log_ordered_local");
+        assert_eq!(write_count, 2, "Read must not enter the LogOrdered WAL fragment");
+        assert_eq!(writes.len(), 2);
+        assert_eq!(end, output.len());
+        assert!(writes.iter().any(|entry| {
+            entry.key.as_ref() == upsert_key.as_ref()
+                && entry.value.as_ref().map(Binary::as_ref) == Some(new_value.as_ref())
+        }));
+        assert!(writes.iter().any(|entry| {
+            entry.key.as_ref() == delete_key.as_ref() && entry.value.is_none()
+        }));
+
+        assert!(transaction.0.actions.lock().is_empty());
+        {
+            let prepared = table.0.prepare.lock();
+            let item = prepared
+                .get(&tid)
+                .expect("LogOrdered prepare map must reserve the root TID");
+            assert_eq!(item.mode, PrepareMode::Ordinary);
+            assert_eq!(item.actions.len(), 3);
+            assert!(matches!(item.actions.get(&read_key), Some(KVActionLog::Read)));
+        }
+
+        let contender = table.transaction(Atom::from("LogOrdered local prepared contender"),
+                                          true,
+                                          true,
+                                          500,
+                                          600);
+        contender.set_transaction_uid(Guid(202));
+        block_on(contender.upsert(upsert_key.clone(), binary("contender-value")))
+            .expect("LogOrdered contender action must succeed locally");
+        let conflict = block_on(contender.prepare_conflicts())
+            .expect_err("same-Key prepared LogOrdered contender must conflict");
+        assert!(conflict.is_conflicts());
+        block_on(contender.rollback()).expect("LogOrdered contender rollback must succeed");
+
+        assert_binary(table.query_committed(&upsert_key),
+                      None,
+                      "prepare must not publish LogOrdered upsert");
+        assert_binary(table.query_committed(&delete_key),
+                      Some(&old_value),
+                      "prepare must not publish LogOrdered delete");
+        block_on(transaction.rollback()).expect("LogOrdered rollback must release prepared state");
+        assert!(table.0.prepare.lock().is_empty());
+    }
+
+    /// DirtyWrite 当前无条件跳过值状态比较；本测试只固定现状，不把它提升为最终设计。
+    #[test]
+    fn test_log_ordered_dirty_prepare_current_conflict_branch() {
+        let fixture = LocalLogOrderedFixture::new("dirty");
+        let table = fixture.table();
+        let key = binary("log-ordered-local-dirty");
+        let initial_value = binary("initial-value");
+        let private_value = binary("dirty-private-value");
+        let concurrent_value = binary("concurrent-committed-value");
+        table.0.root.lock().upsert(key.clone(), initial_value, false);
+
+        let transaction = table.transaction(Atom::from("LogOrdered local dirty source"),
+                                            true,
+                                            true,
+                                            700,
+                                            800);
+        let tid = Guid(301);
+        transaction.set_transaction_uid(tid.clone());
+        block_on(transaction.dirty_upsert(key.clone(), private_value.clone()))
+            .expect("LogOrdered dirty upsert must succeed locally");
+        assert_binary(block_on(transaction.dirty_query(key.clone())),
+                      Some(&private_value),
+                      "dirty query must observe the private root");
+        table.0.root.lock().upsert(key.clone(), concurrent_value.clone(), false);
+
+        assert!(block_on(transaction.prepare_conflicts())
+            .expect("LogOrdered DirtyWrite currently skips committed value comparison")
+            .is_some());
+        assert!(table.0.prepare.lock().contains_key(&tid));
+        assert_binary(table.query_committed(&key),
+                      Some(&concurrent_value),
+                      "LogOrdered dirty prepare must not publish its private value");
+        block_on(transaction.rollback()).expect("LogOrdered dirty rollback must succeed");
+        assert!(table.0.prepare.lock().is_empty());
+    }
+
+    /// 受信 repair 直接得到最终状态并登记 Ordinary prepared；最终动作可逻辑幂等重放。
+    #[test]
+    fn test_log_ordered_repair_final_state_and_local_idempotence() {
+        let fixture = LocalLogOrderedFixture::new("repair");
+        let table = fixture.table();
+        let upsert_key = binary("log-ordered-local-repair-upsert");
+        let delete_key = binary("log-ordered-local-repair-delete");
+        let old_value = binary("old-value");
+        let repaired_value = binary("repaired-value");
+        table.0.root.lock().upsert(delete_key.clone(), old_value, false);
+
+        let first = table.transaction(Atom::from("LogOrdered local repair first"),
+                                      true,
+                                      true,
+                                      900,
+                                      1_000);
+        block_on(first.upsert(upsert_key.clone(), repaired_value.clone()))
+            .expect("first LogOrdered repair upsert action must be staged");
+        block_on(first.delete(delete_key.clone()))
+            .expect("first LogOrdered repair delete action must be staged");
+        let first_tid = Guid(401);
+        first.prepare_repair(first_tid.clone());
+
+        assert_binary(table.query_committed(&upsert_key),
+                      Some(&repaired_value),
+                      "LogOrdered repair must apply upsert directly");
+        assert_binary(table.query_committed(&delete_key),
+                      None,
+                      "LogOrdered repair must apply delete directly");
+        assert!(first.0.actions.lock().is_empty());
+
+        let second = table.transaction(Atom::from("LogOrdered local repair second"),
+                                       true,
+                                       true,
+                                       1_100,
+                                       1_200);
+        block_on(second.upsert(upsert_key.clone(), repaired_value.clone()))
+            .expect("second LogOrdered repair upsert action must be staged");
+        block_on(second.delete(delete_key.clone()))
+            .expect("second LogOrdered repair delete action must be staged");
+        let second_tid = Guid(402);
+        second.prepare_repair(second_tid.clone());
+
+        assert_eq!(table.len(), 1);
+        assert_binary(table.query_committed(&upsert_key),
+                      Some(&repaired_value),
+                      "repeated LogOrdered repair must retain final upsert");
+        assert_binary(table.query_committed(&delete_key),
+                      None,
+                      "repeated LogOrdered repair must retain final delete");
+        let mut prepared = table.0.prepare.lock();
+        assert_eq!(prepared.len(), 2);
+        assert_eq!(prepared.remove(&first_tid).map(|item| item.mode),
+                   Some(PrepareMode::Ordinary));
+        assert_eq!(prepared.remove(&second_tid).map(|item| item.mode),
+                   Some(PrepareMode::Ordinary));
+        assert!(prepared.is_empty());
+    }
+
+    /// loader 必须保持新日志优先，tombstone 必须压制旧值，统计只计算实际载入的 value。
+    #[test]
+    fn test_log_ordered_loader_newest_tombstone_and_statistics_contract() {
+        let fixture = LocalLogOrderedFixture::new("loader");
+        let table = fixture.table();
+        let newest_key = binary("log-ordered-local-loader-newest");
+        let removed_key = binary("log-ordered-local-loader-removed");
+        let older_key = binary("log-ordered-local-loader-older");
+        let newest_value = binary("newest-value");
+        let ignored_older_value = binary("ignored-older-value");
+        let older_value = binary("older-value");
+        let newer_path = PathBuf::from("log-ordered-newer.log");
+        let older_path = PathBuf::from("log-ordered-older.log");
+        let mut loader = LogOrderedTableLoader::new(table.clone());
+
+        assert!(loader.is_require(Some(&newer_path), &newest_key.as_ref().to_vec()));
+        loader.load(Some(&newer_path),
+                    LogMethod::PlainAppend,
+                    newest_key.as_ref().to_vec(),
+                    Some(newest_value.as_ref().to_vec()));
+        assert!(!loader.is_require(Some(&older_path), &newest_key.as_ref().to_vec()));
+
+        assert!(loader.is_require(Some(&newer_path), &removed_key.as_ref().to_vec()));
+        loader.load(Some(&newer_path),
+                    LogMethod::Remove,
+                    removed_key.as_ref().to_vec(),
+                    None);
+        assert!(!loader.is_require(Some(&older_path), &removed_key.as_ref().to_vec()));
+
+        assert!(loader.is_require(Some(&older_path), &older_key.as_ref().to_vec()));
+        loader.load(Some(&older_path),
+                    LogMethod::PlainAppend,
+                    older_key.as_ref().to_vec(),
+                    Some(older_value.as_ref().to_vec()));
+
+        assert_binary(table.query_committed(&newest_key),
+                      Some(&newest_value),
+                      "newest LogOrdered loader value must win");
+        assert_binary(table.query_committed(&removed_key),
+                      None,
+                      "LogOrdered loader tombstone must suppress older value");
+        assert_binary(table.query_committed(&older_key),
+                      Some(&older_value),
+                      "unshadowed older LogOrdered value must load");
+        assert_ne!(table.query_committed(&newest_key), Some(ignored_older_value));
+        assert_eq!(loader.log_files_len(), 2);
+        assert_eq!(loader.keys_len(), 2);
+        assert_eq!(loader.bytes_len(),
+                   (newest_key.len() + newest_value.len()
+                    + older_key.len() + older_value.len()) as u64);
+    }
 }

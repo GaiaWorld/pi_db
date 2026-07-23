@@ -27,7 +27,7 @@ use pi_atom::Atom;
 use pi_db::{
     tables::TableKV,
     utils::CreateTableOptions,
-    Binary, KVDBTableType, KVTableMeta, TableKeyVersion, Version,
+    Binary, KVDBTableType, KVTableMeta, TableKeyVersion, Version, VersionConflictKind,
 };
 
 use key_version_support::{
@@ -836,6 +836,9 @@ fn test_schema_create_version_conflict_rolls_back_transactional_state() {
         expect_eq("schema/version conflict count", &conflicts.len(), &1usize)?;
         expect_eq("schema/version conflict table", &conflicts[0].table, &Atom::from(TABLE_NAME))?;
         expect_binary("schema/version conflict key", Some(&conflicts[0].key), Some(&key))?;
+        expect_eq("schema/version conflict kind",
+                  &conflicts[0].kind,
+                  &VersionConflictKind::ReadSetVersionMismatch)?;
         expect_eq(
             "schema/version conflict status",
             &transaction.get_status(),

@@ -42,7 +42,7 @@ use pi_store::log_store::log_file::{PairLoader,
                                     LogFile};
 
 use crate::{Binary, KVAction, TableTrQos, KVActionLog, KVDBCommitConfirm, KVTableTrError,
-            TableKey,
+            TableKeyConflict,
             db::{KVDBTransaction, KVDBChildTrList},
             key_version::{KeyVersions,
                           PrepareMode,
@@ -50,6 +50,7 @@ use crate::{Binary, KVAction, TableTrQos, KVActionLog, KVDBCommitConfirm, KVTabl
                           PreparedCommitError,
                           TableVersionContext,
                           Version,
+                          VersionConflictKind,
                           VersionReceipt,
                           binary_state_equal,
                           has_prepared_conflict,
@@ -59,9 +60,10 @@ use crate::{Binary, KVAction, TableTrQos, KVActionLog, KVDBCommitConfirm, KVTabl
             utils::KVDBEvent,
             KVDBTableType};
 
+/// Meta 独立表日志一次 `delay_commit` 的最大延迟，单位毫秒。
 ///
-/// 默认的日志文件延迟提交的超时时长，单位ms
-///
+/// 该常量只影响已经发布到内存根、正在写入 Meta `LogFile` 的批次，不是根事务 prepare/commit
+/// timeout，也不改变根 WAL 的提交成功边界。
 const DEFAULT_LOG_FILE_COMMIT_DELAY_TIMEOUT: usize = 1000;
 
 /// 数据库表目录使用的持久化、有序 Meta 表共享句柄。
@@ -95,32 +97,42 @@ impl<
     type Tr = MetaTabTr<C, Log>;
     type Error = KVTableTrError;
 
+    /// 返回内部 Meta 表名的共享字符串 owner；正常数据库固定为 `.tables_meta`。
     fn name(&self) -> <Self as KVTable>::Name {
         self.0.name.clone()
     }
 
+    /// 返回 Meta 独立 `LogFile` 的目录，不是数据库根 WAL 目录。
     fn path(&self) -> Option<&Path> {
         Some(self.0.log_file.path())
     }
 
+    /// Meta 定义必须写入根 WAL 和独立表日志，因此表能力恒为持久化。
     #[inline]
     fn is_persistent(&self) -> bool {
         true
     }
 
+    /// Meta 使用有序 COW 根，迭代顺序按编码后的表名 Key 排列。
     fn is_ordered(&self) -> bool {
         true
     }
 
+    /// 返回调用瞬间已提交 Meta 根的记录数；不包含事务私有修改或 prepared 动作。
     fn len(&self) -> usize {
         self.0.root.lock().size()
     }
 
+    /// 返回当前 COW 根维护的逻辑字节估算，不是进程 RSS、文件大小或根 WAL 大小。
     fn size(&self) -> u64 {
         let root_copy = self.0.root.lock().clone();
         root_copy.full_bytes_size()
     }
 
+    /// 创建一个未托管的 Meta 叶事务。
+    ///
+    /// 生产根事务通常使用 `new_managed` 绑定精确版本表；本入口还用于启动 iterator 的 detached
+    /// 快照 owner。`is_persistent` 表示动作是否生成根 WAL 片段，不改变 Meta 表自身持久化能力。
     fn transaction(&self,
                    source: Atom,
                    is_writable: bool,
@@ -135,6 +147,10 @@ impl<
                        self.clone())
     }
 
+    /// 强制切分 Meta 表日志，为后续只读文件整理建立边界。
+    ///
+    /// 本操作不 flush 根 WAL、不推进事务状态，也不等待当前 `waits` 队列；失败返回可恢复的
+    /// Normal maintenance 错误。
     fn ready_collect(&self) -> BoxFuture<Result<(), Self::Error>> {
         let table = self.clone();
 
@@ -162,6 +178,10 @@ impl<
         }.boxed()
     }
 
+    /// 整理已经切分出的 Meta 只读日志文件。
+    ///
+    /// `LogFile::collect` 自行串行化存储状态；本层不重试，也不持有 Meta root/prepare/waits 锁。
+    /// 成功只表示表日志整理完成，不代表任何根 WAL 新增确认。
     fn collect(&self) -> BoxFuture<Result<(), Self::Error>> {
         let table = self.clone();
 
@@ -213,7 +233,9 @@ impl<
     /// 日志。打开或加载失败会 panic，因此该构造器只供已校验的数据库启动路径使用。
     ///
     /// 返回前日志已加载进 COW 根，但后台整理任务没有 shutdown 接口并会持有表 clone。任务
-    /// 每轮串行 drain `waits`；它不参与根 WAL append，只有表日志成功后才发送提交确认。
+    /// 每轮串行 drain `waits`；它不参与根 WAL append，只有表日志成功后才发送提交确认。当前
+    /// `spawn` 结果被忽略：合法启动契约要求 runtime 仍可接收任务；runtime 拒绝任务不属于可继续
+    /// 服务的成功环境。该永久 owner 和关闭边界归档于 `FIND-LIFE-001`，本构造器不提供 Join。
     pub async fn new<P: AsRef<Path>>(rt: MultiTaskRuntime<()>,
                                      path: P,
                                      name: Atom,
@@ -315,8 +337,10 @@ impl<
 /// Meta 表的共享状态及锁所有权。
 ///
 /// 同步锁只保护短内存临界区；`waits` 使用异步锁，因为 collector 会在持有该锁时执行表日志
-/// `delay_commit().await`。当前锁顺序是版本 publication（表外）-> `prepare` -> `root`，提交
-/// 不反向取得 publication；collector 不访问这三把锁。
+/// `delay_commit().await`。版本事务以 publication 作为最外层门，但 `actions`、`root`、`prepare`
+/// 都是分别取得并释放的短临界区：prepare 依次观察 actions/root 后才取得 prepare，commit 先
+/// 释放 prepare 再取得 root；不存在 `prepare` 与 `root` 的嵌套 guard。collector 不访问上述
+/// 数据/版本锁，只使用 `collecting`、`waits` 和 `LogFile`。
 struct InnerMetaTable<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>,
@@ -331,7 +355,8 @@ struct InnerMetaTable<
     rt:             MultiTaskRuntime<()>,
     // 内存根已发布、仍待写表日志并确认的 FIFO；元素同时保活事务和根确认回调。
     waits:          AsyncMutex<VecDeque<(MetaTabTr<C, Log>, XHashMap<Binary, KVActionLog>, <MetaTabTr<C, Log> as Transaction2Pc>::CommitConfirm)>>,
-    // 新入队动作的近似累计 bytes，用于触发 size collector；触发时先归零。
+    // 自上次 size 阈值归零后的入队累计 bytes，不是当前 FIFO 的精确大小。timer drain 不归零，
+    // 因而后续小批次可能提前触发一次 size collect；这只影响整理时机，不影响动作或确认内容。
     waits_size:     AtomicUsize,
     // `waits_size` 达到该值时立即尝试整理。
     waits_limit:    usize,
@@ -397,22 +422,27 @@ impl<
     type Output = ();
     type Error = KVTableTrError;
 
+    /// 返回根事务创建时固定的可写能力；本层不会在动作 API 中重复执行状态检查。
     fn is_writable(&self) -> bool {
         self.0.writable
     }
 
+    /// Meta 叶提交必须按根 child list 顺序执行，不能与同根其它叶并发发布。
     fn is_concurrent_commit(&self) -> bool {
         false
     }
 
+    /// rollback 仅删除短 prepared 预留，当前不需要并发调度。
     fn is_concurrent_rollback(&self) -> bool {
         false
     }
 
+    /// 返回仅用于诊断和事件的事务来源，不参与事务身份或冲突判定。
     fn get_source(&self) -> Atom {
         self.0.source.clone()
     }
 
+    /// Meta 叶没有额外初始化阶段；实际 COW 快照已在构造时固定。
     fn init(&self)
             -> BoxFuture<Result<<Self as AsyncTransaction>::Output, <Self as AsyncTransaction>::Error>> {
         async move {
@@ -451,18 +481,22 @@ impl<
     type ConfirmError = KVTableTrError;
     type CommitConfirm = KVDBCommitConfirm<C, Log>;
 
+    /// 返回本叶动作是否必须进入根 WAL；Meta 表自身始终拥有独立持久化日志。
     fn is_require_persistence(&self) -> bool {
         self.0.persistence.load(Ordering::Relaxed)
     }
 
+    /// 单向提升根 WAL 需求；重复调用幂等，不会立即执行 I/O。
     fn require_persistence(&self) {
         self.0.persistence.store(true, Ordering::Relaxed);
     }
 
+    /// Meta prepare 依赖同表 prepared map 的确定顺序，当前由 manager 串行执行。
     fn is_concurrent_prepare(&self) -> bool {
         false
     }
 
+    /// 每个 Meta 叶必须继承根 TID/CID，prepared map 只以根 TID 索引。
     fn is_enable_inherit_uid(&self) -> bool {
         true
     }
@@ -523,7 +557,8 @@ impl<
         async move {
             let transaction_uid = tr.get_transaction_uid().unwrap();
             // publication write 使元信息根和全部 Key 版本相对于 query_with_version 一次可见。
-            // prepare 锁只用于取走预留，不能延伸到根发布或后续异步 LogFile 路径。
+            // prepare 锁只用于取走预留，并在独立块末释放；它不能与 root guard 嵌套，更不能
+            // 延伸到后续异步 LogFile 路径。
             let publication = match tr.0.version_context.as_ref() {
                 Some(context) => Some(context.versions().publication().write().await),
                 None => None,
@@ -620,6 +655,9 @@ impl<
 
                 if let (Some(context), Some(revision)) =
                     (tr.0.version_context.as_ref(), revision) {
+                    // root guard 持续覆盖数据、版本和 revision 发布；publication write 又阻止
+                    // query_with_version 在两者之间观察。回执只收集本事务的显式 Versioned 写，
+                    // SchemaCreate 的 context.receipt 固定为 None。
                     for (key, action) in &actions {
                         let value = match action {
                             KVActionLog::Write(value) | KVActionLog::DirtyWrite(value) => value,
@@ -662,6 +700,8 @@ impl<
                             KVActionLog::Read => (),
                         }
                     }
+                    // waits guard 只覆盖一次 FIFO 入队；在调用 collect_waits 前已经释放，避免
+                    // 同一任务重入异步 mutex。事务 Arc 会一直保活到成功确认或失败批次被丢弃。
                     table_copy.0.waits.lock().await.push_back((tr, actions, confirm)); //注册待确认的已提交事务
 
                     let last_waits_size = table_copy.0.waits_size.fetch_add(size, Ordering::SeqCst); //更新待确认的已提交事务的大小计数
@@ -792,6 +832,7 @@ impl<
     type Value = Binary;
     type Error = KVTableTrError;
 
+    /// 读取事务私有根而不登记 Read；它不是绕过事务读取共享最新根。
     fn dirty_query(&self, key: <Self as KVAction>::Key)
                    -> BoxFuture<Option<<Self as KVAction>::Value>> {
         let tr = self.clone();
@@ -806,6 +847,10 @@ impl<
         }.boxed()
     }
 
+    /// 读取事务私有根，并在该 Key 尚无最终动作时登记普通 Read。
+    ///
+    /// 当前实现会在持有短 `actions` guard 时取得 `root_mut` guard；模块内不存在
+    /// `root_mut -> actions` 反向路径。该历史嵌套不跨 await 或 I/O，不能从本注释推导为通用锁序。
     fn query(&self, key: <Self as KVAction>::Key)
              -> BoxFuture<Option<<Self as KVAction>::Value>> {
         let tr = self.clone();
@@ -827,6 +872,10 @@ impl<
         }.boxed()
     }
 
+    /// 以 DirtyWrite 覆盖该 Key 的最终动作，并修改事务私有 COW 根。
+    ///
+    /// 外部协议禁止直接操作 `.tables_meta`，该分支只记录内部现状；dirty 与普通动作混用不保证
+    /// 事务安全，prepare 的 dirty 冲突边界见 `FIND-DIRTY-001`。
     fn dirty_upsert(&self,
                     key: <Self as KVAction>::Key,
                     value: <Self as KVAction>::Value)
@@ -844,6 +893,7 @@ impl<
         }.boxed()
     }
 
+    /// 以普通 Write 覆盖该 Key 的最终动作；共享已提交 Meta 根在 commit 前保持不变。
     fn upsert(&self,
               key: <Self as KVAction>::Key,
               value: <Self as KVAction>::Value)
@@ -861,6 +911,7 @@ impl<
         }.boxed()
     }
 
+    /// 在私有根登记 DirtyWrite tombstone；命中也不承诺返回旧值。
     fn dirty_delete(&self, key: <Self as KVAction>::Key)
         -> BoxFuture<Result<Option<<Self as KVAction>::Value>, <Self as KVAction>::Error>> {
         let tr = self.clone();
@@ -873,6 +924,8 @@ impl<
             // 旧元数据 Binary。命中与未命中最终都返回 Ok(None)，DDL 结果不能据此判断
             // 定义原先是否存在。见 docs/SEMANTIC_CONTRACTS.md#contract-action-001 与
             // docs/REVIEW_FINDINGS.md#find-ordered-delete-001。
+            // pi_ordmap 当前 `delete(_, false)` 命中时返回 Some(None)，所以下方旧值分支不会
+            // 产生 Some；保留分支不等于允许把 copy 改为 true。
             if let Some(Some(value)) = tr.0.root_mut.lock().delete(&key, false) {
                 //指定关键字存在
                 return Ok(Some(value));
@@ -882,6 +935,7 @@ impl<
         }.boxed()
     }
 
+    /// 在私有根登记普通 Write tombstone；结果不能用于判断表定义原先是否存在。
     fn delete(&self, key: <Self as KVAction>::Key)
               -> BoxFuture<Result<Option<<Self as KVAction>::Value>, <Self as KVAction>::Error>> {
         let tr = self.clone();
@@ -894,6 +948,7 @@ impl<
             // 旧元数据 Binary。命中与未命中最终都返回 Ok(None)，DDL 结果不能据此判断
             // 定义原先是否存在。见 docs/SEMANTIC_CONTRACTS.md#contract-action-001 与
             // docs/REVIEW_FINDINGS.md#find-ordered-delete-001。
+            // 与 dirty_delete 相同，copy=false 使命中结果也是 None；这是冻结的逐表返回语义。
             if let Some(Some(value)) = tr.0.root_mut.lock().delete(&key, false) {
                 //指定关键字存在
                 return Ok(Some(value));
@@ -943,6 +998,7 @@ impl<
 
     fn lock_key(&self, _key: <Self as KVAction>::Key)
                 -> BoxFuture<Result<(), <Self as KVAction>::Error>> {
+        // 当前兼容钩子是无条件成功的 no-op，不建立排他、owner 或内存可见性关系。
         async move {
             Ok(())
         }.boxed()
@@ -950,6 +1006,7 @@ impl<
 
     fn unlock_key(&self, _key: <Self as KVAction>::Key)
                   -> BoxFuture<Result<(), <Self as KVAction>::Error>> {
+        // 未持锁、重复调用和任意 Key 都同样成功；不得把结果解释为释放了真实锁。
         async move {
             Ok(())
         }.boxed()
@@ -973,7 +1030,10 @@ impl<
             .unwrap_or(PrepareMode::Ordinary)
     }
 
-    // 构建一个元信息表事务
+    /// 构建不携带版本上下文的 Meta 叶事务。
+    ///
+    /// 构造期间只短暂取得共享 root mutex，并 O(1) clone COW owner；`root_ref` 和初始
+    /// `root_mut` 指向同一逻辑基线。该入口不登记根 child、不分配 TID/CID、不执行 I/O。
     #[inline]
     fn new(source: Atom,
            is_writable: bool,
@@ -1003,6 +1063,11 @@ impl<
     }
 
     /// 构建由数据库管理器装配的事务，并在同一根 guard 内固定数据快照和版本 revision。
+    ///
+    /// 调用方已经为该表确定唯一根 owner 和 PrepareMode。函数在 root mutex 内 clone 数据基线并
+    /// 租用当前 completed revision，随后释放共享锁、只在私有副本上应用最终动作。它不获取
+    /// publication 或 prepare，不执行 await/I/O；与 commit 的配对依赖 commit 在相同 root guard
+    /// 内先发布数据/版本再推进 revision。
     pub(crate) fn new_managed(source: Atom,
                               is_writable: bool,
                               is_persistent: bool,
@@ -1068,9 +1133,10 @@ impl<
         let mut conflicts = Vec::new();
         for (key, expected) in context.expected() {
             if context.versions().current_version(key).as_ref() != Some(expected) {
-                conflicts.push(TableKey {
+                conflicts.push(TableKeyConflict {
                     table: self.0.table.name(),
                     key: key.clone(),
+                    kind: VersionConflictKind::ReadSetVersionMismatch,
                 });
             }
         }
@@ -1089,8 +1155,9 @@ impl<
             return Ok(None);
         }
 
-        // 锁序固定为 publication(read) -> prepare；publication guard 覆盖版本、当前根和预留
-        // 三类检查，commit 只能在 guard 释放后取得 publication(write)，避免检查后发布穿插。
+        // publication read 是整个检查阶段的外层门。actions/root 各自 clone 后立即释放，最后才
+        // 取得 prepare；三者从不互相嵌套。publication guard 覆盖版本、当前根和预留三类检查，
+        // commit 只能在它释放后取得 publication write，避免检查后发布穿插。
         let _publication = match self.0.version_context.as_ref() {
             Some(context) => Some(context.versions().publication().read().await),
             None => None,
@@ -1109,13 +1176,16 @@ impl<
                 // 阶段二仍重复检查 read-set：阶段一到本表 prepare 之间可能已有其它事务提交。
                 for (key, expected) in context.expected() {
                     if context.versions().current_version(key).as_ref() != Some(expected) {
-                        conflict_keys.push(key.clone());
+                        conflict_keys.push((key.clone(),
+                                            VersionConflictKind::ReadSetVersionMismatch));
                     }
                 }
             }
         }
 
-        // 不以根指针相同作为跳过条件；每个非 dirty 动作都比较创建时与当前逻辑值状态。
+        // 不以根指针相同作为跳过条件；每个非 dirty 动作都比较创建时与当前逻辑值状态。Meta
+        // 的 DirtyWrite 当前无条件跳过值状态比较，这只是现状分支，不是外部可直接使用 Meta KV
+        // 的许可，也不是最终 dirty 隔离设计。
         let current_root = self.0.table.0.root.lock().clone();
         for (key, action) in &actions {
             if action.is_dirty_writed() {
@@ -1125,12 +1195,14 @@ impl<
                 if context
                     .versions()
                     .has_committed_after(key, context.snapshot_revision()) {
-                    conflict_keys.push(key.clone());
+                    conflict_keys.push((key.clone(),
+                                        VersionConflictKind::TransactionConflict));
                     continue;
                 }
             }
             if !binary_state_equal(self.0.root_ref.get(key), current_root.get(key)) {
-                conflict_keys.push(key.clone());
+                conflict_keys.push((key.clone(),
+                                    VersionConflictKind::TransactionConflict));
             }
         }
 
@@ -1151,7 +1223,8 @@ impl<
         // 拆到两个临界区，否则两个首次插入相同 Key 的事务可能同时通过。
         for (key, action) in &actions {
             if has_prepared_conflict(&prepare, key, mode, action) {
-                conflict_keys.push(key.clone());
+                conflict_keys.push((key.clone(),
+                                    VersionConflictKind::TransactionConflict));
             }
         }
         if !conflict_keys.is_empty() {
@@ -1201,9 +1274,10 @@ impl<
 
     fn prepare_conflict_error(&self,
                               conflict_kind: PrepareConflictKind,
-                              keys: Vec<Binary>) -> KVTableTrError {
+                              keys: Vec<(Binary, VersionConflictKind)>) -> KVTableTrError {
         // 调用方只在 keys 非空时进入。All 模式保留本表完整集合；根 manager 最终再跨表归一化。
-        let key = keys[0].clone();
+        // 分类与同 Key 优先级见 docs/VERSION_CONFLICT_KIND_DESIGN.md。
+        let key = keys[0].0.clone();
         match conflict_kind {
             PrepareConflictKind::Common => {
                 KVTableTrError::new_transaction_error(
@@ -1220,9 +1294,10 @@ impl<
             PrepareConflictKind::All => {
                 KVTableTrError::new_all_conflicts_error(keys
                     .into_iter()
-                    .map(|key| TableKey {
+                    .map(|(key, kind)| TableKeyConflict {
                         table: self.0.table.name(),
                         key,
+                        kind,
                     })
                     .collect())
             },
@@ -1233,7 +1308,10 @@ impl<
     ///
     /// 该内部入口刻意跳过普通冲突检查：先把 WAL 动作直接作用于当前根，再以指定 TID 放入
     /// `prepare`，使后续 replay commit 沿正常清理/确认结构完成。只能由受信 repair 调用，不能
-    /// 用于在线业务事务，也不会创建版本协议上下文。
+    /// 用于在线业务事务，也不会创建版本协议上下文。动作逐项取得 root mutex，repair 启动期尚未
+    /// 对业务开放，因此不需要 publication；启动流程会在全部 replay 完成后清空恢复期版本状态。
+    /// 重复应用相同最终 upsert/delete 是逻辑幂等的，但不同 TID 会各自留下 prepared 项，必须由
+    /// 对应 `replay_commit` 消费，不能把本方法当作可任意重复调用的公开幂等 API。
     pub(crate) fn prepare_repair(&self, transaction_uid: Guid) {
         //获取事务的当前操作记录，并重置事务的当前操作记录
         let actions = mem::replace(&mut *self.0.actions.lock(), XHashMap::default());
@@ -1294,6 +1372,8 @@ struct InnerMetaTabTr<
 /// 按“新日志优先”规则把 Meta 日志文件集合恢复为一个内存根的启动 loader。
 ///
 /// `removed` 防止旧文件中的已删除 Key 复活；已在 root 中出现的 Key 也不重复加载。
+/// `LogFile::load` 保证从新文件到旧文件遍历，并在调用 `load` 前询问 `is_require`；脱离该调用
+/// 顺序直接复用 loader 不具相同语义。Key/Value 解码由上层启动路径完成，本类型不验证 BON。
 struct MetaTableLoader<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>,
@@ -1308,7 +1388,8 @@ impl<
     Log: AsyncCommitLog<C = C, Cid = Guid>,
 > PairLoader for MetaTableLoader<C, Log> {
     fn is_require(&self, _log_file: Option<&PathBuf>, key: &Vec<u8>) -> bool {
-        //不在已删除关键字表中且不在元信息表的内存表中的关键字，才允许被加载
+        // 不在已删除集合且尚未被更新日志写入 root 的 Key 才允许读取旧记录。root mutex 只覆盖
+        // 一次 O(log n) 点查，不跨文件 I/O；加载器由启动线程串行驱动。
         !self
             .removed
             .contains_key(key)
@@ -1327,6 +1408,7 @@ impl<
             _method: LogMethod,
             key: Vec<u8>,
             value: Option<Vec<u8>>) {
+        // 当前 LogFile 已把 PlainAppend/Remove 投影为 Some/None；method 不参与最终状态判断。
         if let Some(value) = value {
             //插入或更新指定关键字的值
             if let Some(path) = log_file {
@@ -1403,6 +1485,9 @@ impl<
 ///
 /// 当前实现会在表日志 await 期间持有 `waits` 锁，新 commit 只能等待入队；这是现状性能边界。
 /// 函数不持有数据根、prepare 或 publication 锁，不与事务冲突临界区交叉。
+/// 失败批次不会重新放回 `waits`，也不会保留可在线调用的确认器；其根 WAL 只能依赖后续启动
+/// repair 收口。当前项目已明确不把存储设备/文件系统/runtime 失败纳入事务安全保证，本函数不得
+/// 被解释为提供在线重试或 rollback。该边界不是最终或最佳恢复设计。
 async fn collect_waits<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>,
@@ -1423,7 +1508,8 @@ async fn collect_waits<
         return Ok((Instant::now().elapsed(), (0, 0, 0)));
     }
 
-    //将元信息表中等待写入日志文件的事务，写入日志文件
+    // 将当前 FIFO 整批写入同一个 LogFile commit。局部 waits 只保存确认器，不保存 actions；
+    // 一旦 drain 后 I/O 失败，本轮不会在内存队列中自动重试。
     let mut waits = VecDeque::new();
     let mut log_uid = 0;
     let mut trs_len = 0;
@@ -1481,7 +1567,8 @@ async fn collect_waits<
                           false,
                           DEFAULT_LOG_FILE_COMMIT_DELAY_TIMEOUT)
             .await {
-            // 持久化失败后有意不调用 confirm；根 WAL 保留，供重试或启动恢复。
+            // 持久化失败后有意不调用 confirm；根 WAL 保留，供后续启动恢复。当前 drained
+            // confirm 不会重新入队，因此不存在本进程内的完整确认重试。
             // 详见 CONTRACT-CFM-001：docs/SEMANTIC_CONTRACTS.md#contract-confirm-success-only。
             table.0.collecting.store(false, Ordering::Release); //设置为已整理结束
             error!("Collect meta table failed, table: {:?}, transactions: {}, keys: {}, bytes: {}, reason: {:?}",
@@ -1543,4 +1630,461 @@ async fn collect_waits<
     table.0.collecting.store(false, Ordering::Release); //设置为已整理结束
 
     Ok((now.elapsed(), (trs_len, keys_len, bytes_len)))
+}
+
+#[cfg(test)]
+mod meta_local_contract_tests {
+    //! Meta 表内部局部不变量测试。
+    //!
+    //! 测试夹具使用真实 `LogFile`，但直接构造表内层而不启动永久 collector，只用于观察私有
+    //! COW 根、动作、prepared map 和 loader。根 manager、根 WAL、异步确认、DDL、重启与 repair
+    //! 生产可达性仍由独立真实集成测试证明，不能由本模块测试替代。
+
+    use std::{fs,
+              path::PathBuf,
+              sync::{mpsc::sync_channel,
+                     atomic::{AtomicU64, Ordering as AtomicOrdering}},
+              time::{SystemTime, UNIX_EPOCH}};
+
+    use futures::executor::block_on;
+    use pi_async_rt::{prelude::AsyncRuntimeExt,
+                      rt::multi_thread::MultiTaskRuntimeBuilder};
+    use pi_bon::{Encode, WriteBuffer};
+    use pi_store::commit_logger::CommitLogger;
+
+    use super::*;
+
+    type TestTable = MetaTable<usize, CommitLogger>;
+
+    static NEXT_TEST_ROOT: AtomicU64 = AtomicU64::new(0);
+
+    struct LocalMetaFixture {
+        table: Option<TestTable>,
+        path: PathBuf,
+    }
+
+    impl LocalMetaFixture {
+        fn new(label: &str) -> Self {
+            let sequence = NEXT_TEST_ROOT.fetch_add(1, AtomicOrdering::Relaxed);
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time must be after the Unix epoch")
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "pi_db_meta_local_{label}_{}_{}_{}",
+                std::process::id(),
+                nanos,
+                sequence,
+            ));
+            let rt = MultiTaskRuntimeBuilder::default()
+                .init_worker_size(1)
+                .build();
+            let open_rt = rt.clone();
+            let open_path = path.clone();
+            let (sender, receiver) = sync_channel(1);
+            rt.block_on(async move {
+                let result = LogFile::open(open_rt,
+                                           open_path,
+                                           2 * 1024 * 1024,
+                                           64 * 1024 * 1024,
+                                           None).await;
+                sender.send(result).expect("Meta local LogFile receiver must remain alive");
+            })
+                .expect("Meta local runtime must complete LogFile::open");
+            let log_file = receiver
+                .recv()
+                .expect("Meta local LogFile result must be returned")
+                .expect("Meta local LogFile must open");
+            let table = MetaTable(Arc::new(InnerMetaTable {
+                name: Atom::from(".tables_meta"),
+                root: Mutex::new(OrdMap::new(None)),
+                prepare: Mutex::new(XHashMap::default()),
+                rt,
+                waits: AsyncMutex::new(VecDeque::new()),
+                waits_size: AtomicUsize::new(0),
+                waits_limit: 16 * 1024 * 1024,
+                wait_timeout: 60 * 1000,
+                collecting: AtomicBool::new(false),
+                log_file,
+                notifier: None,
+            }));
+
+            Self {
+                table: Some(table),
+                path,
+            }
+        }
+
+        fn table(&self) -> TestTable {
+            self.table.as_ref().expect("fixture table must exist").clone()
+        }
+    }
+
+    impl Drop for LocalMetaFixture {
+        fn drop(&mut self) {
+            drop(self.table.take());
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn bon_usize(value: usize) -> Binary {
+        let mut buffer = WriteBuffer::new();
+        value.encode(&mut buffer);
+        Binary::new(buffer.bytes)
+    }
+
+    fn table_key(name: &str) -> Binary {
+        crate::db::table_to_binary(&Atom::from(name))
+    }
+
+    fn assert_binary(actual: Option<Binary>, expected: Option<&Binary>, label: &str) {
+        match (actual, expected) {
+            (Some(actual), Some(expected)) => {
+                assert_eq!(actual.as_ref(), expected.as_ref(), "{label}: value mismatch");
+            },
+            (None, None) => (),
+            (actual, expected) => {
+                panic!("{label}: presence mismatch, actual: {}, expected: {}",
+                       actual.is_some(),
+                       expected.is_some());
+            },
+        }
+    }
+
+    /// 表属性、叶节点拓扑、根身份字段、状态和 persistence 提升必须保持单义。
+    #[test]
+    fn test_meta_metadata_leaf_identity_and_qos_contract() {
+        let fixture = LocalMetaFixture::new("identity");
+        let table = fixture.table();
+        assert_eq!(table.name().as_str(), ".tables_meta");
+        assert_eq!(table.path(), Some(fixture.path.as_path()));
+        assert!(table.is_persistent());
+        assert!(table.is_ordered());
+        assert_eq!(table.len(), 0);
+        assert_eq!(table.size(), 0);
+
+        let transaction = table.transaction(Atom::from("Meta local identity source"),
+                                            true,
+                                            false,
+                                            1_234,
+                                            5_678);
+        assert!(transaction.is_writable());
+        assert!(!transaction.is_concurrent_prepare());
+        assert!(!transaction.is_concurrent_commit());
+        assert!(!transaction.is_concurrent_rollback());
+        assert!(transaction.is_enable_inherit_uid());
+        assert_eq!(transaction.get_source().as_str(), "Meta local identity source");
+        assert_eq!(transaction.get_prepare_timeout(), 1_234);
+        assert_eq!(transaction.get_commit_timeout(), 5_678);
+        assert_eq!(transaction.get_status(), Transaction2PcStatus::Start);
+        assert!(transaction.is_unit());
+        assert!(!transaction.is_sequence());
+        assert!(!transaction.is_tree());
+        assert!(transaction.prev_item().is_none());
+        assert!(transaction.next_item().is_none());
+        assert_eq!(transaction.children_len(), 0);
+        assert_eq!(transaction.to_children().count(), 0);
+        assert_eq!(transaction.qos(), TableTrQos::ThreadSafe);
+        assert!(block_on(transaction.init()).is_ok());
+
+        let tid = Guid(101);
+        let cid = Guid(102);
+        transaction.set_transaction_uid(tid.clone());
+        transaction.set_commit_uid(cid.clone());
+        transaction.set_prepare_uid(Guid(103));
+        assert_eq!(transaction.get_transaction_uid(), Some(tid));
+        assert_eq!(transaction.get_commit_uid(), Some(cid));
+        assert!(transaction.get_prepare_uid().is_none());
+        transaction.set_status(Transaction2PcStatus::Actioning);
+        assert_eq!(transaction.get_status(), Transaction2PcStatus::Actioning);
+        transaction.require_persistence();
+        transaction.require_persistence();
+        assert!(transaction.is_require_persistence());
+        assert_eq!(transaction.qos(), TableTrQos::Safe);
+
+        let read_only = table.transaction(Atom::from("Meta local read only"),
+                                          false,
+                                          true,
+                                          7,
+                                          9);
+        assert!(matches!(block_on(read_only.prepare()), Ok(None)));
+        assert!(table.0.prepare.lock().is_empty());
+    }
+
+    /// 动作只修改私有 COW 根，同 Key 后写只保留最终动作，流固定创建瞬间的私有根。
+    #[test]
+    fn test_meta_private_cow_final_action_and_snapshot_contract() {
+        let fixture = LocalMetaFixture::new("actions");
+        let table = fixture.table();
+        let retained_key = table_key("meta_local_retained");
+        let deleted_key = table_key("meta_local_deleted");
+        let committed_value = bon_usize(10);
+        let first_value = bon_usize(11);
+        let final_value = bon_usize(12);
+        table.0.root.lock().upsert(deleted_key.clone(), committed_value.clone(), false);
+
+        let transaction = table.transaction(Atom::from("Meta local actions source"),
+                                            true,
+                                            true,
+                                            100,
+                                            200);
+        block_on(transaction.upsert(retained_key.clone(), first_value.clone()))
+            .expect("first private Meta upsert must succeed");
+        let snapshot = transaction.values(None, false);
+        block_on(transaction.upsert(retained_key.clone(), final_value.clone()))
+            .expect("final private Meta upsert must succeed");
+        let removed = block_on(transaction.delete(deleted_key.clone()))
+            .expect("private Meta delete must succeed");
+        assert!(removed.is_none(), "Meta delete must not expose the old value");
+
+        assert_binary(block_on(transaction.query(retained_key.clone())),
+                      Some(&final_value),
+                      "transaction must observe final private upsert");
+        assert_binary(table.query_committed(&retained_key),
+                      None,
+                      "uncommitted Meta upsert must not reach shared root");
+        assert_binary(table.query_committed(&deleted_key),
+                      Some(&committed_value),
+                      "uncommitted Meta delete must not reach shared root");
+
+        let snapshot_entries = block_on(snapshot.collect::<Vec<_>>());
+        assert_eq!(snapshot_entries.len(), 2);
+        assert!(snapshot_entries.iter().any(|(key, value)| {
+            key.as_ref() == retained_key.as_ref() && value.as_ref() == first_value.as_ref()
+        }));
+        assert!(snapshot_entries.iter().any(|(key, value)| {
+            key.as_ref() == deleted_key.as_ref() && value.as_ref() == committed_value.as_ref()
+        }));
+
+        let actions = transaction.0.actions.lock();
+        assert_eq!(actions.len(), 2);
+        assert!(matches!(actions.get(&retained_key),
+                         Some(KVActionLog::Write(Some(value)))
+                         if value.as_ref() == final_value.as_ref()));
+        assert!(matches!(actions.get(&deleted_key), Some(KVActionLog::Write(None))));
+    }
+
+    /// prepare 只编码最终写并转移动作；prepared 冲突必须原子拒绝，rollback 不发布私有根。
+    #[test]
+    fn test_meta_prepare_wal_conflict_ownership_and_rollback_contract() {
+        let fixture = LocalMetaFixture::new("prepare");
+        let table = fixture.table();
+        let upsert_key = table_key("meta_local_prepare_upsert");
+        let delete_key = table_key("meta_local_prepare_delete");
+        let read_key = table_key("meta_local_prepare_read");
+        let old_value = bon_usize(210);
+        let new_value = bon_usize(211);
+        table.0.root.lock().upsert(delete_key.clone(), old_value.clone(), false);
+
+        let transaction = table.transaction(Atom::from("Meta local prepare source"),
+                                            true,
+                                            true,
+                                            300,
+                                            400);
+        let tid = Guid(201);
+        transaction.set_transaction_uid(tid.clone());
+        block_on(transaction.upsert(upsert_key.clone(), new_value.clone()))
+            .expect("private Meta upsert before prepare must succeed");
+        block_on(transaction.delete(delete_key.clone()))
+            .expect("private Meta delete before prepare must succeed");
+        assert!(block_on(transaction.query(read_key.clone())).is_none());
+
+        let output = block_on(transaction.prepare_conflicts())
+            .expect("Meta prepare must succeed")
+            .expect("Meta writes must produce a WAL fragment");
+        let (table_name, write_count, offset) =
+            <TestTable as KVTable>::get_init_table_prepare_output(&output, 0);
+        let (writes, end) =
+            <TestTable as KVTable>::get_all_key_value_from_table_prepare_output(
+                &output,
+                &table_name,
+                write_count,
+                offset);
+        assert_eq!(table_name.as_str(), ".tables_meta");
+        assert_eq!(write_count, 2, "Read must not enter the Meta WAL fragment");
+        assert_eq!(writes.len(), 2);
+        assert_eq!(end, output.len());
+        assert!(writes.iter().any(|entry| {
+            entry.key.as_ref() == upsert_key.as_ref()
+                && entry.value.as_ref().map(Binary::as_ref) == Some(new_value.as_ref())
+        }));
+        assert!(writes.iter().any(|entry| {
+            entry.key.as_ref() == delete_key.as_ref() && entry.value.is_none()
+        }));
+
+        assert!(transaction.0.actions.lock().is_empty());
+        {
+            let prepared = table.0.prepare.lock();
+            let item = prepared.get(&tid).expect("Meta prepare map must reserve the root TID");
+            assert_eq!(item.mode, PrepareMode::Ordinary);
+            assert_eq!(item.actions.len(), 3);
+            assert!(matches!(item.actions.get(&read_key), Some(KVActionLog::Read)));
+        }
+
+        let contender = table.transaction(Atom::from("Meta local prepared contender"),
+                                          true,
+                                          true,
+                                          500,
+                                          600);
+        contender.set_transaction_uid(Guid(202));
+        block_on(contender.upsert(upsert_key.clone(), bon_usize(212)))
+            .expect("Meta contender action must succeed locally");
+        let conflict = block_on(contender.prepare_conflicts())
+            .expect_err("same-Key prepared Meta contender must conflict");
+        assert!(conflict.is_conflicts());
+        block_on(contender.rollback()).expect("Meta contender rollback must succeed");
+
+        assert_binary(table.query_committed(&upsert_key),
+                      None,
+                      "prepare must not publish Meta upsert");
+        assert_binary(table.query_committed(&delete_key),
+                      Some(&old_value),
+                      "prepare must not publish Meta delete");
+        block_on(transaction.rollback()).expect("Meta rollback must release prepared state");
+        assert!(table.0.prepare.lock().is_empty());
+    }
+
+    /// Meta DirtyWrite 当前无条件跳过值状态比较；只记录实现事实，不开放外部 Meta KV 协议。
+    #[test]
+    fn test_meta_dirty_prepare_current_conflict_branch() {
+        let fixture = LocalMetaFixture::new("dirty");
+        let table = fixture.table();
+        let key = table_key("meta_local_dirty");
+        let initial_value = bon_usize(310);
+        let private_value = bon_usize(311);
+        let concurrent_value = bon_usize(312);
+        table.0.root.lock().upsert(key.clone(), initial_value, false);
+
+        let transaction = table.transaction(Atom::from("Meta local dirty source"),
+                                            true,
+                                            true,
+                                            700,
+                                            800);
+        let tid = Guid(301);
+        transaction.set_transaction_uid(tid.clone());
+        block_on(transaction.dirty_upsert(key.clone(), private_value))
+            .expect("Meta dirty upsert must succeed locally");
+        table.0.root.lock().upsert(key.clone(), concurrent_value.clone(), false);
+
+        assert!(block_on(transaction.prepare_conflicts())
+            .expect("Meta DirtyWrite currently skips committed value comparison")
+            .is_some());
+        assert!(table.0.prepare.lock().contains_key(&tid));
+        assert_binary(table.query_committed(&key),
+                      Some(&concurrent_value),
+                      "Meta dirty prepare must not publish its private value");
+        block_on(transaction.rollback()).expect("Meta dirty rollback must succeed");
+        assert!(table.0.prepare.lock().is_empty());
+    }
+
+    /// 受信 repair 直接得到最终 Meta 状态并登记 Ordinary prepared；最终动作可逻辑幂等重放。
+    #[test]
+    fn test_meta_repair_final_state_and_local_idempotence() {
+        let fixture = LocalMetaFixture::new("repair");
+        let table = fixture.table();
+        let upsert_key = table_key("meta_local_repair_upsert");
+        let delete_key = table_key("meta_local_repair_delete");
+        let old_value = bon_usize(410);
+        let repaired_value = bon_usize(411);
+        table.0.root.lock().upsert(delete_key.clone(), old_value, false);
+
+        let first = table.transaction(Atom::from("Meta local repair first"),
+                                      true,
+                                      true,
+                                      900,
+                                      1_000);
+        block_on(first.upsert(upsert_key.clone(), repaired_value.clone()))
+            .expect("first Meta repair upsert action must be staged");
+        block_on(first.delete(delete_key.clone()))
+            .expect("first Meta repair delete action must be staged");
+        let first_tid = Guid(401);
+        first.prepare_repair(first_tid.clone());
+
+        assert_binary(table.query_committed(&upsert_key),
+                      Some(&repaired_value),
+                      "Meta repair must apply upsert directly");
+        assert_binary(table.query_committed(&delete_key),
+                      None,
+                      "Meta repair must apply delete directly");
+        assert!(first.0.actions.lock().is_empty());
+
+        let second = table.transaction(Atom::from("Meta local repair second"),
+                                       true,
+                                       true,
+                                       1_100,
+                                       1_200);
+        block_on(second.upsert(upsert_key.clone(), repaired_value.clone()))
+            .expect("second Meta repair upsert action must be staged");
+        block_on(second.delete(delete_key.clone()))
+            .expect("second Meta repair delete action must be staged");
+        let second_tid = Guid(402);
+        second.prepare_repair(second_tid.clone());
+
+        assert_eq!(table.len(), 1);
+        assert_binary(table.query_committed(&upsert_key),
+                      Some(&repaired_value),
+                      "repeated Meta repair must retain final upsert");
+        assert_binary(table.query_committed(&delete_key),
+                      None,
+                      "repeated Meta repair must retain final delete");
+        let mut prepared = table.0.prepare.lock();
+        assert_eq!(prepared.len(), 2);
+        assert_eq!(prepared.remove(&first_tid).map(|item| item.mode),
+                   Some(PrepareMode::Ordinary));
+        assert_eq!(prepared.remove(&second_tid).map(|item| item.mode),
+                   Some(PrepareMode::Ordinary));
+        assert!(prepared.is_empty());
+    }
+
+    /// loader 必须保持新日志优先，tombstone 必须压制旧值，统计只计算实际载入的 value。
+    #[test]
+    fn test_meta_loader_newest_tombstone_and_statistics_contract() {
+        let fixture = LocalMetaFixture::new("loader");
+        let table = fixture.table();
+        let newest_key = table_key("meta_local_loader_newest");
+        let removed_key = table_key("meta_local_loader_removed");
+        let older_key = table_key("meta_local_loader_older");
+        let newest_value = bon_usize(510);
+        let ignored_older_value = bon_usize(511);
+        let older_value = bon_usize(512);
+        let newer_path = PathBuf::from("meta-newer.log");
+        let older_path = PathBuf::from("meta-older.log");
+        let mut loader = MetaTableLoader::new(table.clone());
+
+        assert!(loader.is_require(Some(&newer_path), &newest_key.as_ref().to_vec()));
+        loader.load(Some(&newer_path),
+                    LogMethod::PlainAppend,
+                    newest_key.as_ref().to_vec(),
+                    Some(newest_value.as_ref().to_vec()));
+        assert!(!loader.is_require(Some(&older_path), &newest_key.as_ref().to_vec()));
+
+        assert!(loader.is_require(Some(&newer_path), &removed_key.as_ref().to_vec()));
+        loader.load(Some(&newer_path),
+                    LogMethod::Remove,
+                    removed_key.as_ref().to_vec(),
+                    None);
+        assert!(!loader.is_require(Some(&older_path), &removed_key.as_ref().to_vec()));
+
+        assert!(loader.is_require(Some(&older_path), &older_key.as_ref().to_vec()));
+        loader.load(Some(&older_path),
+                    LogMethod::PlainAppend,
+                    older_key.as_ref().to_vec(),
+                    Some(older_value.as_ref().to_vec()));
+
+        assert_binary(table.query_committed(&newest_key),
+                      Some(&newest_value),
+                      "newest Meta loader value must win");
+        assert_binary(table.query_committed(&removed_key),
+                      None,
+                      "Meta loader tombstone must suppress older value");
+        assert_binary(table.query_committed(&older_key),
+                      Some(&older_value),
+                      "unshadowed older Meta value must load");
+        assert_ne!(table.query_committed(&newest_key), Some(ignored_older_value));
+        assert_eq!(loader.log_files_len(), 2);
+        assert_eq!(loader.keys_len(), 2);
+        assert_eq!(loader.bytes_len(),
+                   (newest_key.len() + newest_value.len()
+                    + older_key.len() + older_value.len()) as u64);
+    }
 }

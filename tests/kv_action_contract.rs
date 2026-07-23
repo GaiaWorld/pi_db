@@ -10,7 +10,8 @@
 //! - delete 返回值的逐表差异：Memory/LogOrdered 不返回旧值，Btree 返回可取得的旧值，
 //!   LogWrite 不执行删除；
 //! - LogWrite 当前只写边界；
-//! - 缺表在普通/dirty query、upsert、delete 上互不相同的返回语义；
+//! - 缺表在普通/dirty query、upsert、delete 上互不相同的返回语义；普通 upsert 返回 Fatal 后
+//!   立即丢弃该根，另用独立误用根验证 rollback 被拒绝，绝不把 Fatal 后继续使用当成合法证据；
 //! - `TableKV::value=None` 传给 upsert 时当前是 no-op，而不是 delete；
 //! - 五类表的 `lock_key/unlock_key` 当前不互斥、不校验 owner，缺表也成功；
 //! - `CreateTableOptions` 对 Memory/LogWrite 当前被忽略，对 LogOrdered/Btree 必须匹配 variant。
@@ -37,14 +38,17 @@ use pi_async_rt::rt::{
     multi_thread::{MultiTaskRuntime, MultiTaskRuntimeBuilder},
     startup_global_time_loop, AsyncRuntime,
 };
-use pi_async_transaction::{manager_2pc::Transaction2PcManager, ErrorLevel};
+use pi_async_transaction::{
+    manager_2pc::{Transaction2PcManager, Transaction2PcStatus},
+    AsyncCommitLog, ErrorLevel, UnitTransaction,
+};
 use pi_atom::Atom;
 use pi_bon::{Decode, Encode, ReadBuffer, WriteBuffer};
 use pi_db::{
     db::{KVDBManager, KVDBManagerBuilder, KVDBTransaction},
     tables::TableKV,
     utils::CreateTableOptions,
-    Binary, KVDBTableType, KVTableMeta,
+    Binary, KVDBTableType, KVTableMeta, KVTableTrError,
 };
 use pi_guid::GuidGen;
 use pi_sinfo::EnumType;
@@ -52,6 +56,7 @@ use pi_store::commit_logger::{CommitLogger, CommitLoggerBuilder};
 
 type TestResult<T = ()> = Result<T, String>;
 type RealDb = KVDBManager<usize, CommitLogger>;
+type RealManager = Transaction2PcManager<usize, CommitLogger>;
 type RealTransaction = KVDBTransaction<usize, CommitLogger>;
 
 const MEMORY_TABLE: &str = "action_memory";
@@ -70,10 +75,10 @@ fn test_kv_action_current_contract_matrix() {
     let root_path = root.path().to_path_buf();
 
     run_on_runtime(TEST_TIMEOUT, move |rt| async move {
-        let db = build_database(&rt, &root_path).await?;
+        let (db, tr_manager, logger) = build_database(&rt, &root_path).await?;
         create_tables(&db).await?;
         exercise_point_action_matrix(&db).await?;
-        exercise_missing_table_matrix(&db).await?;
+        exercise_missing_table_matrix(&db, &tr_manager, &logger).await?;
         exercise_noop_lock_matrix(&db).await?;
         exercise_invalid_option_matrix(&db).await?;
         Ok(())
@@ -308,7 +313,22 @@ async fn exercise_point_action_matrix(db: &RealDb) -> TestResult<()> {
 }
 
 /// 验证缺表的普通写为 Fatal，而 dirty 写静默成功；读/删除均保留一个 `None` 槽位。
-async fn exercise_missing_table_matrix(db: &RealDb) -> TestResult<()> {
+///
+/// 普通读/删、Fatal 写和 Fatal 后 rollback 防御分别使用不同根。Fatal 根只允许被立即 drop；
+/// rollback probe 是独立的非法调用防御测试，观察一次拒绝后也立即 drop，不能解释为可恢复。
+async fn exercise_missing_table_matrix(db: &RealDb,
+                                       tr_manager: &RealManager,
+                                       logger: &CommitLogger) -> TestResult<()> {
+    let produced_before = tr_manager.produced_transaction_total();
+    let consumed_before = tr_manager.consumed_transaction_total();
+    let append_before = logger.append_total_count();
+    if tr_manager.transaction_len() != 0 {
+        return Err(format!(
+            "missing-table matrix started with {} registered transactions",
+            tr_manager.transaction_len()
+        ));
+    }
+
     let dirty = transaction(db, "KVAction missing dirty", true)?;
     dirty
         .dirty_upsert(vec![kv(MISSING_TABLE, 1, Some(2))])
@@ -329,9 +349,34 @@ async fn exercise_missing_table_matrix(db: &RealDb) -> TestResult<()> {
     )?;
     drop(dirty);
 
-    let ordinary = transaction(db, "KVAction missing ordinary", true)?;
-    let error = ordinary
-        .upsert(vec![kv(MISSING_TABLE, 1, Some(2))])
+    let ordinary_read_delete = transaction(db, "KVAction missing ordinary read delete", true)?;
+    assert_values(
+        "missing ordinary query",
+        ordinary_read_delete
+            .query(vec![kv(MISSING_TABLE, 1, None)])
+            .await,
+        &[None],
+    )?;
+    assert_values(
+        "missing ordinary delete",
+        ordinary_read_delete
+            .delete(vec![kv(MISSING_TABLE, 1, None)])
+            .await
+            .map_err(|error| format!("missing ordinary delete failed: {error:?}"))?,
+        &[None],
+    )?;
+    drop(ordinary_read_delete);
+
+    // 前三项只写入事务私有 COW/overlay，末项缺表返回 Fatal。Fatal 后不得再调用该根；drop 后
+    // 新根逐表权威查询必须仍为空，从外部证明批次前缀没有发布，也没有进入根 WAL。
+    let ordinary_fatal = transaction(db, "KVAction missing ordinary Fatal", true)?;
+    let error = ordinary_fatal
+        .upsert(vec![
+            kv(MEMORY_TABLE, 31, Some(331)),
+            kv(LOG_ORDERED_TABLE, 32, Some(332)),
+            kv(BTREE_TABLE, 33, Some(333)),
+            kv(MISSING_TABLE, 34, Some(334)),
+        ])
         .await
         .expect_err("ordinary upsert of a missing table must currently return an error");
     if !matches!(error.level(), ErrorLevel::Fatal) {
@@ -339,20 +384,66 @@ async fn exercise_missing_table_matrix(db: &RealDb) -> TestResult<()> {
             "ordinary missing-table upsert returned non-Fatal error: {error:?}"
         ));
     }
+    drop(ordinary_fatal);
+
+    let verifier = transaction(db, "KVAction missing Fatal verifier", false)?;
     assert_values(
-        "missing ordinary query",
-        ordinary.query(vec![kv(MISSING_TABLE, 1, None)]).await,
-        &[None],
+        "Fatal batch prefix must remain unpublished",
+        verifier
+            .query(vec![
+                kv(MEMORY_TABLE, 31, None),
+                kv(LOG_ORDERED_TABLE, 32, None),
+                kv(BTREE_TABLE, 33, None),
+            ])
+            .await,
+        &[None, None, None],
     )?;
-    assert_values(
-        "missing ordinary delete",
-        ordinary
-            .delete(vec![kv(MISSING_TABLE, 1, None)])
-            .await
-            .map_err(|error| format!("missing ordinary delete failed: {error:?}"))?,
-        &[None],
-    )?;
-    drop(ordinary);
+    drop(verifier);
+
+    // 该根只用于验证状态机对“Fatal 后 rollback”这一非法调用的防御结果。返回 Normal 表示
+    // rollback 因根仍处于 Start 而被拒绝，不表示原 Fatal 可恢复；拒绝后不再使用该根。
+    let rollback_probe = transaction(db, "KVAction missing Fatal rollback probe", true)?;
+    let fatal = rollback_probe
+        .upsert(vec![kv(MISSING_TABLE, 41, Some(441))])
+        .await
+        .expect_err("rollback probe must first produce the missing-table Fatal");
+    if !matches!(fatal.level(), ErrorLevel::Fatal) {
+        return Err(format!(
+            "rollback probe missing-table upsert returned non-Fatal error: {fatal:?}"
+        ));
+    }
+    let rollback_error = rollback_probe
+        .rollback_modified()
+        .await
+        .expect_err("rollback after Fatal must be rejected");
+    if !matches!(&rollback_error, KVTableTrError::Common(ErrorLevel::Normal, _)) {
+        return Err(format!(
+            "rollback rejection must be Common(Normal), actual: {rollback_error:?}"
+        ));
+    }
+    if rollback_probe.get_status() != Transaction2PcStatus::RollbackFailed {
+        return Err(format!(
+            "rollback rejection must leave the misuse root in RollbackFailed, actual: {:?}",
+            rollback_probe.get_status()
+        ));
+    }
+    drop(rollback_probe);
+
+    if tr_manager.produced_transaction_total() != produced_before
+        || tr_manager.consumed_transaction_total() != consumed_before
+        || tr_manager.transaction_len() != 0
+        || logger.append_total_count() != append_before {
+        return Err(format!(
+            "missing-table actions unexpectedly entered 2PC or WAL, produced={}->{}, consumed={}->{}, active={}, appended={}->{}",
+            produced_before,
+            tr_manager.produced_transaction_total(),
+            consumed_before,
+            tr_manager.consumed_transaction_total(),
+            tr_manager.transaction_len(),
+            append_before,
+            logger.append_total_count()
+        ));
+    }
     Ok(())
 }
 
@@ -523,7 +614,8 @@ async fn commit_transaction(transaction: &RealTransaction, label: &str) -> TestR
         .map_err(|error| format!("committing {label} failed: {error:?}"))
 }
 
-async fn build_database(rt: &MultiTaskRuntime<()>, root: &Path) -> TestResult<RealDb> {
+async fn build_database(rt: &MultiTaskRuntime<()>,
+                        root: &Path) -> TestResult<(RealDb, RealManager, CommitLogger)> {
     fs::create_dir_all(root)
         .map_err(|error| format!("creating KVAction root {root:?} failed: {error}"))?;
     let wal_path = root.join("root-wal");
@@ -535,12 +627,13 @@ async fn build_database(rt: &MultiTaskRuntime<()>, root: &Path) -> TestResult<Re
     let manager = Transaction2PcManager::new(
         rt.clone(),
         GuidGen::new(0, std::process::id() as u16),
-        logger,
+        logger.clone(),
     );
-    KVDBManagerBuilder::new(rt.clone(), manager, root.join("database"))
+    let db = KVDBManagerBuilder::new(rt.clone(), manager.clone(), root.join("database"))
         .startup(false)
         .await
-        .map_err(|error| format!("starting KVAction database failed: {error}"))
+        .map_err(|error| format!("starting KVAction database failed: {error}"))?;
+    Ok((db, manager, logger))
 }
 
 fn run_on_runtime<T, F, Fut>(timeout: Duration, build: F) -> TestResult<T>

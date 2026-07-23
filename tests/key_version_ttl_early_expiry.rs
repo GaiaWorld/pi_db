@@ -30,7 +30,7 @@ use pi_atom::Atom;
 use pi_bon::{Encode, WriteBuffer};
 use pi_db::{
     db::{KVDBManager, KVDBManagerBuilder, KVDBTransaction},
-    Binary, KVDBTableType, KVTableMeta, TableKeyVersion, Version,
+    Binary, KVDBTableType, KVTableMeta, TableKeyVersion, Version, VersionConflictKind,
 };
 use pi_guid::GuidGen;
 use pi_sinfo::EnumType;
@@ -116,6 +116,8 @@ async fn verify_expired_read_version_is_a_complete_conflict(
             "expired read-set conflict reported the wrong table")?;
     require(conflicts[0].key.as_ref() == key.as_ref(),
             "expired read-set conflict reported the wrong key")?;
+    require(conflicts[0].kind == VersionConflictKind::ReadSetVersionMismatch,
+            "expired read-set conflict reported the wrong conflict kind")?;
     require(transaction.get_status() == Transaction2PcStatus::PrepareFailed,
             "expired read-set transaction did not enter PrepareFailed")?;
     require(fixture.logger.append_total_count() == appended_before,

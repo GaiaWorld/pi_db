@@ -15,8 +15,14 @@
 //! 仍存活的合法域内保持创建流瞬间的双层快照；流不保证与创建事务后续 upsert/delete 的事务
 //! 安全性。`query` 与 `dirty_query` 当前同义，事务安全方法和 `dirty_*` 方法混用不提供保证。
 //!
+//! 显式表整理先用 `collecting` 与后台 collector 互斥，再持有 redb 外层写锁执行 empty immediate
+//! commit 和 compact。compact 总计最多尝试三次，任意成功立即返回；前两次失败各同步等待一秒，
+//! 第三次失败返回可恢复的 Normal 错误。该维护路径不追加根 WAL，也不属于事务 2PC。
+//!
 //! 当前 `len` 对活跃 overlay/tombstone 的统计语义尚未冻结，见
 //! `docs/REVIEW_FINDINGS.md#find-table-002`；调用方不得把它当作严格逻辑快照计数。
+//! 完整内部结构、锁序、2PC、collector、repair、性能和证据矩阵见
+//! `docs/BTREE_TABLE_INTERNAL_CONTRACT.md#btree-table-internal-contract-index`。
 
 use std::{mem, thread};
 use std::path::{Path, PathBuf};
@@ -58,29 +64,63 @@ use pi_ordmap::asbtree::Tree;
 use pi_ordmap::ordmap::{ImOrdMap, OrdMap};
 use pi_store::log_store::log_file::LogMethod;
 
-use crate::{Binary, KVAction, KVActionLog, KVDBCommitConfirm, KVTableTrError, TableKey, TableTrQos, TransactionDebugEvent, transaction_debug_logger, db::{KVDBChildTrList, KVDBTransaction}, key_version::{KeyVersions,
+use crate::{Binary, KVAction, KVActionLog, KVDBCommitConfirm, KVTableTrError, TableKeyConflict, TableTrQos, TransactionDebugEvent, transaction_debug_logger, db::{KVDBChildTrList, KVDBTransaction}, key_version::{KeyVersions,
                                                                                                                                                                                                                                                       PrepareMode,
                                                                                                                                                                                                                                                       PreparedActions,
                                                                                                                                                                                                                                                       PreparedCommitError,
                                                                                                                                                                                                                                                       TableVersionContext,
                                                                                                                                                                                                                                                       Version,
+                                                                                                                                                                                                                                                      VersionConflictKind,
                                                                                                                                                                                                                                                       VersionReceipt,
                                                                                                                                                                                                                                                       has_prepared_conflict,
                                                                                                                                                                                                                                                       has_prepared_transaction,
                                                                                                                                                                                                                                                       take_prepared_for_commit}, tables::{KVTable, ordmap_snapshot::OrdMapSnapshot,
                                                                                                                                                                                             log_ord_table::{LogOrderedTable, LogOrdTabTr}}, utils::KVDBEvent, KVDBTableType};
 
-// 默认的表文件名
+/// 每个逻辑 Btree 表目录中唯一的 redb 数据文件名。
 const DEFAULT_TABLE_FILE_NAME: &str = "table.dat";
 
-// 默认的表名
+/// redb 文件内部承载全部业务 Key/Value 的固定表定义。
 const DEFAULT_TABLE_NAME: TableDefinition<Binary, Binary> = TableDefinition::new("$default");
 
-// 最小缓存大小
+/// 小于该值的外部 redb cache 配置会回退到 [`DEFAULT_CACHE_SIZE`]。
 const MIN_CACHE_SIZE: usize = 32 * 1024;
 
-// 默认缓存大小
+/// Btree redb 页缓存的默认容量，单位字节。
 pub(crate) const DEFAULT_CACHE_SIZE: usize = 2 * 1024 * 1024;
+
+// 单次表整理最多执行三次 compact；该上限包含首次调用，而不是“首次调用后再重试三次”。
+const BTREE_COMPACT_MAX_ATTEMPTS: usize = 3;
+
+// redb compact 失败后的固定同步退避时间。整理期间继续持有 inner 写锁，保持既有排他边界。
+const BTREE_COMPACT_RETRY_INTERVAL: Duration = Duration::from_millis(1000);
+
+/// 在固定上限内执行 compact，并在第一次成功时立即返回。
+///
+/// `wait` 只会在尚有下一次机会的失败之后调用，所以三次均失败时恰好调用 compact 三次、
+/// 等待两次。该 helper 不分配、不持有额外状态，也不改变调用方已有锁的生命周期。
+/// 冻结边界、真实失败证据和性能结论见
+/// `docs/BTREE_COLLECT_RETRY_BUG.md#bug-btree-collect-retry-001-index`。
+#[inline]
+fn compact_with_bounded_retry<T, E, Compact, Wait>(mut compact: Compact,
+                                                    mut wait: Wait) -> Result<T, E>
+    where Compact: FnMut() -> Result<T, E>,
+          Wait: FnMut()
+{
+    for attempt in 1..=BTREE_COMPACT_MAX_ATTEMPTS {
+        match compact() {
+            Ok(value) => return Ok(value),
+            Err(error) => {
+                if attempt == BTREE_COMPACT_MAX_ATTEMPTS {
+                    return Err(error);
+                }
+                wait();
+            },
+        }
+    }
+
+    unreachable!("Btree compact retry limit must be greater than zero")
+}
 
 impl Value for Binary {
     type SelfType<'a>
@@ -92,10 +132,12 @@ impl Value for Binary {
         Self: 'a
     = Binary;
 
+    /// Btree 的 Key/Value 是变长 BON 字节，不提供 redb 固定宽度优化。
     fn fixed_width() -> Option<usize> {
         None
     }
 
+    /// 从 redb 页复制出独立 owned `Binary`；返回值不借用页或读事务。
     fn from_bytes<'a>(data: &'a [u8]) -> Self::SelfType<'a>
     where
         Self: 'a
@@ -103,6 +145,7 @@ impl Value for Binary {
         Binary::new(data.to_vec())
     }
 
+    /// 以共享 owner 暴露编码字节；redb 在本次调用期间读取该 owner。
     fn as_bytes<'a, 'b: 'a>(value: &'a Self::SelfType<'b>) -> Self::AsBytes<'a>
     where
         Self: 'a,
@@ -111,12 +154,17 @@ impl Value for Binary {
         value.clone()
     }
 
+    /// redb 持久类型身份固定为 `Binary`，修改名称会影响文件兼容性检查。
     fn type_name() -> TypeName {
         TypeName::new("Binary")
     }
 }
 
 impl Key for Binary {
+    /// 使用 `pi_bon::ReadBuffer` 的类型化值顺序比较 Key，而不是任意 bytes 字典序。
+    ///
+    /// 比较失败时当前实现记录错误并强制判等；非法 BON Key 的最终入口策略尚未冻结，见
+    /// `FIND-DATA-002`，调用方不能把该降级解释为任意 bytes 都有全序保证。
     fn compare(data1: &[u8], data2: &[u8]) -> std::cmp::Ordering {
         if let Some(ord) = ReadBuffer::new(data1, 0)
             .partial_cmp(&ReadBuffer::new(data2, 0))
@@ -163,19 +211,23 @@ impl<
     type Tr = BtreeOrdTabTr<C, Log>;
     type Error = KVTableTrError;
 
+    /// 返回逻辑表名的共享 owner；它也是版本缓存、事件和诊断中的表身份。
     fn name(&self) -> <Self as KVTable>::Name {
         self.0.name.clone()
     }
 
+    /// 返回包含 `table.dat` 的完整 redb 文件路径，而不是表目录或数据库根目录。
     fn path(&self) -> Option<&Path> {
         Some(self.0.path.as_path())
     }
 
+    /// Btree 始终拥有 redb 数据文件；事务的 persistence 位仅决定是否生成根 WAL 片段。
     #[inline]
     fn is_persistent(&self) -> bool {
         true
     }
 
+    /// redb 和 overlay 都按 BON Key 顺序组织，因此表支持有序范围流。
     fn is_ordered(&self) -> bool {
         true
     }
@@ -206,10 +258,16 @@ impl<
     }
 
     fn size(&self) -> u64 {
+        // 这里只统计共享 overlay 的逻辑字节估算，不包含 redb 文件、页缓存、事务私有根或
+        // 等待队列；调用方不能把它解释为表总磁盘大小或进程 RSS。
         let cache_copy = self.0.cache.lock().clone();
         cache_copy.full_bytes_size()
     }
 
+    /// 创建未携带版本上下文的普通 Btree 叶事务。
+    ///
+    /// 构造只 O(1) clone 当前共享 overlay 根，不打开 redb 读事务；Key 的 redb 基线在首次
+    /// query/delete 时按需建立。该入口自身不登记根 child，也不分配 TID/CID。
     fn transaction(&self,
                    source: Atom,
                    is_writable: bool,
@@ -225,6 +283,7 @@ impl<
     }
 
     fn ready_collect(&self) -> BoxFuture<Result<(), Self::Error>> {
+        // Btree 没有 LogFile 切分准备阶段；真正维护全部发生在 collect。
         async move {
             //忽略整理准备
             Ok(())
@@ -273,36 +332,31 @@ impl<
                                                                          e)));
             }
 
-            //开始B树表的压缩
-            // 当前 retry_count 未递减且成功后未立即 break，compact 的重试/返回语义存在已归档
-            // 高可信缺陷 FIND-TABLE-001。本轮只补注释，不改变维护流程或扩大修复范围。
-            let mut retry_count = 3; //可以重试3次
-            for _ in 0..3 {
-                let now = Instant::now();
-                if let Err(e) = locked.compact() {
-                    //压缩数据表失败
-                    if retry_count == 0 {
-                        //重试已达限制，则立即返回错误原因
-                        table.0.collecting.store(false, Ordering::Release); //设置为已整理结束
-                        return Err(KVTableTrError::new_transaction_error(ErrorLevel::Normal,
-                                                                         format!("Compact b-tree ordered table failed, table: {:?}, time: {:?}, reason: {:?}",
-                                                                                 table.name().as_str(),
-                                                                                 now.elapsed(),
-                                                                                 e)));
-                    } else {
-                        //稍候重试
-                        thread::sleep(Duration::from_millis(1000)); //必须同步休眠指定时间
-                        continue;
-                    }
-                }
-
-                info!("Compact b-tree ordered table succeeded, table: {:?}, time: {:?}",
-                table.name().as_str(),
-                now.elapsed());
+            // compact 最多总计尝试三次；任意一次成功都立即结束，只有前两次失败会同步退避。
+            // inner 写锁和 collecting owner 在全部尝试期间保持不变，避免并发事务或另一个整理者
+            // 穿入重试窗口。该同步阻塞是既有维护边界，不得把等待改成跨 await 持锁。
+            let now = Instant::now();
+            match compact_with_bounded_retry(
+                || locked.compact(),
+                || thread::sleep(BTREE_COMPACT_RETRY_INTERVAL),
+            ) {
+                Ok(_) => {
+                    info!("Compact b-tree ordered table succeeded, table: {:?}, time: {:?}",
+                        table.name().as_str(),
+                        now.elapsed());
+                    table.0.collecting.store(false, Ordering::Release); //设置为已整理结束
+                    Ok(())
+                },
+                Err(e) => {
+                    //三次 compact 均失败；释放整理 owner，并保留既有可 rollback 的 Normal 分类。
+                    table.0.collecting.store(false, Ordering::Release); //设置为已整理结束
+                    Err(KVTableTrError::new_transaction_error(ErrorLevel::Normal,
+                                                               format!("Compact b-tree ordered table failed, table: {:?}, time: {:?}, reason: {:?}",
+                                                                       table.name().as_str(),
+                                                                       now.elapsed(),
+                                                                       e)))
+                },
             }
-
-            table.0.collecting.store(false, Ordering::Release); //设置为已整理结束
-            Ok(())
         }.boxed()
     }
 }
@@ -643,22 +697,27 @@ impl<
     type Output = ();
     type Error = KVTableTrError;
 
+    /// 返回根事务创建时固定的可写能力；动作方法本身不重复检查该标志。
     fn is_writable(&self) -> bool {
         self.0.writable
     }
 
+    /// Btree 叶发布共享 overlay 时必须服从根 child 顺序，当前不允许并发 commit。
     fn is_concurrent_commit(&self) -> bool {
         false
     }
 
+    /// rollback 只移除短 prepared 预留和版本 lease，当前不需要并发调度。
     fn is_concurrent_rollback(&self) -> bool {
         false
     }
 
+    /// 返回用于管理、事件和日志的来源，不参与事务身份或冲突判定。
     fn get_source(&self) -> Atom {
         self.0.source.clone()
     }
 
+    /// Btree 事务在构造时已固定 overlay 根，没有额外异步初始化阶段。
     fn init(&self)
             -> BoxFuture<Result<<Self as AsyncTransaction>::Output, <Self as AsyncTransaction>::Error>> {
         async move {
@@ -697,18 +756,22 @@ impl<
     type ConfirmError = KVTableTrError;
     type CommitConfirm = KVDBCommitConfirm<C, Log>;
 
+    /// 返回本叶动作是否需要进入根 WAL；它不表示 redb 文件是否存在。
     fn is_require_persistence(&self) -> bool {
         self.0.persistence.load(Ordering::Relaxed)
     }
 
+    /// 单向提升根 WAL 需求；重复调用幂等且不会立即执行 I/O。
     fn require_persistence(&self) {
         self.0.persistence.store(true, Ordering::Relaxed);
     }
 
+    /// prepared map 需要确定的根 child 顺序，当前由 manager 串行执行。
     fn is_concurrent_prepare(&self) -> bool {
         false
     }
 
+    /// Btree 叶必须继承整棵根事务树唯一的 TID/CID。
     fn is_enable_inherit_uid(&self) -> bool {
         true
     }
@@ -975,6 +1038,7 @@ impl<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>,
 > Transaction2PcAllConflicts for BtreeOrdTabTr<C, Log> {
+    /// 版本协议第一阶段只比较完整 expected version 集合，不登记 prepared 或读取 redb。
     fn precheck_all_conflicts(&self)
         -> BoxFuture<'_, Result<(), <Self as Transaction2Pc>::PrepareError>> {
         let tr = self.clone();
@@ -983,6 +1047,7 @@ impl<
         }.boxed()
     }
 
+    /// 在标准值/版本检查和 prepared 预留中收集去重后的全部冲突 Key。
     fn prepare_all_conflicts(&self)
         -> BoxFuture<'_, Result<Option<<Self as Transaction2Pc>::PrepareOutput>, <Self as Transaction2Pc>::PrepareError>> {
         let tr = self.clone();
@@ -999,7 +1064,7 @@ impl<
     type Status = Transaction2PcStatus;
     type Qos = TableTrQos;
 
-    //有序B树表事务，一定是单元事务
+    /// Btree 表事务始终是事务树叶节点。
     fn is_unit(&self) -> bool {
         true
     }
@@ -1013,6 +1078,7 @@ impl<
     }
 
     fn qos(&self) -> <Self as UnitTransaction>::Qos {
+        // Safe/ThreadSafe 是事务框架调度标签；它不替代本模块的锁和 redb 所有权规则。
         if self.is_require_persistence() {
             TableTrQos::Safe
         } else {
@@ -1027,7 +1093,7 @@ impl<
 > SequenceTransaction for BtreeOrdTabTr<C, Log> {
     type Item = Self;
 
-    //有序B树表事务，一定不是顺序事务
+    /// Btree 叶自身不拥有前后兄弟指针，顺序由根 child list 管理。
     fn is_sequence(&self) -> bool {
         false
     }
@@ -1048,7 +1114,7 @@ impl<
     type Node = KVDBTransaction<C, Log>;
     type NodeInterator = KVDBChildTrList<C, Log>;
 
-    //有序B树表事务，一定不是事务树
+    /// Btree 叶不再包含子事务。
     fn is_tree(&self) -> bool {
         false
     }
@@ -1620,6 +1686,7 @@ impl<
     fn lock_key(&self, _key: <Self as KVAction>::Key)
                 -> BoxFuture<Result<(), <Self as KVAction>::Error>>
     {
+        // 当前兼容钩子无条件成功，不建立排他、owner、等待或内存可见性关系。
         async move {
             Ok(())
         }.boxed()
@@ -1628,6 +1695,7 @@ impl<
     fn unlock_key(&self, _key: <Self as KVAction>::Key)
                   -> BoxFuture<Result<(), <Self as KVAction>::Error>>
     {
+        // 未持锁、重复调用和任意 Key 均成功；不得把返回值解释为释放了真实 Key 锁。
         async move {
             Ok(())
         }.boxed()
@@ -1778,6 +1846,7 @@ impl<
         }
     }
 
+    /// 取走全部最终动作并释放逐 Key 基线 owner；只供受信 repair 装配使用。
     fn take_actions(&self) -> XHashMap<Binary, KVActionLog> {
         mem::replace(&mut *self.0.key_states.lock(), XHashMap::default())
             .into_iter()
@@ -1785,6 +1854,7 @@ impl<
             .collect()
     }
 
+    /// 在 publication read 内校验版本协议的完整外部 read-set，不产生副作用。
     async fn precheck_versions(&self) -> Result<(), KVTableTrError> {
         let Some(context) = self.0.version_context.as_ref() else {
             return Ok(());
@@ -1799,9 +1869,10 @@ impl<
         let mut conflicts = Vec::new();
         for (key, expected) in context.expected() {
             if context.versions().current_version(key).as_ref() != Some(expected) {
-                conflicts.push(TableKey {
+                conflicts.push(TableKeyConflict {
                     table: self.0.table.name(),
                     key: key.clone(),
+                    kind: VersionConflictKind::ReadSetVersionMismatch,
                 });
             }
         }
@@ -1812,6 +1883,10 @@ impl<
         }
     }
 
+    /// 执行 Btree 的统一普通/版本 prepare，并按调用模式返回 Common、首冲突或完整冲突。
+    ///
+    /// 成功时整批 KeyState 原子转移到表级 prepared map；失败时不移动动作、不写 WAL、不发布
+    /// overlay，调用方仍可对整棵根事务 rollback。所有同步 redb 点读都发生在 prepared guard 前。
     async fn prepare_registered(&self,
                                 conflict_kind: PrepareConflictKind)
         -> Result<Option<Vec<u8>>, KVTableTrError> {
@@ -1842,7 +1917,8 @@ impl<
             if context.mode() == PrepareMode::Versioned {
                 for (key, expected) in context.expected() {
                     if context.versions().current_version(key).as_ref() != Some(expected) {
-                        conflict_keys.push(key.clone());
+                        conflict_keys.push((key.clone(),
+                                            VersionConflictKind::ReadSetVersionMismatch));
                     }
                 }
             }
@@ -1867,7 +1943,8 @@ impl<
                 if context
                     .versions()
                     .has_committed_after(key, context.snapshot_revision()) {
-                    conflict_keys.push(key.clone());
+                    conflict_keys.push((key.clone(),
+                                        VersionConflictKind::TransactionConflict));
                     continue;
                 }
             }
@@ -1885,14 +1962,16 @@ impl<
                                     error))
                     })?;
                     if !btree_baseline_state_equal(expected.as_ref(), current.as_ref()) {
-                        conflict_keys.push(key.clone());
+                        conflict_keys.push((key.clone(),
+                                            VersionConflictKind::TransactionConflict));
                     }
                 },
                 BtreeKeyBaseline::OverlayMissing => {
                     // blind write 只证明创建时 overlay 无项。当前出现 value 或 tombstone 都是
                     // 可证明的并发变化；已被 collector 清走的提交由 revision 证据覆盖。
                     if self.0.table.0.cache.lock().get(key).is_some() {
-                        conflict_keys.push(key.clone());
+                        conflict_keys.push((key.clone(),
+                                            VersionConflictKind::TransactionConflict));
                     }
                 },
             }
@@ -1914,7 +1993,8 @@ impl<
         }
         for (key, action) in &actions {
             if has_prepared_conflict(&prepare, key, mode, action) {
-                conflict_keys.push(key.clone());
+                conflict_keys.push((key.clone(),
+                                    VersionConflictKind::TransactionConflict));
             }
         }
         if !conflict_keys.is_empty() {
@@ -1931,6 +2011,7 @@ impl<
         Ok(write_buf)
     }
 
+    /// 将最终写动作编码为根 WAL 中的单表片段；Read 和非持久叶不产生输出。
     fn prepare_output(&self,
                       actions: &XHashMap<Binary, KVActionLog>) -> Option<Vec<u8>> {
         if !self.is_require_persistence() {
@@ -1965,10 +2046,13 @@ impl<
         Some(buf)
     }
 
+    /// 按公开 prepare 入口的错误形状构造冲突，并保持完整冲突集合去重工作由调用方完成。
     fn prepare_conflict_error(&self,
                               conflict_kind: PrepareConflictKind,
-                              keys: Vec<Binary>) -> KVTableTrError {
-        let key = keys[0].clone();
+                              keys: Vec<(Binary, VersionConflictKind)>) -> KVTableTrError {
+        // All 模式按原检查点保留分类；根 manager 只做 Table/Key 归并。完整规则见
+        // docs/VERSION_CONFLICT_KIND_DESIGN.md。
+        let key = keys[0].0.clone();
         match conflict_kind {
             PrepareConflictKind::Common => {
                 KVTableTrError::new_transaction_error(
@@ -1985,9 +2069,10 @@ impl<
             PrepareConflictKind::All => {
                 KVTableTrError::new_all_conflicts_error(keys
                     .into_iter()
-                    .map(|key| TableKey {
+                    .map(|(key, kind)| TableKeyConflict {
                         table: self.0.table.name(),
                         key,
+                        kind,
                     })
                     .collect())
             },
@@ -2139,7 +2224,7 @@ pub(crate) enum InnerTransaction {
 }
 
 impl InnerTransaction {
-    // 判断是否是只读事务
+    /// 判断当前封装是否持有普通 redb 只读事务。
     pub fn is_only_read(&self) -> bool {
         if let InnerTransaction::OnlyRead(_, _) = self {
             true
@@ -2148,7 +2233,7 @@ impl InnerTransaction {
         }
     }
 
-    // 判断是否是可写事务
+    /// 判断当前封装是否持有可提交/回滚的 redb 写事务。
     pub fn is_writable(&self) -> bool {
         if let InnerTransaction::Writable(_, _) = self {
             true
@@ -2157,7 +2242,7 @@ impl InnerTransaction {
         }
     }
 
-    // 判断是否是写冲突事务
+    /// 判断当前封装是否只是携带写冲突后的读上下文。
     pub fn is_write_conflict(&self) -> bool {
         if let InnerTransaction::WriteConflict(_, _) = self {
             true
@@ -2166,7 +2251,7 @@ impl InnerTransaction {
         }
     }
 
-    // 判断是否是修复表事务
+    /// 判断当前封装是否处于低层 repair 标记状态。
     pub fn is_repair(&self) -> bool {
         if let InnerTransaction::Repair(_, _) = self {
             true
@@ -2175,7 +2260,11 @@ impl InnerTransaction {
         }
     }
 
-    // 获取指定关键字的值
+    /// 从允许读取的 variant 点查 redb。
+    ///
+    /// `OnlyRead`、`WriteConflict` 和 `Writable` 把 open/get 错误记录后降级为 `None`；`Repair`
+    /// 无条件返回 `None`。该低层接口没有结构化错误通道，不能替代版本路径的严格
+    /// `query_committed`，也不能据 `None` 区分缺失与存储错误。
     pub fn query(&self, key: &Binary) -> Option<Binary> {
         match self {
             InnerTransaction::OnlyRead(transaction, name) => {
@@ -2251,7 +2340,10 @@ impl InnerTransaction {
         }
     }
 
-    // 写入指定关键字的值
+    /// 只在 `Writable` variant 的 redb 写事务中暂存 upsert。
+    ///
+    /// 非写 variant 返回错误，但历史 `Repair` 分支是无副作用 `Ok(())`；该枚举当前只有
+    /// `OnlyRead` 由 Btree 合并流生产构造，其余 variant 不属于外部稳定 API。
     pub fn upsert(&mut self, key: Binary, value: Binary) -> IOResult<()> {
         match self {
             InnerTransaction::OnlyRead(_transaction, name) => {
@@ -2296,7 +2388,9 @@ impl InnerTransaction {
         }
     }
 
-    // 删除指定关键字的值
+    /// 只在 `Writable` variant 的 redb 写事务中暂存删除，并尽可能返回 redb 旧值。
+    ///
+    /// `Repair` 当前无副作用返回 `Ok(None)`；不得把该内部兼容分支解释为修复流程已经执行删除。
     pub fn delete(&mut self, key: &Binary) -> IOResult<Option<Binary>> {
         match self {
             InnerTransaction::OnlyRead(_transaction, name) => {
@@ -2344,7 +2438,10 @@ impl InnerTransaction {
         }
     }
 
-    /// 获取从只读事务中指定关键字开始的迭代器
+    /// 从只读或冲突读事务取得有界/无界 redb 范围。
+    ///
+    /// 起始 Key 对正序和倒序均为包含边界；创建失败记录日志并返回 `None`。返回 Range 借用
+    /// table 和事务，调用方必须让二者覆盖完整迭代生命周期。
     pub(crate) fn values_by_read<'a>(&'a self,
                                      table: &'a ReadOnlyTable<Binary, Binary>,
                                      key: Option<Binary>,
@@ -2452,7 +2549,10 @@ impl InnerTransaction {
         }
     }
 
-    /// 获取从可写事务中的指定关键字开始的迭代器
+    /// 从 `Writable` redb table 取得有界/无界范围；其它 variant 返回 `None`。
+    ///
+    /// 本入口当前没有 Btree 2PC 生产调用点，只作为低层封装事实保留；不得与公开
+    /// `KVAction::keys/values` 的 overlay 合并快照语义混同。
     pub fn values_by_write<'a>(&'a self,
                                table: &'a Table<'a, Binary, Binary>,
                                key: Option<Binary>,
@@ -2524,7 +2624,7 @@ impl InnerTransaction {
         }
     }
 
-    // 提交可写事务的所有写操作
+    /// 消费并提交 `Writable` redb 事务；其它 variant 当前按 no-op 成功关闭 owner。
     pub fn commit(self) -> IOResult<()> {
         if let InnerTransaction::Writable(mut transaction, name) = self {
             //当前是写事务
@@ -2542,7 +2642,7 @@ impl InnerTransaction {
         }
     }
 
-    // 回滚可写事务的所有写操作
+    /// 消费并 abort `Writable` redb 事务；其它 variant 当前按 no-op 成功关闭 owner。
     pub fn rollback(self) -> IOResult<()> {
         if let InnerTransaction::Writable(mut transaction, name) = self {
             //当前是写事务
@@ -2560,7 +2660,9 @@ impl InnerTransaction {
         }
     }
 
-    // 关闭非可写事务
+    /// 显式关闭 `OnlyRead/WriteConflict` 事务；写和 repair variant 当前按 no-op 成功。
+    ///
+    /// 正常 RAII drop 也会释放 redb 读事务；显式 close 只用于需要观察关闭错误的低层路径。
     pub fn close(self) -> IOResult<()> {
         match self {
             InnerTransaction::OnlyRead(transaction, name) => {
@@ -2810,11 +2912,12 @@ async fn collect_waits<
 
 #[cfg(test)]
 mod iterator_read_transaction_tests {
-    //! Btree 流持有和释放 redb `ReadTransaction` 的精确白盒测试。
+    //! Btree 内部局部不变量、compact 重试和 redb `ReadTransaction` 生命周期测试。
     //!
-    //! redb 在活动读事务存在时明确拒绝 compact。测试使用生产 `BtreeOrdTabTr::keys`
-    //! 创建流，以该错误作为资源存活门禁；流取消或耗尽后 compact 必须立即恢复。测试直接
-    //! 构造表内部对象，避免启动与本断言无关的永久 collector 任务。
+    //! 测试直接构造表内部对象并使用真实 redb、runtime、文件系统和生产事务类型，但不启动永久
+    //! collector。局部测试只证明 adapter、overlay、逐 Key 基线、prepared、合并流、repair 和
+    //! cache flag 等模块内事实；根 manager、根 WAL、异步确认、崩溃恢复和生产并发仍由独立真实
+    //! target 证明。redb 在活动读事务存在时明确拒绝 compact，该错误用于资源存活硬门禁。
 
     use std::{
         fs,
@@ -2868,6 +2971,40 @@ mod iterator_read_transaction_tests {
         Binary::new(buffer.bytes)
     }
 
+    fn assert_binary(actual: Option<Binary>, expected: Option<&Binary>, label: &str) {
+        match (actual, expected) {
+            (Some(actual), Some(expected)) => {
+                assert_eq!(actual.as_ref(), expected.as_ref(), "{label}: value mismatch");
+            },
+            (None, None) => (),
+            (actual, expected) => {
+                panic!("{label}: presence mismatch, actual: {}, expected: {}",
+                       actual.is_some(),
+                       expected.is_some());
+            },
+        }
+    }
+
+    fn seed_redb(table: &TestTable, entries: &[(Binary, Binary)]) {
+        let inner = table.0.inner.read();
+        let transaction = inner
+            .begin_write()
+            .expect("Btree local redb write transaction must open");
+        {
+            let mut inner_table = transaction
+                .open_table(DEFAULT_TABLE_NAME)
+                .expect("Btree local redb table must open");
+            for (key, value) in entries {
+                inner_table
+                    .insert(key.clone(), value.clone())
+                    .expect("Btree local redb seed insert must succeed");
+            }
+        }
+        transaction
+            .commit()
+            .expect("Btree local redb seed transaction must commit");
+    }
+
     fn build_table(root: &TempRoot) -> TestTable {
         let path = root.path().join(DEFAULT_TABLE_FILE_NAME);
         let database = TableBuilder::new()
@@ -2913,6 +3050,530 @@ mod iterator_read_transaction_tests {
             .write()
             .compact()
             .unwrap_or_else(|error| panic!("{label}: read transaction remained active: {error:?}"));
+    }
+
+    /// redb adapter、表能力、叶节点身份、状态和 persistence 提升必须保持单义。
+    #[test]
+    fn test_btree_adapter_metadata_leaf_identity_and_qos_contract() {
+        let encoded = bon_usize(17);
+        let decoded = <Binary as Value>::from_bytes(encoded.as_ref());
+        assert_eq!(decoded.as_ref(), encoded.as_ref());
+        assert_eq!(<Binary as Value>::as_bytes(&decoded).as_ref(), encoded.as_ref());
+        assert_eq!(<Binary as Value>::fixed_width(), None);
+        assert_eq!(<Binary as Key>::compare(bon_usize(1).as_ref(), bon_usize(2).as_ref()),
+                   std::cmp::Ordering::Less);
+        assert_eq!(<Binary as Key>::compare(encoded.as_ref(), encoded.as_ref()),
+                   std::cmp::Ordering::Equal);
+
+        let root = TempRoot::new();
+        let table = build_table(&root);
+        let expected_path = root.path().join(DEFAULT_TABLE_FILE_NAME);
+        assert_eq!(table.name().as_str(), "iterator_read_guard");
+        assert_eq!(table.path(), Some(expected_path.as_path()));
+        assert!(table.is_persistent());
+        assert!(table.is_ordered());
+        assert_eq!(table.len(), 0);
+        assert_eq!(table.size(), 0);
+
+        let transaction = table.transaction(Atom::from("Btree local identity source"),
+                                            true,
+                                            false,
+                                            1_234,
+                                            5_678);
+        assert!(transaction.is_writable());
+        assert!(!transaction.is_concurrent_prepare());
+        assert!(!transaction.is_concurrent_commit());
+        assert!(!transaction.is_concurrent_rollback());
+        assert!(transaction.is_enable_inherit_uid());
+        assert_eq!(transaction.get_source().as_str(), "Btree local identity source");
+        assert_eq!(transaction.get_prepare_timeout(), 1_234);
+        assert_eq!(transaction.get_commit_timeout(), 5_678);
+        assert_eq!(transaction.get_status(), Transaction2PcStatus::Start);
+        assert!(transaction.is_unit());
+        assert!(!transaction.is_sequence());
+        assert!(!transaction.is_tree());
+        assert!(transaction.prev_item().is_none());
+        assert!(transaction.next_item().is_none());
+        assert_eq!(transaction.children_len(), 0);
+        assert_eq!(transaction.to_children().count(), 0);
+        assert_eq!(transaction.qos(), TableTrQos::ThreadSafe);
+        assert!(block_on(transaction.init()).is_ok());
+
+        let tid = Guid(101);
+        let cid = Guid(102);
+        transaction.set_transaction_uid(tid.clone());
+        transaction.set_commit_uid(cid.clone());
+        transaction.set_prepare_uid(Guid(103));
+        assert_eq!(transaction.get_transaction_uid(), Some(tid));
+        assert_eq!(transaction.get_commit_uid(), Some(cid));
+        assert!(transaction.get_prepare_uid().is_none());
+        transaction.set_status(Transaction2PcStatus::Actioning);
+        assert_eq!(transaction.get_status(), Transaction2PcStatus::Actioning);
+        transaction.require_persistence();
+        transaction.require_persistence();
+        assert!(transaction.is_require_persistence());
+        assert_eq!(transaction.qos(), TableTrQos::Safe);
+
+        let read_only = table.transaction(Atom::from("Btree local read only"),
+                                          false,
+                                          true,
+                                          7,
+                                          9);
+        assert!(matches!(block_on(read_only.prepare()), Ok(None)));
+        assert!(table.0.prepare.lock().is_empty());
+    }
+
+    /// 动作只修改私有 overlay，同 Key 后写保留首次基线，创建后的流固定双层快照。
+    #[test]
+    fn test_btree_private_overlay_final_action_and_snapshot_contract() {
+        let root = TempRoot::new();
+        let table = build_table(&root);
+        let private_key = bon_usize(10);
+        let disk_key = bon_usize(20);
+        let first_value = bon_usize(1010);
+        let final_value = bon_usize(1011);
+        let disk_value = bon_usize(1020);
+        seed_redb(&table, &[(disk_key.clone(), disk_value.clone())]);
+
+        let transaction = table.transaction(Atom::from("Btree local actions source"),
+                                            true,
+                                            true,
+                                            100,
+                                            200);
+        block_on(transaction.upsert(private_key.clone(), first_value.clone()))
+            .expect("first private Btree upsert must succeed");
+        let snapshot = transaction.values(None, false);
+        block_on(transaction.upsert(private_key.clone(), final_value.clone()))
+            .expect("final private Btree upsert must succeed");
+        let removed = block_on(transaction.delete(disk_key.clone()))
+            .expect("private Btree redb delete must succeed");
+        assert_binary(removed, Some(&disk_value), "Btree delete must expose redb old value");
+
+        assert_binary(block_on(transaction.query(private_key.clone())),
+                      Some(&final_value),
+                      "transaction must observe final private Btree upsert");
+        assert_binary(block_on(transaction.query(disk_key.clone())),
+                      None,
+                      "transaction tombstone must hide redb old value");
+        assert_binary(table.query_committed(&private_key)
+                           .expect("shared private-key probe must succeed"),
+                      None,
+                      "uncommitted Btree upsert must not reach shared overlay");
+        assert_binary(table.query_committed(&disk_key)
+                           .expect("shared disk-key probe must succeed"),
+                      Some(&disk_value),
+                      "uncommitted Btree delete must not reach redb or shared overlay");
+
+        let snapshot_entries = block_on(snapshot.collect::<Vec<_>>());
+        assert_eq!(snapshot_entries,
+                   vec![(private_key.clone(), first_value.clone()),
+                        (disk_key.clone(), disk_value.clone())]);
+        assert!(transaction.0.cache_ref.lock().get(&private_key).is_none());
+        assert!(matches!(transaction.0.cache_mut.lock().get(&disk_key), Some(None)));
+
+        let key_states = transaction.0.key_states.lock();
+        let private_state = key_states
+            .get(&private_key)
+            .expect("private Btree upsert state must exist");
+        assert!(matches!(&private_state.action,
+                         KVActionLog::Write(Some(value))
+                         if value.as_ref() == final_value.as_ref()));
+        assert!(matches!(&private_state.baseline, BtreeKeyBaseline::OverlayMissing));
+        let disk_state = key_states
+            .get(&disk_key)
+            .expect("private Btree delete state must exist");
+        assert!(matches!(&disk_state.action, KVActionLog::Write(None)));
+        assert!(matches!(&disk_state.baseline,
+                         BtreeKeyBaseline::Known(Some(value))
+                         if value.as_ref() == disk_value.as_ref()));
+    }
+
+    /// redb 点读建立独立 Known 基线，blind write 保持 OverlayMissing，逻辑判等兼容新 allocation。
+    #[test]
+    fn test_btree_redb_baseline_and_state_equality_contract() {
+        let root = TempRoot::new();
+        let table = build_table(&root);
+        let disk_key = bon_usize(30);
+        let missing_key = bon_usize(31);
+        let blind_key = bon_usize(32);
+        let disk_value = bon_usize(1030);
+        seed_redb(&table, &[(disk_key.clone(), disk_value.clone())]);
+
+        let equal_allocation = Binary::new(disk_value.as_ref().to_vec());
+        let different_value = bon_usize(1031);
+        assert!(btree_baseline_state_equal(Some(&disk_value), Some(&disk_value)));
+        assert!(!Binary::binary_equal(&disk_value, &equal_allocation));
+        assert!(btree_baseline_state_equal(Some(&disk_value), Some(&equal_allocation)));
+        assert!(!btree_baseline_state_equal(Some(&disk_value), Some(&different_value)));
+        assert!(btree_baseline_state_equal(None, None));
+        assert!(!btree_baseline_state_equal(Some(&disk_value), None));
+
+        let transaction = table.transaction(Atom::from("Btree local baseline source"),
+                                            true,
+                                            true,
+                                            300,
+                                            400);
+        assert_binary(block_on(transaction.query(disk_key.clone())),
+                      Some(&disk_value),
+                      "redb query must return the stable value");
+        assert_binary(block_on(transaction.query(missing_key.clone())),
+                      None,
+                      "redb query must preserve a confirmed missing state");
+        block_on(transaction.upsert(blind_key.clone(), bon_usize(1032)))
+            .expect("blind Btree upsert must succeed locally");
+
+        assert!(transaction.0.cache_ref.lock().get(&disk_key).is_none());
+        assert!(transaction.0.cache_mut.lock().get(&disk_key).is_none());
+        let states = transaction.0.key_states.lock();
+        assert!(matches!(&states.get(&disk_key)
+                              .expect("redb value baseline must exist")
+                              .baseline,
+                         BtreeKeyBaseline::Known(Some(value))
+                         if value.as_ref() == disk_value.as_ref()));
+        assert!(matches!(&states.get(&missing_key)
+                              .expect("redb missing baseline must exist")
+                              .baseline,
+                         BtreeKeyBaseline::Known(None)));
+        assert!(matches!(&states.get(&blind_key)
+                              .expect("blind Btree baseline must exist")
+                              .baseline,
+                         BtreeKeyBaseline::OverlayMissing));
+    }
+
+    /// prepare 只编码最终写并转移 KeyState；同 Key prepared 冲突必须原子拒绝并可 rollback。
+    #[test]
+    fn test_btree_prepare_wal_conflict_ownership_and_rollback_contract() {
+        let root = TempRoot::new();
+        let table = build_table(&root);
+        let upsert_key = bon_usize(40);
+        let delete_key = bon_usize(41);
+        let read_key = bon_usize(42);
+        let old_value = bon_usize(1041);
+        let new_value = bon_usize(1040);
+        seed_redb(&table, &[(delete_key.clone(), old_value.clone())]);
+
+        let transaction = table.transaction(Atom::from("Btree local prepare source"),
+                                            true,
+                                            true,
+                                            500,
+                                            600);
+        let tid = Guid(201);
+        transaction.set_transaction_uid(tid.clone());
+        block_on(transaction.upsert(upsert_key.clone(), new_value.clone()))
+            .expect("private Btree upsert before prepare must succeed");
+        assert_binary(block_on(transaction.delete(delete_key.clone()))
+                          .expect("private Btree delete before prepare must succeed"),
+                      Some(&old_value),
+                      "Btree prepare fixture must capture the redb old value");
+        assert!(block_on(transaction.query(read_key.clone())).is_none());
+
+        let output = block_on(transaction.prepare_conflicts())
+            .expect("Btree prepare must succeed")
+            .expect("persistent Btree writes must produce a WAL fragment");
+        let (table_name, write_count, offset) =
+            <TestTable as KVTable>::get_init_table_prepare_output(&output, 0);
+        let (writes, end) =
+            <TestTable as KVTable>::get_all_key_value_from_table_prepare_output(
+                &output,
+                &table_name,
+                write_count,
+                offset);
+        assert_eq!(table_name.as_str(), "iterator_read_guard");
+        assert_eq!(write_count, 2, "Read must not enter the Btree WAL fragment");
+        assert_eq!(writes.len(), 2);
+        assert_eq!(end, output.len());
+        assert!(writes.iter().any(|entry| {
+            entry.key.as_ref() == upsert_key.as_ref()
+                && entry.value.as_ref().map(Binary::as_ref) == Some(new_value.as_ref())
+        }));
+        assert!(writes.iter().any(|entry| {
+            entry.key.as_ref() == delete_key.as_ref() && entry.value.is_none()
+        }));
+
+        assert!(transaction.0.key_states.lock().is_empty());
+        {
+            let prepared = table.0.prepare.lock();
+            let item = prepared.get(&tid).expect("Btree prepare map must reserve the root TID");
+            assert_eq!(item.mode, PrepareMode::Ordinary);
+            assert_eq!(item.actions.len(), 3);
+            assert!(matches!(item.actions.get(&read_key), Some(KVActionLog::Read)));
+        }
+
+        let contender = table.transaction(Atom::from("Btree local prepared contender"),
+                                          true,
+                                          true,
+                                          700,
+                                          800);
+        contender.set_transaction_uid(Guid(202));
+        block_on(contender.upsert(upsert_key.clone(), bon_usize(2040)))
+            .expect("Btree contender action must succeed locally");
+        let conflict = block_on(contender.prepare_conflicts())
+            .expect_err("same-Key prepared Btree contender must conflict");
+        assert!(conflict.is_conflicts());
+        block_on(contender.rollback()).expect("Btree contender rollback must succeed");
+
+        assert_binary(table.query_committed(&upsert_key)
+                           .expect("shared Btree upsert probe must succeed"),
+                      None,
+                      "prepare must not publish Btree upsert");
+        assert_binary(table.query_committed(&delete_key)
+                           .expect("shared Btree delete probe must succeed"),
+                      Some(&old_value),
+                      "prepare must not publish Btree delete");
+        block_on(transaction.rollback()).expect("Btree rollback must release prepared state");
+        assert!(table.0.prepare.lock().is_empty());
+    }
+
+    /// 合并流必须让 overlay 覆盖 redb、tombstone 屏蔽 redb，并保持包含边界与顺逆序。
+    #[test]
+    fn test_btree_merged_stream_order_range_and_tombstone_contract() {
+        let root = TempRoot::new();
+        let table = build_table(&root);
+        let key0 = bon_usize(0);
+        let key1 = bon_usize(1);
+        let key2 = bon_usize(2);
+        let key3 = bon_usize(3);
+        let key4 = bon_usize(4);
+        let key6 = bon_usize(6);
+        let value0 = bon_usize(2000);
+        let value1 = bon_usize(1001);
+        let value2 = bon_usize(2002);
+        let value3 = bon_usize(2003);
+        let value4 = bon_usize(1004);
+        let value6 = bon_usize(1006);
+        seed_redb(&table,
+                  &[(key1.clone(), value1.clone()),
+                    (key2.clone(), bon_usize(1002)),
+                    (key4.clone(), value4.clone()),
+                    (key6.clone(), value6.clone())]);
+
+        let transaction = table.transaction(Atom::from("Btree local merged stream"),
+                                            true,
+                                            true,
+                                            900,
+                                            1_000);
+        block_on(transaction.upsert(key0.clone(), value0.clone()))
+            .expect("cache-only Btree upsert must succeed");
+        block_on(transaction.upsert(key2.clone(), value2.clone()))
+            .expect("Btree overlay replacement must succeed");
+        block_on(transaction.upsert(key3.clone(), value3.clone()))
+            .expect("middle Btree overlay upsert must succeed");
+        assert_binary(block_on(transaction.delete(key4.clone()))
+                          .expect("Btree persisted tombstone must succeed"),
+                      Some(&value4),
+                      "Btree persisted tombstone must expose old value");
+
+        let ascending = block_on(transaction.keys(None, false).collect::<Vec<_>>());
+        assert_eq!(ascending,
+                   vec![key0.clone(), key1.clone(), key2.clone(), key3.clone(), key6.clone()]);
+        let descending = block_on(transaction.keys(None, true).collect::<Vec<_>>());
+        assert_eq!(descending,
+                   vec![key6.clone(), key3.clone(), key2.clone(), key1.clone(), key0.clone()]);
+        let from_two = block_on(transaction.keys(Some(key2.clone()), false).collect::<Vec<_>>());
+        assert_eq!(from_two, vec![key2.clone(), key3.clone(), key6.clone()]);
+        let down_to_two = block_on(transaction.keys(Some(key2.clone()), true).collect::<Vec<_>>());
+        assert_eq!(down_to_two, vec![key2.clone(), key1.clone(), key0.clone()]);
+
+        let values = block_on(transaction.values(None, false).collect::<Vec<_>>());
+        assert_eq!(values,
+                   vec![(key0, value0),
+                        (key1, value1),
+                        (key2, value2),
+                        (key3, value3),
+                        (key6, value6)]);
+    }
+
+    /// repair 必须发布最终 overlay 并登记 Ordinary prepared；cache cleanup 只删除匹配 TID。
+    #[test]
+    fn test_btree_repair_prepared_and_cache_flag_ownership_contract() {
+        let root = TempRoot::new();
+        let table = build_table(&root);
+        let upsert_key = bon_usize(80);
+        let delete_key = bon_usize(81);
+        let cleanup_key = bon_usize(90);
+        let repaired_value = bon_usize(1080);
+        let deleted_value = bon_usize(1081);
+        let current_value = bon_usize(1090);
+        seed_redb(&table, &[(delete_key.clone(), deleted_value)]);
+
+        let repair = table.transaction(Atom::from("Btree local repair"),
+                                       true,
+                                       true,
+                                       1_100,
+                                       1_200);
+        block_on(repair.upsert(upsert_key.clone(), repaired_value.clone()))
+            .expect("Btree repair upsert action must be staged");
+        block_on(repair.delete(delete_key.clone()))
+            .expect("Btree repair delete action must be staged");
+        let repair_tid = Guid(301);
+        repair.prepare_repair(repair_tid.clone());
+
+        assert_binary(table.query_committed(&upsert_key)
+                           .expect("Btree repair upsert probe must succeed"),
+                      Some(&repaired_value),
+                      "Btree repair must publish upsert to shared overlay");
+        assert_binary(table.query_committed(&delete_key)
+                           .expect("Btree repair delete probe must succeed"),
+                      None,
+                      "Btree repair tombstone must hide redb old value");
+        assert!(repair.0.key_states.lock().is_empty());
+        {
+            let prepared = table.0.prepare.lock();
+            let item = prepared
+                .get(&repair_tid)
+                .expect("Btree repair must register prepared actions by TID");
+            assert_eq!(item.mode, PrepareMode::Ordinary);
+            assert_eq!(item.actions.len(), 2);
+        }
+
+        let stale_tid = Guid(401);
+        let current_tid = Guid(402);
+        table.0.cache.lock().upsert(cleanup_key.clone(), Some(current_value.clone()), false);
+        table.0.cache_flags.lock().insert(cleanup_key.clone(), current_tid.clone());
+        let stale_cleaner = table.transaction(Atom::from("Btree stale cache cleaner"),
+                                              false,
+                                              false,
+                                              1_300,
+                                              1_400);
+        stale_cleaner.delete_cache(vec![(cleanup_key.clone(), Some(stale_tid))]);
+        assert_binary(table.query_committed(&cleanup_key)
+                           .expect("stale Btree cleanup probe must succeed"),
+                      Some(&current_value),
+                      "stale collector TID must not remove a newer overlay value");
+        assert_eq!(table.0.cache_flags.lock().get(&cleanup_key), Some(&current_tid));
+
+        let matching_cleaner = table.transaction(Atom::from("Btree matching cache cleaner"),
+                                                 false,
+                                                 false,
+                                                 1_500,
+                                                 1_600);
+        matching_cleaner.delete_cache(vec![(cleanup_key.clone(), Some(current_tid))]);
+        assert!(table.0.cache_flags.lock().get(&cleanup_key).is_none());
+        assert_binary(table.query_committed(&cleanup_key)
+                           .expect("matching Btree cleanup probe must succeed"),
+                      None,
+                      "matching collector TID must remove the persisted overlay owner");
+
+        assert_eq!(table.0.prepare.lock().remove(&repair_tid).map(|item| item.mode),
+                   Some(PrepareMode::Ordinary));
+        assert!(table.0.prepare.lock().is_empty());
+    }
+
+    /// 第一次成功必须立即返回，不能执行等待或多余 compact。
+    #[test]
+    fn test_btree_compact_retry_returns_on_first_success() {
+        let mut compact_calls = 0;
+        let mut wait_calls = 0;
+        let result = compact_with_bounded_retry(
+            || {
+                compact_calls += 1;
+                Ok::<usize, &'static str>(17)
+            },
+            || wait_calls += 1,
+        );
+
+        assert_eq!(result, Ok(17));
+        assert_eq!(compact_calls, 1, "success must stop compact immediately");
+        assert_eq!(wait_calls, 0, "success must not enter retry wait");
+    }
+
+    /// 一次失败后成功时只能等待一次，并返回成功调用的原始结果。
+    #[test]
+    fn test_btree_compact_retry_succeeds_within_limit() {
+        let mut compact_calls = 0;
+        let mut wait_calls = 0;
+        let mut outcomes = vec![Err("first failure"), Ok(23)].into_iter();
+        let result = compact_with_bounded_retry(
+            || {
+                compact_calls += 1;
+                outcomes.next().expect("compact must stop after the first success")
+            },
+            || wait_calls += 1,
+        );
+
+        assert_eq!(result, Ok(23));
+        assert_eq!(compact_calls, 2, "one failure and one success require two calls");
+        assert_eq!(wait_calls, 1, "only the retryable failure may wait");
+    }
+
+    /// 第三次仍属于允许范围；成功后必须返回，不能按“已达到计数”误报失败。
+    #[test]
+    fn test_btree_compact_retry_allows_success_on_final_attempt() {
+        let mut compact_calls = 0;
+        let mut wait_calls = 0;
+        let mut outcomes = vec![Err("failure 1"), Err("failure 2"), Ok(29)].into_iter();
+        let result = compact_with_bounded_retry(
+            || {
+                compact_calls += 1;
+                outcomes.next().expect("compact must stop at the final allowed success")
+            },
+            || wait_calls += 1,
+        );
+
+        assert_eq!(result, Ok(29));
+        assert_eq!(compact_calls, BTREE_COMPACT_MAX_ATTEMPTS);
+        assert_eq!(wait_calls, BTREE_COMPACT_MAX_ATTEMPTS - 1);
+    }
+
+    /// 三次全部失败必须返回最后一次错误；第三次之后禁止继续等待或调用。
+    #[test]
+    fn test_btree_compact_retry_returns_final_failure_at_limit() {
+        let mut compact_calls = 0;
+        let mut wait_calls = 0;
+        let outcomes: Vec<Result<usize, &'static str>> =
+            vec![Err("failure 1"), Err("failure 2"), Err("failure 3")];
+        let mut outcomes = outcomes.into_iter();
+        let result = compact_with_bounded_retry(
+            || {
+                compact_calls += 1;
+                outcomes.next().expect("compact must not exceed its fixed attempt limit")
+            },
+            || wait_calls += 1,
+        );
+
+        assert_eq!(result, Err("failure 3"));
+        assert_eq!(compact_calls, BTREE_COMPACT_MAX_ATTEMPTS);
+        assert_eq!(wait_calls, BTREE_COMPACT_MAX_ATTEMPTS - 1);
+    }
+
+    /// 活动 redb 读事务会让生产 collect 连续失败；达到上限后必须返回 Normal 错误并释放 owner，
+    /// 丢弃流后同一表必须可以再次整理成功，且事务私有逻辑值保持不变。
+    #[test]
+    fn test_btree_collect_reports_real_compaction_failure_and_recovers() {
+        let root = TempRoot::new();
+        let table = build_table(&root);
+        let transaction = table.transaction(Atom::from("collect retry owner"), true, false, 5_000, 5_000);
+        let key = bon_usize(1);
+        let value = bon_usize(11);
+        block_on(transaction.upsert(key.clone(), value.clone()))
+            .expect("overlay setup must succeed");
+
+        let stream = transaction.keys(None, false);
+        assert_read_transaction_active(&table, "collect retry zero-poll stream");
+        let error = block_on(table.collect())
+            .expect_err("three real compact failures must not be reported as success");
+        match error {
+            KVTableTrError::Common(ErrorLevel::Normal, reason) => {
+                assert!(reason.contains("TransactionInProgress"),
+                        "collect must retain the final redb failure, observed: {reason}");
+            },
+            other => panic!("collect failure must remain recoverable Normal, observed: {other:?}"),
+        }
+        assert!(!table.0.collecting.load(Ordering::Acquire),
+                "failed collect must release the collecting owner");
+        assert_eq!(block_on(transaction.query(key.clone())), Some(value.clone()),
+                   "failed maintenance must not alter transaction-local logical data");
+
+        drop(stream);
+        block_on(table.collect()).expect("collect must recover after the read transaction is released");
+        assert!(!table.0.collecting.load(Ordering::Acquire),
+                "successful collect must release the collecting owner");
+        assert_eq!(block_on(transaction.query(key)), Some(value),
+                   "successful maintenance must not alter transaction-local logical data");
+
+        drop(transaction);
+        drop(table);
+        drop(root);
     }
 
     /// 0 poll、部分消费和正常耗尽均必须解除 redb 活动读事务门禁。

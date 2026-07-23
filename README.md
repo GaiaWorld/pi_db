@@ -15,6 +15,38 @@
 合法表定义不会被静默跳过；权威 Meta 中的全部定义必须成功装配后，启动才会继续进入根 WAL
 修复和可用状态。
 
+<a id="startup-repair-execution-context"></a>
+
+#### 启动恢复执行上下文
+
+存在未确认根 WAL 时，`CommitLogger::start_replay` 会在轮询启动 future 的当前线程同步调用
+`pi_db` 的 replay callback。callback 把真正的表动作、`prepare_repair` 和 `commit_repair` 投递到
+该数据库实例的 runtime，并同步等待这条 repair task 返回；callback 返回后，存储层才能按原有
+顺序推进对应 checkpoint。该同步边界是当前 replay/WAL 归属语义的一部分，不能改成先返回再后台
+修复。
+
+已确认的活性限制必须同时满足以下条件才会触发：存在会调用 callback 的非空未确认 WAL；startup
+future 正由数据库 runtime 自身的 worker 驱动；所有可执行 worker 都被 startup/replay callback
+同步等待占用，以致刚投递的 repair task 没有 worker 可以首次 poll。此时 startup 会持续等待，
+数据库不会进入可用状态；这是活性问题，不是 data race 或 UB，当前也没有数据损坏证据。单 worker
+配置本身不是触发条件：空 WAL 不调用 callback；由 runtime 外部线程驱动 startup 时，唯一 worker
+仍可执行 repair；同一 runtime 中尚有空闲 worker 时也可以推进。
+
+当前正式生产链 `pi-launcher::start_storage_db_server -> futures::executor::block_on ->
+pi_db_server::init_db_server -> DbInstance::build -> KVDBManagerBuilder::startup` 由 launcher 启动线程
+轮询 startup。`pi_db_server` 为每个实例创建独立数据库 runtime，并在 registry 构建期间顺序启动
+实例；启动期 worker 只处理文件、repair commit 和提交确认任务。因此当前装配即使配置一个 worker，
+也不会提供上述自阻塞窗口。直接集成 `pi_db` 的调用方若改为在同一个数据库 runtime 内启动实例，
+必须确保 replay 等待期间至少保留一个可执行 worker，或改由 runtime 外部线程驱动 startup；不得
+同时并发启动足以占满共享 runtime 全部 worker 的多个待 repair 实例。
+
+本轮不修改 repair、checkpoint、确认、WAL 格式、公开 API 或正常生产执行路径，只归档该条件性
+限制。`tests/startup_repair_liveness.rs` 使用真实 runtime、事务管理器、CommitLogger、LogOrdered
+表、文件系统和公开 startup：外部线程驱动的单 worker 非空 WAL 必须恢复成功并校验最终值；同一
+runtime 唯一 worker 的特定窗口必须在有限截止内精确命中特征化红线，且不能退化为 I/O 错误、
+panic、channel 断开或测试进程永久挂起。完整证据与未来候选方案见
+`docs/STARTUP_REPAIR_RUNTIME_LIVENESS_BUG.md`。
+
 ### 事务树身份与根 WAL
 
 一次公开事务生命周期只注册一个外层根，根及全部子表事务共享同一个事务 ID；需要写根 WAL 时
@@ -24,7 +56,45 @@ rollback/finish`。`prepare_len` 和 `commit_len` 只表示当前正在运行的
 
 `persistence=true` 只表示对应事务动作需要进入根 WAL，不表示该表拥有独立数据文件。Memory 表
 允许 `persistence=true`，其动作会写入根 WAL，但不会创建 Memory 数据文件；可写非持久化事务
-不写 WAL，仍会执行完整子表 commit。
+不写 WAL，仍会执行完整子表 commit。未确认根 WAL 可在启动 repair 中恢复 Memory 动作；事务
+全部确认且 WAL 可移走后，data-only 重启只恢复 Memory 表定义，不恢复其业务值。内部结构、锁序
+和证据边界见 `docs/MEMORY_TABLE_INTERNAL_CONTRACT.md`。
+
+一个普通可写根可以按首次触表顺序直接拥有多个表级单元子事务；这属于单层多表事务树，不是
+单元事务。需要 WAL 时，根与全部叶子共享同一个事务 ID 和提交 ID，三个表的 prepare 输出只由
+外层根追加、刷新一次 WAL。`commit_modified` 返回后，Memory 已发布内存根，LogOrdered/Btree
+仍可处于异步表文件持久化阶段；只有所有持久化叶子的成功信号到齐，根 WAL 才能最终确认。
+`tests/ordinary_multi_table_recovery.rs` 使用一个普通业务根同时写三表，并以 manager 配平、单次
+业务 WAL、`.bak`、Btree overlay 清空及连续两次移走 WAL 后冷启动的最终值共同验证该闭环。
+
+普通 `prepare_modified_conflicts` 按首次触表顺序在首个冲突处停止，只返回一个 Normal
+`Conflicts(table,key)`，不提供版本协议 `AllConflicts` 的完整集合语义。失败时，冲突前的叶子
+可能已经 `Prepared`，冲突叶子为 `PrepareFailed`，后续叶子仍为 `Inited`；合法非 Fatal 路径的
+`rollback_modified` 会处理整棵树并将该事务永久关闭，重试必须创建新根。
+`tests/ordinary_multi_table_conflict_rollback.rs` 分别在 Memory、LogOrdered、Btree 作为首个、
+中间、最后失败叶子时验证状态、零失败 WAL、manager 配平、同 Key 新事务重试、repair、`.bak`
+及移走 WAL 后最终数据。
+
+`tests/ordinary_multi_table_concurrency.rs` 进一步在真实双 runtime 上以 36 个同步波次执行 288 次
+普通三表事务尝试，并确定性形成高、中、低三种冲突率。每个事务同时处理 counter/marker 两个
+Key，marker 在 upsert/delete 间切换；独立参考模型和精确计数要求恰好 120 次提交、168 次
+`Conflicts`、其它 Normal/Fatal/commit/rollback/timeout 失败为零。最终门禁同时检查 122 条合法
+根 WAL、全部确认、repair、`.bak`、Btree overlay 清空，以及移走 WAL 后连续两次冷启动时
+LogOrdered/Btree 的逐 Key 最终值；Memory 只由 WAL 恢复，不被误判为拥有独立数据文件。
+
+首次触表顺序不是固定的 Memory/LogOrdered/Btree 顺序。`tests/ordinary_multi_table_ordering.rs`
+逐一提交三表全部六种排列，并让六个排列根对同一组三表新 Key 通过异步 barrier 并发 prepare。
+由于每个根按自身 child list 串行建立表级预留，交叉顺序允许全部冲突，也允许恰有一个 winner；
+不承诺固定 winner 或至少一个成功。但绝不允许两个 winner、非普通冲突错误、提交前值泄漏或
+rollback 后预留残留。所有失败根关闭后，全新根必须成功重试；最终仍以根 WAL repair、确认、
+`.bak`、overlay 归零及两次 data-only 冷启动的精确数据状态为门禁。
+
+普通 `upsert` 遇到缺表当前返回 Fatal。该分支发生在事务 manager start 和根 WAL 之前，批次
+前缀也只存在于事务私有 COW/overlay；但“当前没有共享副作用”不表示 Fatal 可以 rollback。
+调用方必须立即丢弃整个根，不得再 query/delete/prepare/commit 或复用。`kv_action_contract`
+使用独立根分别验证缺表读删、Fatal 写、非法 rollback 被拒绝及新根所见数据/manager/WAL 均未
+变化；future 被取消同样不会自动 rollback/finish，服务端必须由独立 owner 将 2PC 推进到明确
+终态。
 
 显式只读事务不需要 commit 回调。可写事务即使只有读动作、prepare 输出为空，也必须执行完整
 事务树 commit，以释放 prepare 阶段建立的读预留；空输出只会跳过 WAL append/flush。删表仍应
@@ -37,6 +107,38 @@ rollback/finish`。`prepare_len` 和 `commit_len` 只表示当前正在运行的
 这些阶段外情形中证明 WAL 完全没有落盘。该边界不是空 WAL：空 prepare 输出会直接跳过物理 WAL
 写入。根 WAL 已成功后发生的子表数据文件持久化失败仍保留未确认 WAL，并继续适用既有启动恢复
 语义。
+
+### 根 WAL 表片段格式
+
+根事务的 prepare buffer 以 16 字节事务 ID 开始，随后按子表 prepare 顺序拼接零个或多个表
+片段。每个片段的稳定布局是：
+
+```text
+table_name_len:u16-le
+table_name:[u8; table_name_len]
+action_count:u64-le
+repeat action_count times:
+    key_len:u16-le
+    key:[u8; key_len]
+    value_len:u32-le
+    value:[u8; value_len]
+```
+
+`value_len == 0` 只表示 delete tombstone，不表示合法空 Value。数据库的持久化协议严格禁止
+写入长度为 0 的 Value；当前普通 upsert 入口尚未统一实现该拒绝，因此调用方不得传入空 Value，
+该实现偏离继续按 `FIND-DATA-001` 归档，不能把运行时暂时接受解释为稳定能力。合法表名为
+`1..=4096` UTF-8 字节，能够进入版本协议的 Key 为 `1..=u16::MAX` 字节；codec helper 本身是
+受信内部边界，不会为每项重复做结构化校验。
+
+解码 helper 接受调用方提供的 offset，供根 TID 前缀和多表片段顺序解析使用，并返回下一片段
+的精确 offset。当前实现对截断、伪造长度或非法 UTF-8 可能 panic，只能用于经过根日志外层校验、
+由当前 `pi_db` 生成的完整 WAL，不能直接处理不可信网络输入或任意损坏文件。损坏输入的可恢复
+错误策略仍属于独立 `FIND-CODEC-001`，本轮没有改变 WAL 字节格式或 replay 行为。
+
+`tests/table_wal_codec_contract.rs` 独立验证非零起始偏移、多表拼接、4096 字节表名、65535 字节
+Key、非空 upsert、delete 占位及最终 offset；真实 WAL 落地、提交确认和 repair 仍由事务/恢复
+专项负责。`benches/table_wal_codec.rs` 只建立纯 CPU、分配和字节复制基线，不代表文件 I/O 或
+完整事务延迟。
 
 ### 协议中立建表前导
 
@@ -107,8 +209,13 @@ commit、rollback 或整体释放。该保留是冲突检测所需的有限生�
 `query_with_version` 不创建数据库事务，原子返回当前逻辑值和同一线性化状态的版本。版本缺席时
 会用事务管理器的 Guid 生成器创建首次观测版本；并发读取同一缺失 Key 只会公布一个版本。
 `prepare_with_version` 先完整比较外部读集，再执行标准事务冲突检查；版本或标准冲突以
-`KVTableTrError::AllConflicts` 返回完整、去重、确定顺序的 `Table/Key` 集合，非 Fatal 失败须由
-调用方 rollback，并用全新事务重试。
+`KVTableTrError::AllConflicts(Vec<TableKeyConflict>)` 返回完整、去重、确定顺序的
+`Table/Key/Kind` 集合。`ReadSetVersionMismatch` 表示版本缺失、TTL 淘汰、版本不等或只读表身份
+变化，外部必须失效 Value/Version 并重新读取；`TransactionConflict` 表示 revision、值状态或
+prepared 预留阻止本次事务。冲突项不返回 expected/current Version；同一 Table/Key 同时观察到
+两类原因时版本失配优先。两者都是非 Fatal 失败，调用方均须 rollback，并用全新事务重试。
+完整分类和下游 wire 迁移见
+[`VERSION-CONFLICT-KIND-001`](docs/VERSION_CONFLICT_KIND_DESIGN.md#version-conflict-kind-design-index)。
 
 根 WAL 成功后，`commit_with_version` 按表依次在短 publication write 临界区同时发布数据和本
 事务版本，并只返回本事务最终写集的 `TableKeyVersion`。单表内的值/版本观察是原子的；多表间
@@ -142,6 +249,12 @@ Key 也会按无效持久化数据拒绝。表名当前合法范围为 `1..=4096
 1ms。TTL 为 `Duration::ZERO` 时关闭自动淘汰；其它非零且小于 1ms 的值按 1ms 处理，大于等于
 1ms 的值会舍弃不足 1ms 的小数部分，例如 `20.999ms` 的有效值为 `20ms`。
 
+TTL 非零但轮询间隔为 `Duration::ZERO` 属于非法启动配置，`startup*` 会在创建数据库目录、表、
+事件 channel 和后台任务之前返回 `io::ErrorKind::InvalidInput`。TTL 本身为 ZERO 时轮询间隔完全
+不生效，因此 interval 为 ZERO 也合法，并且不会创建版本淘汰任务；同一缓存记录会一直保留到
+提交覆盖、删表、启动清空或数据库对象释放。真实配置边界由
+`tests/manager_startup_configuration.rs` 验证。
+
 版本记录不会早于量化后的有效 TTL 被淘汰。实际淘汰仍可能因轮询周期、runtime 调度、分批扫描
 或活跃事务快照而延后；TTL 是最短保留时间，不是精确触发时刻。
 
@@ -164,6 +277,12 @@ token 会在让出 runtime 前返回索引。因此额外空间为 O(当前活�
 
 启用 `trace` feature 后，既有 15 秒 tracing loop 会通过同一 OpenTelemetry Meter 上报以下指标：
 
+该进程级共享 Meter 的 instrumentation scope 固定为 `pi_db`。宿主需要导出指标时，必须在
+启动数据库前通过 OpenTelemetry `global` 安装并持续持有 MeterProvider；未安装 Provider 时按
+OpenTelemetry 标准语义使用 no-op Meter，但 tracing loop 仍会正常运行，不会等待旧版
+`pi_logger::opentelemetry::is_init()` 状态。`Loop tracing succeeded...` 为 INFO 日志，是否可见
+还取决于宿主日志 bridge 和过滤级别。
+
 - `pi_db.db.key_version_cache_record_count{table}`：当前注册表中每张表的活动 Key 版本记录数。
 - `pi_db.db.key_version_cache_estimated_memory_bytes{table}`：活动记录可归属的动态内存估值。
 - `pi_db.db.key_version_query_calls{result=success|failure}`：`query_with_version` 调用结果。
@@ -183,6 +302,28 @@ token 会在让出 runtime 前返回索引。因此额外空间为 O(当前活�
 单标签；同进程多实例的同名表会合并为同一 time series，这是观测边界，不影响数据库语义。
 
 未启用 `trace` 时，上述字段、原子读写和采集代码均由条件编译移除，不增加默认构建运行时成本。
+
+## 表级整理边界
+
+`KVDBManager::ready_collect_table` 和 `collect_table` 是表存储维护入口，不属于事务 2PC，也不会
+追加根 WAL。缺表当前静默成功；Memory 的两个阶段都是 no-op；Meta/LogOrdered 的 ready 阶段
+会 split 各自表日志，collect 阶段会整理只读日志；Btree 的 ready 阶段为 no-op，collect 阶段
+执行 redb 持久化提交和 compact。Btree compact 最多总计尝试三次：任意一次成功立即返回，
+只有前两次失败各同步等待一秒，第三次失败返回可恢复的 `Normal` 错误。LogWrite 当前不允许
+外部业务使用，本轮没有新增其动态测试。
+
+`tests/manager_table_maintenance.rs` 在真实非空 Meta、Memory、LogOrdered、Btree 上验证当前成功
+路径：三个独立普通根写入并删除部分 Key，等待根 WAL 全部确认和 Btree overlay 清空后逐表整理，
+每个阶段都要求逻辑值、记录数、缓存字节、manager 状态和根 WAL 文件快照不变；整体移走已确认
+WAL 后，两次独立冷启动还必须从 Meta/LogOrdered/Btree 数据文件恢复精确状态，Memory 业务值则
+按其无独立数据文件的语义消失。
+
+这些 API 当前会在等待表级 I/O 时持有 registry 读 guard，不应与 DDL 并发使用，也不提供全库
+原子快照、一次性 ready token、幂等或取消保证。Btree compact 的历史重试/成功退出缺陷
+`FIND-TABLE-001` 已按上述边界修复；同文件确定性测试精确约束调用/等待次数，真实 redb 活动
+读事务专项验证三次失败会返回错误、释放整理 owner，流释放后可再次成功整理。完整证据见
+`docs/BTREE_COLLECT_RETRY_BUG.md`。Linux 上的 `cleanup_buffer_after_collect_table` 只是进程级
+`malloc_trim` 提示，可能同步阻塞且返回值非确定，不是表整理完成或数据安全的证明。
 
 ## 运行时验收范围
 
@@ -204,3 +345,22 @@ sanitizer 结论只适用于已测试的 `0.5.2` 依赖图，不能自动外推�
 跨硬件 SLA。详细证据保存在本地开发文档 `docs/KEY_VERSION_PUBLICATION_ACCEPTANCE.md`；事务树、
 根 WAL、提交确认、checkpoint、`.bak` 和 `try_repair` 的中文流程图、状态图及时序图保存在
 `docs/TRANSACTION_WAL_RECOVERY_FLOWS.md`。
+
+## 普通 Memory 并发基准
+
+`benches/ordinary_memory_concurrency.rs` 使用一套共享 8-worker 数据库 runtime、一套共享
+8-worker 调用 runtime，并为每个 case 创建独立真实数据库、事务管理器、CommitLogger、根 WAL
+和临时目录。九个 case 覆盖 1/2/4/8 writer 以及 0%、50%、75%、87.5% 的确定性 Key 冲突率；
+每轮都精确断言 prepare 成功/冲突、commit/rollback 状态、manager 配平、WAL 增量和最终权威值。
+当前 x86_64 样本使用 5 字节 BON Usize Key 和 7 字节 Value，并为每轮分配新 Key，因此描述
+插入/冲突路径而不是固定旧 Key 更新稳态。
+
+当前 `nightly-2026-06-25` Release 首基线为约 `10.09~10.11ms/波次`，派生尝试吞吐约从
+`99.05` 扩展到 `793.04 attempts/s`。不同冲突率的延迟差值小于样本离散，不能解释为稳定性能
+收益或退化；该结果只适用于当前持久化 Memory 和根 WAL 装配，不代表 LogOrdered/Btree、版本
+协议、数据文件确认或跨机器 SLA。运行入口：
+
+```text
+cargo +nightly-2026-06-25 bench --locked --offline -p pi_db \
+  --bench ordinary_memory_concurrency -- --nocapture
+```

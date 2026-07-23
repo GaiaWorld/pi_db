@@ -52,7 +52,7 @@ pub mod inspector;
 pub mod utils;
 mod key_version;
 
-pub use key_version::{TableKey, TableKeyVersion, Version};
+pub use key_version::{TableKey, TableKeyConflict, TableKeyVersion, Version, VersionConflictKind};
 
 /// 表名 UTF-8 编码的最大字节数。
 ///
@@ -862,9 +862,11 @@ impl KVActionLog {
 /// 完整协议、生产调用点和历史误判说明见本地
 /// [CONTRACT-CFM-001](../docs/SEMANTIC_CONTRACTS.md#contract-confirm-success-only)；合法成功计数
 /// 由 `tests/commit_confirmation_contract.rs` 验证，真实 LogOrdered 持久化失败、WAL 保留和
-/// 重启恢复由 `tests/commit_confirmation_real_environment.rs` 验证。公开低层构造、非法组合、
-/// 重复调用和任务投递可观测性仍分别记录在 `FIND-CONFIRM-001`、`FIND-SPAWN-001`，当前说明
-/// 不把这些风险提升为受支持行为。
+/// 重启恢复由 `tests/commit_confirmation_real_environment.rs` 验证；普通 Memory/LogOrdered/
+/// Btree 三叶根的计数聚合、最终 `.bak` 和 data-only 数据由
+/// `tests/ordinary_multi_table_recovery.rs` 验证。公开低层构造、非法组合、重复调用和任务投递
+/// 可观测性仍分别记录在 `FIND-CONFIRM-001`、`FIND-SPAWN-001`，当前说明不把这些风险提升为
+/// 受支持行为。
 #[derive(Clone)]
 pub struct KVDBCommitConfirm<
     C: Clone + Send + 'static,
@@ -1018,30 +1020,33 @@ static COMMITED_LEN: AtomicUsize = AtomicUsize::new(0);
 /// `pi_db` 表事务和根事务共享的错误类型。
 ///
 /// [`Common`](Self::Common) 保存 `pi_async_transaction::ErrorLevel` 和已格式化原因；
-/// [`Conflicts`](Self::Conflicts) 保存首个冲突表名与 Key；[`AllConflicts`](Self::AllConflicts)
-/// 保存完整冲突集合，两者始终按可恢复的 `Normal` 等级对待。Fatal 表示不可恢复且不可
-/// rollback；Normal/Conflicts 会使当前事务树失败，但在
+/// [`Conflicts`](Self::Conflicts) 保存普通事务的首个冲突表名与 Key；
+/// [`AllConflicts`](Self::AllConflicts) 保存版本事务的完整分类冲突集合，两者始终按可恢复的
+/// `Normal` 等级对待。Fatal 表示不可恢复且不可 rollback；Normal/Conflicts 会使当前事务树失败，但在
 /// 其它节点没有 Fatal 时仍属于可 rollback、可重试或可忽略的失败。
 ///
 /// 本类型实现 `Debug`，未实现 `Display`/`std::error::Error`。字段拥有其数据，不借用事务；
-/// `Common` 的空间取决于消息长度，冲突 payload 拥有表名和 Key。检查 variant/level 为 O(1)，
-/// 构造普通错误需要 O(n) 格式化，完整冲突归并会按原始字节排序和去重。
+/// `Common` 的空间取决于消息长度，冲突 payload 拥有表名、Key 和小枚举。检查 variant/level
+/// 为 O(1)，构造普通错误需要 O(n) 格式化，完整冲突归并会按原始字节排序、去重并以
+/// read-set 版本失配优先合并同 Key 类型。
 ///
 /// 类型可跨线程移动和共享且无内部可变性；它本身不执行 rollback、日志、I/O 或回调，真正
 /// 的错误传播由事务树负责。测试入口见 `tests/core_types_contract.rs`；可恢复与 Fatal 边界见
-/// `CONTRACT-TR-003` / `CONTRACT-TR-004`。
+/// `CONTRACT-TR-003` / `CONTRACT-TR-004`；版本冲突分类契约见
+/// [VERSION-CONFLICT-KIND-001](../docs/VERSION_CONFLICT_KIND_DESIGN.md#version-conflict-kind-design-index)。
 #[derive(Debug)]
 pub enum KVTableTrError {
     /// 普通事务错误：错误等级和拥有的诊断字符串。
     Common(ErrorLevel, String),
     /// 预提交冲突：首个冲突表名和 Key；其 [`KVTableTrError::level`] 固定返回 Normal。
     Conflicts(Atom, Binary),
-    /// 版本协议完整冲突：非空、去重并按表名/Key 原始字节确定性排序。
-    AllConflicts(Vec<TableKey>),
+    /// 版本协议完整冲突：非空、去重并按表名/Key 原始字节确定性排序，且每项携带冲突类型。
+    AllConflicts(Vec<TableKeyConflict>),
 }
 
-// SAFETY: 三个 variant 只包含拥有的 ErrorLevel/String/Atom/Binary/Vec；它们在构造后没有
-// 内部可变状态。String/Vec 由标准库保证 Send，Atom/Binary 的跨线程安全由各自类型契约保证。
+// SAFETY: 三个 variant 只包含拥有的 ErrorLevel/String/Atom/Binary/Vec 和无内部状态的 enum；
+// 它们在构造后没有内部可变状态。String/Vec 由标准库保证 Send，Atom/Binary 的跨线程安全
+// 由各自类型契约保证。
 unsafe impl Send for KVTableTrError {}
 // SAFETY: 共享引用只能读取不可变字段；没有裸指针、线程 owner 状态或非同步 interior
 // mutability。Atom 的全局池同步与 Binary 的 Arc 引用计数由依赖类型负责。
@@ -1064,12 +1069,16 @@ impl TransactionError for KVTableTrError {
 }
 
 impl TransactionConflictError for KVTableTrError {
-    type ConflictSet = Vec<TableKey>;
+    type ConflictSet = Vec<TableKeyConflict>;
 
     fn into_conflict_set(self) -> Result<Self::ConflictSet, Self> {
         match self {
             KVTableTrError::Conflicts(table, key) => {
-                Ok(vec![TableKey { table, key }])
+                Ok(vec![TableKeyConflict {
+                    table,
+                    key,
+                    kind: VersionConflictKind::TransactionConflict,
+                }])
             },
             KVTableTrError::AllConflicts(conflicts) => Ok(conflicts),
             error => Err(error),
@@ -1090,7 +1099,7 @@ impl TransactionConflictError for KVTableTrError {
 
 impl KVTableTrError {
     /// 构造版本协议的非空、确定性排序且去重的完整冲突集合。
-    pub(crate) fn new_all_conflicts_error(conflicts: Vec<TableKey>) -> Self {
+    pub(crate) fn new_all_conflicts_error(conflicts: Vec<TableKeyConflict>) -> Self {
         let conflicts = key_version::normalize_conflicts(conflicts);
         assert!(!conflicts.is_empty(),
                 "Construct all conflicts failed, reason: conflict set must not be empty");
@@ -1164,8 +1173,8 @@ impl KVTableTrError {
 
     /// 借用完整冲突集合。
     ///
-    /// 仅 `AllConflicts` 返回非空 slice；其它 variant 返回 None。O(1)、无克隆和副作用。
-    pub fn all_conflicts(&self) -> Option<&[TableKey]> {
+    /// 仅 `AllConflicts` 返回非空分类 slice；其它 variant 返回 None。O(1)、无克隆和副作用。
+    pub fn all_conflicts(&self) -> Option<&[TableKeyConflict]> {
         if let Self::AllConflicts(conflicts) = self {
             Some(conflicts.as_slice())
         } else {

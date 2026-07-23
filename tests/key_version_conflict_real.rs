@@ -16,7 +16,7 @@ use pi_async_transaction::{
 use pi_atom::Atom;
 use pi_db::{
     tables::TableKV,
-    Binary, KVTableTrError, TableKey, TableKeyVersion,
+    Binary, KVTableTrError, TableKeyConflict, TableKeyVersion, VersionConflictKind,
 };
 
 use key_version_support::{
@@ -101,9 +101,10 @@ async fn verify_version_phase_complete_set(
         &error,
         stale_reads
             .iter()
-            .map(|item| TableKey {
+            .map(|item| TableKeyConflict {
                 table: item.table.clone(),
                 key: item.key.clone(),
+                kind: VersionConflictKind::ReadSetVersionMismatch,
             })
             .collect(),
         "version phase complete set",
@@ -181,9 +182,10 @@ async fn verify_standard_phase_complete_set(
         &error,
         cases
             .iter()
-            .map(|(table, key, _)| TableKey {
+            .map(|(table, key, _)| TableKeyConflict {
                 table: Atom::from(*table),
                 key: key.clone(),
+                kind: VersionConflictKind::TransactionConflict,
             })
             .collect(),
         "standard phase complete set",
@@ -290,9 +292,10 @@ async fn verify_read_reservation_blocks_safe_and_dirty_writes(
         .expect_err("version Read must conflict with existing ordinary DirtyWrite");
     assert_all_conflicts(
         &error,
-        vec![TableKey {
+        vec![TableKeyConflict {
             table: Atom::from(MEMORY_TABLE),
             key: key.clone(),
+            kind: VersionConflictKind::TransactionConflict,
         }],
         "version reader against dirty",
     )?;
@@ -362,7 +365,7 @@ async fn verify_common_write_identity_error_has_priority(
 
 fn assert_all_conflicts(
     error: &KVTableTrError,
-    mut expected: Vec<TableKey>,
+    mut expected: Vec<TableKeyConflict>,
     label: &str,
 ) -> TestResult<()> {
     if !error.is_all_conflicts() || !matches!(error.level(), ErrorLevel::Normal) {
@@ -377,7 +380,6 @@ fn assert_all_conflicts(
             .cmp(right.table.as_str().as_bytes())
             .then_with(|| left.key.as_ref().cmp(right.key.as_ref()))
     });
-    expected.dedup_by(|left, right| left.table == right.table && left.key == right.key);
     let actual = error
         .all_conflicts()
         .ok_or_else(|| format!("{label}: AllConflicts accessor returned None"))?;

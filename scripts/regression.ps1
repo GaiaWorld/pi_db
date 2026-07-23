@@ -51,6 +51,18 @@ try {
     }
     Invoke-CargoChecked $TraceTtlArguments
 
+    # 独立验证 global MeterProvider 初始化顺序、共享 scope、六项指标和 loop INFO。
+    $TraceMeterArguments = @(
+        "+$Toolchain", "test", "--locked", "--offline", "-p", "pi_db",
+        "--features", "trace", "--test", "trace_meter_initialization", "--"
+    )
+    if ($Mode -eq "list") {
+        $TraceMeterArguments += @("--list", "--format", "terse")
+    } else {
+        $TraceMeterArguments += "--test-threads=1"
+    }
+    Invoke-CargoChecked $TraceMeterArguments
+
     foreach ($Line in Get-Content $TargetFile) {
         $Trimmed = $Line.Trim()
         if (-not $Trimmed -or $Trimmed.StartsWith("#")) {

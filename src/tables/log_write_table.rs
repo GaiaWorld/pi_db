@@ -50,13 +50,14 @@ use crate::{Binary,
             KVActionLog,
             KVDBCommitConfirm,
             KVTableTrError,
-            TableKey,
+            TableKeyConflict,
             db::{KVDBTransaction, KVDBChildTrList},
             key_version::{KeyVersions,
                           PrepareMode,
                           PreparedActions,
                           TableVersionContext,
                           Version,
+                          VersionConflictKind,
                           VersionReceipt,
                           binary_state_equal,
                           has_prepared_conflict},
@@ -937,9 +938,10 @@ impl<
         let mut conflicts = Vec::new();
         for (key, expected) in context.expected() {
             if context.versions().current_version(key).as_ref() != Some(expected) {
-                conflicts.push(TableKey {
+                conflicts.push(TableKeyConflict {
                     table: self.0.table.name(),
                     key: key.clone(),
+                    kind: VersionConflictKind::ReadSetVersionMismatch,
                 });
             }
         }
@@ -977,7 +979,8 @@ impl<
             if context.mode() == PrepareMode::Versioned {
                 for (key, expected) in context.expected() {
                     if context.versions().current_version(key).as_ref() != Some(expected) {
-                        conflict_keys.push(key.clone());
+                        conflict_keys.push((key.clone(),
+                                            VersionConflictKind::ReadSetVersionMismatch));
                     }
                 }
             }
@@ -993,12 +996,14 @@ impl<
                 if context
                     .versions()
                     .has_committed_after(key, context.snapshot_revision()) {
-                    conflict_keys.push(key.clone());
+                    conflict_keys.push((key.clone(),
+                                        VersionConflictKind::TransactionConflict));
                     continue;
                 }
             }
             if !binary_state_equal(self.0.root_ref.get(key), current_root.get(key)) {
-                conflict_keys.push(key.clone());
+                conflict_keys.push((key.clone(),
+                                    VersionConflictKind::TransactionConflict));
             }
         }
 
@@ -1007,7 +1012,8 @@ impl<
         let mut prepare = self.0.table.0.prepare.lock();
         for (key, action) in &actions {
             if has_prepared_conflict(&prepare, key, mode, action) {
-                conflict_keys.push(key.clone());
+                conflict_keys.push((key.clone(),
+                                    VersionConflictKind::TransactionConflict));
             }
         }
         if !conflict_keys.is_empty() {
@@ -1055,8 +1061,10 @@ impl<
 
     fn prepare_conflict_error(&self,
                               conflict_kind: PrepareConflictKind,
-                              keys: Vec<Binary>) -> KVTableTrError {
-        let key = keys[0].clone();
+                              keys: Vec<(Binary, VersionConflictKind)>) -> KVTableTrError {
+        // LogWrite 当前不开放版本服务，但其公共事务枚举仍必须输出同一分类载荷；完整边界见
+        // docs/VERSION_CONFLICT_KIND_DESIGN.md，除此之外不扩大 LogWrite 行为。
+        let key = keys[0].0.clone();
         match conflict_kind {
             PrepareConflictKind::Common => {
                 KVTableTrError::new_transaction_error(
@@ -1073,9 +1081,10 @@ impl<
             PrepareConflictKind::All => {
                 KVTableTrError::new_all_conflicts_error(keys
                     .into_iter()
-                    .map(|key| TableKey {
+                    .map(|(key, kind)| TableKeyConflict {
                         table: self.0.table.name(),
                         key,
+                        kind,
                     })
                     .collect())
             },

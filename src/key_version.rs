@@ -55,7 +55,10 @@ pub struct TableKeyVersion {
     pub version: Version,
 }
 
-/// 完整冲突集合中的表和 Key。
+/// 表名和 Key 的联合标识。
+///
+/// 当前内部成功路径用它索引版本事务的最终写集合；版本冲突错误使用携带类型的
+/// [`TableKeyConflict`]。字段均为 owned 值，不借用表或事务。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TableKey {
     /// 表名。
@@ -64,8 +67,56 @@ pub struct TableKey {
     pub key: Binary,
 }
 
+/// 版本事务预提交失败时，单个 Table/Key 的主冲突类型。
+///
+/// 该类型只描述本次实际执行检查所观察到的阻断阶段，不穷举因 Phase 1 短路而没有执行的
+/// 潜在检查。同一 Key 同时观察到两类冲突时，版本失配优先，因为外部必须先失效 Value/Version
+/// 缓存并重新执行 `query_with_version`。完整分类、归并和下游映射见
+/// [VERSION-CONFLICT-KIND-001](../docs/VERSION_CONFLICT_KIND_DESIGN.md#version-conflict-kind-design-index)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum VersionConflictKind {
+    /// `read_set` 的版本在缓存中缺失、被淘汰、与当前版本不等，或对应只读表身份已变化。
+    ReadSetVersionMismatch,
+    /// read-set 版本未被判为失配，但数据基线、revision 或其它 prepared 预留发生冲突。
+    TransactionConflict,
+}
+
+impl VersionConflictKind {
+    /// 合并同一 Table/Key 的冲突类型；read-set 失配按冻结协议具有确定性优先级。
+    #[inline]
+    fn merge(self, other: Self) -> Self {
+        if matches!(self, Self::ReadSetVersionMismatch)
+            || matches!(other, Self::ReadSetVersionMismatch) {
+            Self::ReadSetVersionMismatch
+        } else {
+            Self::TransactionConflict
+        }
+    }
+}
+
+/// 版本事务完整冲突集合中的单项。
+///
+/// 字段均为 owned 值，错误返回后不借用事务、表或版本缓存。`kind` 不携带 expected/current
+/// Version；下游只能据此选择失效缓存或稍后重试，不能直接刷新 Value/Version 对。
+/// 公开 wire 迁移见
+/// [pi_db_server 对接](../docs/PI_DB_SERVER_KEY_VERSION_API_HANDOFF.md#pi-db-server-version-conflict-kind)。
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TableKeyConflict {
+    /// 表名。
+    pub table: Atom,
+    /// 冲突 Key 的规范二进制编码。
+    pub key: Binary,
+    /// 本次实际阻断预提交的主冲突类型。
+    pub kind: VersionConflictKind,
+}
+
 /// 按公开协议要求对冲突集合执行原始字节排序和去重。
-pub(crate) fn normalize_conflicts(mut conflicts: Vec<TableKey>) -> Vec<TableKey> {
+///
+/// 相同 Table/Key 的多项会合并为一项；只要任一项为 read-set 版本失配，最终类型就是
+/// `ReadSetVersionMismatch`。该函数只在错误路径执行，不读取数据库共享状态。
+pub(crate) fn normalize_conflicts(
+    mut conflicts: Vec<TableKeyConflict>,
+) -> Vec<TableKeyConflict> {
     conflicts.sort_by(|left, right| {
         left
             .table
@@ -74,9 +125,14 @@ pub(crate) fn normalize_conflicts(mut conflicts: Vec<TableKey>) -> Vec<TableKey>
             .cmp(right.table.as_str().as_bytes())
             .then_with(|| left.key.as_ref().cmp(right.key.as_ref()))
     });
-    conflicts.dedup_by(|left, right| {
-        left.table.as_str().as_bytes() == right.table.as_str().as_bytes()
-            && left.key.as_ref() == right.key.as_ref()
+    conflicts.dedup_by(|next, previous| {
+        if previous.table.as_str().as_bytes() == next.table.as_str().as_bytes()
+            && previous.key.as_ref() == next.key.as_ref() {
+            previous.kind = previous.kind.merge(next.kind);
+            true
+        } else {
+            false
+        }
     });
     conflicts
 }
@@ -1278,6 +1334,7 @@ pub(crate) fn has_prepared_conflict(prepare: &XHashMap<Guid, PreparedActions>,
 #[cfg(test)]
 mod tests {
     use std::{collections::BTreeSet,
+              io::ErrorKind,
               sync::{Arc, atomic::Ordering},
               thread,
               time::Duration};
@@ -1294,11 +1351,14 @@ mod tests {
                 PrepareMode,
                 PreparedActions,
                 PreparedCommitError,
+                TableKeyConflict,
                 TTL_SCAN_BATCH_SIZE,
                 TtlKeyIndex,
+                VersionConflictKind,
                 deadline_tick,
                 duration_to_ticks,
                 has_prepared_transaction,
+                normalize_conflicts,
                 prepared_actions_conflict,
                 take_prepared_for_commit};
     #[cfg(feature = "trace")]
@@ -1306,6 +1366,60 @@ mod tests {
                 KeyVersionApiOperation,
                 NO_DEADLINE,
                 estimated_record_memory_bytes};
+
+    /// 完整冲突集合必须按 Table/Key 排序、去重，并让版本失配覆盖同 Key 的事务冲突。
+    #[test]
+    fn test_normalize_conflicts_orders_deduplicates_and_merges_kind() {
+        let table_a = Atom::from("conflict_a");
+        let table_b = Atom::from("conflict_b");
+        let key_1 = binary_from_u32(1);
+        let key_2 = binary_from_u32(2);
+        let normalized = normalize_conflicts(vec![
+            TableKeyConflict {
+                table: table_b.clone(),
+                key: key_2.clone(),
+                kind: VersionConflictKind::TransactionConflict,
+            },
+            TableKeyConflict {
+                table: table_a.clone(),
+                key: key_2.clone(),
+                kind: VersionConflictKind::TransactionConflict,
+            },
+            TableKeyConflict {
+                table: table_a.clone(),
+                key: key_1.clone(),
+                kind: VersionConflictKind::TransactionConflict,
+            },
+            TableKeyConflict {
+                table: table_a.clone(),
+                key: key_2.clone(),
+                kind: VersionConflictKind::ReadSetVersionMismatch,
+            },
+            TableKeyConflict {
+                table: table_a.clone(),
+                key: key_1.clone(),
+                kind: VersionConflictKind::TransactionConflict,
+            },
+        ]);
+
+        assert_eq!(normalized, vec![
+            TableKeyConflict {
+                table: table_a.clone(),
+                key: key_1,
+                kind: VersionConflictKind::TransactionConflict,
+            },
+            TableKeyConflict {
+                table: table_a,
+                key: key_2.clone(),
+                kind: VersionConflictKind::ReadSetVersionMismatch,
+            },
+            TableKeyConflict {
+                table: table_b,
+                key: key_2,
+                kind: VersionConflictKind::TransactionConflict,
+            },
+        ]);
+    }
 
     /// SchemaCreate 和 Versioned 都必须使用严格矩阵；Ordinary 的既有 dirty 写放宽保持不变。
     #[test]
@@ -1407,6 +1521,33 @@ mod tests {
                                                   PrepareMode::Ordinary,
                                                   false),
                          Ok(None)));
+    }
+
+    /// 只有开启 TTL 时 ZERO 轮询间隔才非法；关闭 TTL 不得创建 task owner 通道。
+    ///
+    /// 真实公开 startup 的错误种类、目录、manager 和 WAL 零副作用由独立
+    /// `manager_startup_configuration` target 验证，本单元只隔离配置到 registry 的直接映射。
+    #[test]
+    fn test_key_version_config_zero_poll_interval_depends_on_ttl_enablement() {
+        let error = KeyVersionConfig::new(Duration::from_secs(1), Duration::ZERO)
+            .expect_err("enabled TTL with zero poll interval must be rejected");
+        assert_eq!(error.kind(), ErrorKind::InvalidInput);
+
+        let disabled = KeyVersionConfig::new(Duration::ZERO, Duration::ZERO)
+            .expect("disabled TTL must ignore a zero poll interval");
+        assert_eq!(disabled.ttl_ticks(), None);
+        assert_eq!(disabled.poll_interval_ticks(), 0);
+        let (disabled_registry, disabled_receiver) = KeyVersionRegistry::new(disabled);
+        assert!(disabled_receiver.is_none());
+        assert!(disabled_registry.0.shutdown_tx.is_none());
+
+        let enabled = KeyVersionConfig::new(Duration::from_secs(1), Duration::from_millis(1))
+            .expect("enabled TTL with a positive poll interval must be accepted");
+        assert_eq!(enabled.ttl_ticks(), Some(1000));
+        assert_eq!(enabled.poll_interval_ticks(), 1);
+        let (enabled_registry, enabled_receiver) = KeyVersionRegistry::new(enabled);
+        assert!(enabled_receiver.is_some());
+        assert!(enabled_registry.0.shutdown_tx.is_some());
     }
 
     /// TTL 使用 1ms 最小单位；非零 sub-ms 值提升到最小单位，其余小数直接忽略。

@@ -63,8 +63,10 @@ use crate::{Binary,
             KVTableTrError,
             MAX_TABLE_NAME_BYTES,
             TableKey,
+            TableKeyConflict,
             TableKeyVersion,
             Version,
+            VersionConflictKind,
             key_version::{KeyVersionConfig,
                           KeyVersionRegistry,
                           KeyVersions,
@@ -360,13 +362,20 @@ pub struct KVDBManagerBuilder<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>,
 > {
-    rt:                 MultiTaskRuntime<()>,               //异步运行时
-    tr_mgr:             Transaction2PcManager<C, Log>,      //事务管理器
-    db_path:            PathBuf,                            //数据库的表文件所在目录
-    tables_meta_path:   PathBuf,                            //数据库的元信息表文件所在目录
-    tables_path:        PathBuf,                            //数据库表文件所在目录
-    key_version_ttl:    Duration,                           //Key 版本记录的生存时长
-    key_version_ttl_poll_interval: Duration,                //Key 版本 TTL 固定轮询间隔
+    /// 执行启动 I/O、表 collector、repair、listener 和版本 TTL 的数据库 runtime。
+    rt:                 MultiTaskRuntime<()>,
+    /// 分配根事务 ID、登记 2PC 树并持有根 CommitLogger 的共享事务管理器。
+    tr_mgr:             Transaction2PcManager<C, Log>,
+    /// 调用方提供的数据库根路径词法副本；不等于根 WAL 路径。
+    db_path:            PathBuf,
+    /// 固定由 `db_path/.tables_meta` 派生的内部 Meta 表日志目录。
+    tables_meta_path:   PathBuf,
+    /// 固定由 `db_path/.tables` 派生的持久化用户表父目录。
+    tables_path:        PathBuf,
+    /// Key 版本记录的配置寿命；ZERO 完全关闭 TTL。
+    key_version_ttl:    Duration,
+    /// TTL 开启时的固定扫描间隔；TTL 关闭时包括 ZERO 在内均被忽略。
+    key_version_ttl_poll_interval: Duration,
 }
 
 /*
@@ -444,10 +453,15 @@ impl<
     /// [`KVDBManager::report_transaction_info`] 会返回 `ConnectionAborted`。错误保留底层目录、
     /// 表加载或恢复原因，但启动不具备 rollback/cancellation 原子性，失败前已产生的文件系统
     /// 副作用不会由本 API 撤销。
+    /// 唯一保证零数据库副作用的配置拒绝是“TTL 非零且轮询间隔为 ZERO”：它在创建数据库目录、
+    /// 表、channel 和后台任务前返回 `InvalidInput`。TTL 为 ZERO 时轮询值不生效，ZERO 合法。
     ///
     /// 运行时间为 O(t + w)，t 为 Meta 中用户表数，w 为待扫描/重放 WAL 字节数，并包含真实
-    /// 异步文件 I/O、同步锁和表引擎打开成本。单 worker runtime 上的 repair 可能阻塞，见
-    /// `FIND-REPAIR-001`。
+    /// 异步文件 I/O、同步锁和表引擎打开成本。存在未确认 WAL 时，当前 replay callback 会同步
+    /// 等待投递到数据库 runtime 的 repair task；调用方必须由该 runtime 之外的线程驱动 startup，
+    /// 或确保等待期间至少还有一个可执行 worker。单 worker 配置本身合法，现有 pi-launcher 正是
+    /// 由外部启动线程驱动；只有 startup 占满同一 runtime 全部 worker 的特定窗口会自阻塞。
+    /// 该现状限制、生产排除条件和红线测试见 README 的“启动恢复执行上下文”。
     pub async fn startup(self, enable_accelerated_repair: bool) -> IOResult<KVDBManager<C, Log>> {
         self
             .startup_with_listener::<fn(&KVDBManager<C, Log>, &Transaction2PcManager<C, Log>, &mut Vec<KVDBEvent<Guid>>)>(enable_accelerated_repair, None)
@@ -457,7 +471,9 @@ impl<
     /// 启动数据库，并可选安装批量事件回调。
     ///
     /// 启动顺序是：确保 Meta/用户表目录存在，打开内部 Meta 表，按 Meta 快照批量加载用户表，
-    /// 调用内部 `try_repair` 修复未确认根 WAL，最后启动 listener 任务并把数据库标为可用。
+    /// 调用内部 `try_repair` 修复未确认根 WAL，清空仅供恢复使用的 Key 版本并启动版本 TTL，最后
+    /// 启动 listener/trace 任务并把数据库标为可用。各表构造时可能已经启动自己的 collector；
+    /// 全局版本 TTL、listener 和 trace 不会先于根 WAL repair 启动。
     /// `enable_accelerated_repair` 的语义与 [`Self::startup`] 相同。
     ///
     /// `db_event_listener=None` 不创建事件通道。传入 `Some` 时，回调被保存到一个长期 runtime
@@ -636,7 +652,12 @@ impl<
         drop(meta_iterator);
         drop(tr);
 
-        //如果有未确认的提交日志，则尝试修复数据库表数据
+        // 如果有未确认的提交日志，则尝试修复数据库表数据。当前 pi_store 在轮询 start_replay
+        // 时同步调用下面的 callback，而 callback 会等待投递到 db runtime 的 repair task；因此
+        // 驱动 startup 的线程不得同时占满该 runtime 的全部 worker。pi-launcher/pi_db_server 当前
+        // 从外部启动线程 block_on 此 future，哪怕数据库只有一个 worker，也仍由空闲 worker 执行
+        // repair。这里不能把“单 worker”本身误标为故障条件，也不能在未审计 checkpoint 顺序前
+        // 把 callback 改成提前返回。详见 README“启动恢复执行上下文”和 FIND-REPAIR-001。
         let now = Instant::now();
         match db_mgr.try_repair(enable_accelerated_repair).await {
             Err(e) => {
@@ -1236,7 +1257,9 @@ impl<
     ///
     /// 当前实现从取得 registry 读 guard 到表 future 完成期间一直持有该 guard，DDL registry
     /// 写入可能被长 I/O 阻塞，见 `FIND-ASYNC-001`。底层表错误被格式化并统一包装为
-    /// `io::ErrorKind::Other`，错误等级信息不会结构化保留。非幂等表可能轮换文件。
+    /// `io::ErrorKind::Other`，错误等级信息不会结构化保留。非幂等表可能轮换文件。非空四表当前
+    /// 成功路径由 `tests/manager_table_maintenance.rs` 验证；完整范围见
+    /// `docs/MANAGER_TABLE_MAINTENANCE_ACCEPTANCE.md#manager-table-maintenance-index`。
     pub async fn ready_collect_table(&self, table_name: &Atom) -> IOResult<()> {
         match self.0.tables.read().await.get(table_name).map(|registered| &registered.table) {
             None => (),
@@ -1277,8 +1300,12 @@ impl<
     /// 不返回整理后的大小或记录数，也不保证与并发事务形成全库级原子边界。
     ///
     /// 调用可能长时间执行文件 I/O、同步 redb 锁和 runtime timeout；整个 await 期间当前仍持
-    /// registry 读 guard，见 `FIND-ASYNC-001`。表错误统一降为 `io::ErrorKind::Other`；Btree
-    /// collect 的重试控制另见 `FIND-TABLE-001`。该方法有文件副作用且不保证幂等。
+    /// registry 读 guard，见 `FIND-ASYNC-001`。表错误统一降为 `io::ErrorKind::Other`。Btree
+    /// compact 最多总计尝试三次，任意成功立即结束，只有前两次失败各同步等待一秒；第三次
+    /// 失败由表层生成可恢复的 Normal 错误，再由本方法包装。FIND-TABLE-001 的修复边界和真实
+    /// 失败证据见 `docs/BTREE_COLLECT_RETRY_BUG.md#bug-btree-collect-retry-001-index`。
+    /// 该方法有文件副作用且不保证幂等。整理前后逻辑数据、表统计、根 WAL 和 data-only 冷启动
+    /// 门禁由 `tests/manager_table_maintenance.rs` 验证。
     pub async fn collect_table(&self, table_name: &Atom) -> IOResult<()> {
         match self.0.tables.read().await.get(table_name).map(|registered| &registered.table) {
             None => (),
@@ -1336,8 +1363,13 @@ impl<
         }
     }
 
-    // 尝试幂等的重播未确认的提交日志，并修复数据库表数据
-    // 注意如果在只有单个线程的运行时修复或并发修复，则可能会发生阻塞
+    // 尝试幂等地重播未确认的提交日志，并修复数据库表数据。
+    // start_replay 的 callback 必须在本条 WAL 完成 append_replay/commit_repair 后才能返回，存储层
+    // 随后才推进对应 checkpoint；因此当前实现把异步 repair 投递到数据库 runtime，再在 callback
+    // 所在线程同步等待。只有 callback 占满该 runtime 的全部 worker 时才会自阻塞：外部线程驱动的
+    // 单 worker 配置可正常恢复，同 runtime 内仍有空闲 worker 也可推进。当前生产 pi-launcher 属于
+    // 前一种安全装配；特定同 runtime 全占用窗口只归档并由 startup_repair_liveness 红线测试约束，
+    // 本轮不得为消除此限制而改变 replay/checkpoint/confirm 的执行顺序。
     pub(crate) async fn try_repair(&self, enable_accelerated_repair: bool) -> IOResult<(usize, usize)> {
         //构建重播回调
         let db_mgr = self.clone();
@@ -1350,7 +1382,9 @@ impl<
         let tables = Arc::new(Mutex::new(BTreeMap::new()));
         let tables_copy = tables.clone();
         let replay_callback = move |commit_uid: Guid, prepare_output: Vec<u8>| -> IOResult<()> {
-            //异步执行重播
+            // callback 由 pi_store 在 start_replay 的轮询线程同步调用。repair 动作本身必须回到
+            // 数据库 runtime 执行；同步等待保证 callback 返回前，本条 WAL 已按原 TID/CID 完成
+            // prepare_repair/commit_repair，存储层不会提前推进 checkpoint。
             let db_mgr_copy = db_mgr.clone();
             let commit_uid_copy = commit_uid.clone();
             let meta_table_name = Atom::from(DEFAULT_DB_TABLES_META_DIR);
@@ -1512,7 +1546,11 @@ impl<
             }.boxed();
             let _ = db_mgr.0.rt.spawn(boxed);
 
-            //注意单个线程的运行时重播或并发重播，则可能会发生阻塞
+            // 这里等待的是刚投递到 db runtime 的 repair task。若 callback 本身占用同一 runtime
+            // 的最后一个 worker，任务无法首次 poll，形成确定性活性等待；外部线程驱动 startup 时
+            // callback 不占数据库 worker，因此单 worker 也能推进。spawn 被拒绝会丢弃 boxed 及其
+            // sender，使 recv 返回 channel 错误，并非这个永久等待窗口。完整边界见
+            // FIND-REPAIR-001；保持同步等待是当前 checkpoint 顺序的一部分。
             match receiver.recv() {
                 Err(e) => {
                     //同步通道异常，则立即返回错误原因
@@ -2711,6 +2749,12 @@ impl<
     /// 又禁止 rollback，所以合法调用必须预先保证全部表存在。表内错误按其原等级返回。成功只
     /// 表示私有动作已登记，后续仍须完整 prepare/commit。长度为 0 的 Value 当前未在入口统一
     /// 拒绝，但不属于可持久化合法域。
+    /// 缺表 Fatal 发生在 manager start/TID/CID 和根 WAL 之前；这只说明当前分支没有发布共享
+    /// 状态，绝不把 Fatal 降级为可 rollback。调用方必须立即丢弃整个根，不能继续 query/delete/
+    /// prepare/commit。真实边界与测试前提校准见
+    /// [CONTRACT-TR-004](../docs/SEMANTIC_CONTRACTS.md#contract-tr-004)、
+    /// [Fatal/取消边界](../docs/ORDINARY_FATAL_CANCELLATION_BOUNDARY.md#ordinary-fatal-cancellation-boundary-index)
+    /// 和 `tests/kv_action_contract.rs`。
     ///
     /// 每项平均包含 registry 查找和 O(log n) COW/overlay 更新；同步 guard 不跨文件 I/O，动作
     /// 阶段不写根 WAL 或数据文件。真实返回、缺表和逐表差异见 `tests/kv_action_contract.rs`。
@@ -2897,9 +2941,25 @@ impl<
     /// [`KVTableTrError::Conflicts`]，其中保存首个冲突表名和 Key，错误等级为 Normal；多个
     /// 冲突不保证全部报告，也不保证跨表诊断顺序独立于首次触表顺序。
     ///
+    /// 当前 manager 按首次触表顺序串行 prepare，并在首个错误处停止。因此多叶根失败时，冲突
+    /// 之前的叶子可能已经 `Prepared`，冲突叶子为 `PrepareFailed`，尚未访问的叶子仍为
+    /// `Inited`；这不是部分提交，三个状态都必须由整树 rollback 收口。首/中/末冲突位置和
+    /// 失败节点状态由 `tests/ordinary_multi_table_conflict_rollback.rs` 逐项验证。
+    ///
     /// 冲突发生在根 WAL append/flush 和子表根原子发布之前，因此在没有其它 Fatal 节点时
     /// 可以 rollback。真实 same-key 冲突和 manager 计数闭环由
-    /// `tests/root_transaction_lifecycle.rs` 验证。
+    /// `tests/root_transaction_lifecycle.rs` 验证；普通 Memory/LogOrdered/Btree 三叶根的失败 WAL、
+    /// 全树 rollback、同 Key 新根重试和 data-only 最终状态由
+    /// `tests/ordinary_multi_table_conflict_rollback.rs` 验证；分层冲突率下 288 次多 Key 尝试的
+    /// 成功/冲突守恒、跨 runtime 原子预留和恢复最终值由
+    /// `tests/ordinary_multi_table_concurrency.rs` 验证。
+    /// 不同外层根采用相反首次触表顺序时，跨表预留可能使全部根冲突，也可能恰有一个根完成
+    /// prepare；不承诺固定 winner 或“至少一个成功”。但重叠 Key 绝不能出现两个 winner，全部
+    /// loser 必须整树 rollback 后才能用新根重试。六排列、异步 barrier、WAL/repair 和双冷启动
+    /// 门禁由 `tests/ordinary_multi_table_ordering.rs` 验证，方案见
+    /// `docs/ORDINARY_MULTI_TABLE_ORDERING_ACCEPTANCE.md#ordinary-multi-table-ordering-index`。
+    /// 普通持久化 Memory 的 1/2/4/8 writer 与确定性冲突率性能基线由
+    /// `benches/ordinary_memory_concurrency.rs` 承载；该基准不外推其它表或版本协议。
     pub async fn prepare_modified_conflicts(&self) -> Result<Vec<u8>, KVTableTrError> {
         match self {
             KVDBTransaction::RootTr(tr) => {
@@ -2920,9 +2980,14 @@ impl<
     /// `write_set` 均可为空；各集合内部不允许重复 `(table, key)`，跨集合重叠合法且最终动作以
     /// write 为准。`Some(value)` 是 upsert，`None` 是 delete；LogWrite 不支持 delete。
     ///
-    /// 所有表名、Key、Value 长度及重复项会在 UID、子事务和共享状态副作用前检查。版本失配及
-    /// 只读表身份失效返回确定性 [`KVTableTrError::AllConflicts`]；写表缺失/替换和参数错误返回
-    /// 可 rollback 的 Normal Common。成功 token 是一次性 opaque 数据，只能原样传给同一事务。
+    /// 所有表名、Key、Value 长度及重复项会在 UID、子事务和共享状态副作用前检查。版本缺失、
+    /// TTL 淘汰、版本不等及只读表身份失效返回带 `ReadSetVersionMismatch` 的确定性
+    /// [`KVTableTrError::AllConflicts`]；revision、值状态或 prepared 预留冲突返回
+    /// `TransactionConflict`。冲突项不携带 expected/current Version，同 Key 两类并存时版本失配
+    /// 优先，详见
+    /// [VERSION-CONFLICT-KIND-001](../docs/VERSION_CONFLICT_KIND_DESIGN.md#version-conflict-kind-design-index)。
+    /// 写表缺失/替换和参数错误返回可 rollback 的 Normal Common。成功 token 是一次性 opaque
+    /// 数据，只能原样传给同一事务。
     pub async fn prepare_with_version(&self,
                                       read_set: Vec<TableKeyVersion>,
                                       write_set: Vec<TableKV>)
@@ -2960,6 +3025,8 @@ impl<
     /// 在尚未调用根 WAL append/flush 时产生的非 Fatal 逻辑失败可按状态 rollback；WAL 已成功
     /// 后的数据文件失败不能 rollback，WAL 保持未确认并由重启 repair 补齐。方法会执行异步文件
     /// I/O、同步锁和 runtime 任务投递，不保证取消安全；调用方必须等待明确结果并另行观察最终确认。
+    /// 普通 Memory/LogOrdered/Btree 三叶事务的共享 TID/CID、单次根 WAL、异步确认、repair 和
+    /// 移走 WAL 后最终数据由 `tests/ordinary_multi_table_recovery.rs` 提供真实闭环证据。
     ///
     /// 当前事务安全保证不覆盖根 WAL 自身因磁盘空间/配额、只读或故障文件系统、设备 I/O、
     /// runtime 拒绝任务或文件大小限制导致的 append/flush 失败。依赖层普通 `io::Error` 不保留
@@ -3019,6 +3086,12 @@ impl<
     /// 根 WAL 成功落地和数据文件写入之前，不会撤销已提交数据。Fatal 永不可 rollback。方法
     /// 可能 await 子事务回滚并获取同步锁；成功后返回 `Ok(())`，失败保留错误等级和事务状态，
     /// 不应继续复用严重失败句柄。
+    /// 多叶根在首个 prepare 冲突后仍会遍历全部叶子：此前 `Prepared`、冲突
+    /// `PrepareFailed` 和尚未 prepare 的 `Inited` 叶子都必须进入 `Rollbacked`。成功回滚后旧
+    /// 根及叶子即使仍有外部 `Arc` 也只是已关闭句柄；后续重试必须使用全新根和全新 TID/CID。
+    /// 该生命周期由 `tests/ordinary_multi_table_conflict_rollback.rs` 验证；同批大量失败根与
+    /// 多个不相交成功根并发收口后的 manager 配平和预留释放由
+    /// `tests/ordinary_multi_table_concurrency.rs` 验证。
     ///
     /// 上述安全结论只适用于当前受支持的事务失败域。若 `LogCommitFailed` 来源是根 WAL 的磁盘、
     /// 文件系统、设备、runtime 或文件大小限制错误，当前依赖链无法证明 0/部分/完整落盘状态，
@@ -3526,8 +3599,17 @@ impl<
         Ok(table_tr)
     }
 
-    // 创建指定名称表的子事务
-    // 注意表事务是否持久化，表示事务是否允许持久化，允许事务持久化表示这个事务的所有写操作会被写入提交日志
+    /// 创建指定名称表的普通子事务，并同时登记每表唯一 owner 与有序事务树节点。
+    ///
+    /// 调用方已经确认该表尚无 owner 并持续持有 `childs_map` guard。本函数先把 owner 写入 map，
+    /// 再在同一 map 临界区内把相同句柄追加到 `childs`；因此 child list 顺序就是普通非空动作的
+    /// 首次触表顺序，不是表名或表类型顺序。同表后续动作必须从 map 复用原 owner，不能再次追加
+    /// 或改变顺序。事务 manager 按此列表串行 prepare/commit/rollback；多个外层根使用相反顺序
+    /// 并发 prepare 时可能形成交叉预留，但不会在这里持有跨表锁或执行 await。
+    ///
+    /// `is_persistent` 只表示该子事务动作是否进入根 WAL，不表示表拥有独立数据文件。六种三表
+    /// 排列、交叉冲突、全树 rollback、重试和 repair 由
+    /// `tests/ordinary_multi_table_ordering.rs` 验证，完整边界见 `SI-045`。
     fn table_transaction(&self,
                          name: Atom,
                          table: &RegisteredTable<C, Log>,
@@ -3807,9 +3889,10 @@ impl<
                 }
             } else {
                 for key in &identity.read_keys {
-                    conflicts.push(TableKey {
+                    conflicts.push(TableKeyConflict {
                         table: identity.name.clone(),
                         key: key.clone(),
+                        kind: VersionConflictKind::ReadSetVersionMismatch,
                     });
                 }
             }
@@ -5828,6 +5911,8 @@ impl<
         // 在这里猜测耐久状态、清理 CommitLogger checkpoint 或改变 rollback/Fatal 分类。
         // 当前根 WAL 链最终调用 pi_async_file::AsyncFile::write，而不是未被这四库调用的
         // write_batch；后者的独立实现缺陷归档为 FIND-ASYNC-FILE-BATCH-001，不得据此扩大本边界。
+        // 普通三叶根的直接结构、共享 TID/CID、一次 WAL 和 data-only 最终状态由
+        // tests/ordinary_multi_table_recovery.rs 验证；该测试不改变本处顺序或计数算法。
         let commit_confirm = KVDBCommitConfirm::new(self.0.db_mgr.0.rt.clone(),
                                                     self.0.db_mgr.0.tr_mgr.commit_logger(),
                                                     self.get_transaction_uid().unwrap(),
