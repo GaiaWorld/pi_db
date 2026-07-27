@@ -7,8 +7,11 @@
 //!   manager 和根 WAL 均没有副作用；
 //! - TTL 为 ZERO 时完全关闭淘汰，轮询间隔包括 ZERO 在内均被忽略，startup 正常完成，同一
 //!   缺失 Meta Key 的首次观察版本在等待后保持不变。
+//! - Linux 上数据库根路径已经是普通文件时，目录创建失败必须保留 `NotADirectory`，且
+//!   listener、manager、根 WAL 和阻断文件均没有额外副作用。
 //!
-//! 本测试不注入损坏路径、Meta 或 WAL，不对 startup 的其它错误/panic 策略作结论。正式证据见
+//! 本测试不注入损坏 Meta、表或 WAL，不对持久表构造、受信解码及异步批量加载的
+//! panic/挂起策略作结论。正式证据见
 //! `docs/MANAGER_STARTUP_CONFIGURATION_ACCEPTANCE.md#manager-startup-config-index`。
 
 use std::{
@@ -16,6 +19,10 @@ use std::{
     future::Future,
     io::ErrorKind,
     path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -27,8 +34,12 @@ use pi_async_rt::rt::{
 use pi_async_transaction::{manager_2pc::Transaction2PcManager, AsyncCommitLog};
 use pi_atom::Atom;
 use pi_bon::{Encode, WriteBuffer};
-use pi_db::{db::KVDBManagerBuilder, Binary};
-use pi_guid::GuidGen;
+use pi_db::{
+    db::{KVDBManager, KVDBManagerBuilder},
+    utils::KVDBEvent,
+    Binary,
+};
+use pi_guid::{Guid, GuidGen};
 use pi_store::commit_logger::{CommitLogger, CommitLoggerBuilder};
 
 type TestResult<T = ()> = Result<T, String>;
@@ -36,6 +47,7 @@ type TestResult<T = ()> = Result<T, String>;
 const META_TABLE: &str = ".tables_meta";
 const TEST_TIMEOUT: Duration = Duration::from_secs(30);
 const NO_TTL_OBSERVATION: Duration = Duration::from_millis(25);
+const BLOCKING_FILE_CONTENT: &[u8] = b"not a database directory";
 
 #[test]
 fn test_manager_startup_key_version_ttl_configuration_contract() {
@@ -102,6 +114,65 @@ fn test_manager_startup_key_version_ttl_configuration_contract() {
         Ok(())
     })
     .unwrap_or_else(|error| panic!("manager startup configuration contract failed: {error}"));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn test_manager_startup_path_error_preserves_cause_and_has_no_database_side_effects() {
+    let root = TempRoot::new().expect("creating startup path-error root must succeed");
+    let root_path = root.path().to_path_buf();
+
+    run_on_runtime(TEST_TIMEOUT, move |rt| async move {
+        let (manager, logger) = build_transaction_manager(&rt, &root_path).await?;
+        let db_path = root_path.join("database-blocking-file");
+        fs::write(&db_path, BLOCKING_FILE_CONTENT)
+            .map_err(|error| format!("creating database blocking file failed: {error}"))?;
+        require(db_path.is_file(), "database blocking path is not a regular file")?;
+
+        let callback_count = Arc::new(AtomicUsize::new(0));
+        let callback_count_copy = callback_count.clone();
+        let failed = KVDBManagerBuilder::new(rt.clone(), manager.clone(), &db_path)
+            .startup_with_listener(
+                false,
+                Some(
+                    move |_db: &KVDBManager<usize, CommitLogger>,
+                          _manager: &Transaction2PcManager<usize, CommitLogger>,
+                          _events: &mut Vec<KVDBEvent<Guid>>| {
+                        callback_count_copy.fetch_add(1, Ordering::SeqCst);
+                    },
+                ),
+            )
+            .await;
+        let error = match failed {
+            Ok(_) => return Err("startup unexpectedly accepted a regular file as database root".to_owned()),
+            Err(error) => error,
+        };
+        require(
+            error.kind() == ErrorKind::NotADirectory,
+            &format!("blocked database root returned {:?}: {error}", error.kind()),
+        )?;
+        require(
+            callback_count.load(Ordering::SeqCst) == 0,
+            "path failure invoked the database event listener",
+        )?;
+        require(db_path.is_file(), "path failure replaced the blocking file")?;
+        require(
+            fs::read(&db_path)
+                .map_err(|read_error| format!("reading database blocking file failed: {read_error}"))?
+                == BLOCKING_FILE_CONTENT,
+            "path failure changed the blocking file content",
+        )?;
+        require(
+            !db_path.join(META_TABLE).exists(),
+            "path failure created a Meta path below the blocking file",
+        )?;
+        require(
+            !db_path.join(".tables").exists(),
+            "path failure created a user-table path below the blocking file",
+        )?;
+        assert_no_transaction_or_wal_side_effects(&manager, &logger).await
+    })
+    .unwrap_or_else(|error| panic!("manager startup path-error contract failed: {error}"));
 }
 
 async fn assert_no_transaction_or_wal_side_effects(

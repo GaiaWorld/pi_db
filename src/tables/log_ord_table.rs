@@ -509,7 +509,11 @@ impl<
         async move {
             let write_buf = tr.prepare_registered(PrepareConflictKind::Common).await?;
             if tr.is_writable() {
-                // 调试事件仍只记录可写事务成功完成的 prepare。
+                // FIND-DEBUG-001：历史自动埋点按 LogOrdered 子表发送 Begin，而不是按根发送。
+                // 同一根含多个 LogOrdered 子表时会重复 TID；其它表则没有 Begin。该 feature
+                // 已暂挂，日志不能作为完整事务树证据，详见
+                // docs/TRANSACTION_DEBUG_LOGGER_BOUNDARY.md。feature 开启但全局日志器未初始化
+                // 时 accessor 会在本位置 panic，并中断 prepare 返回。
                 #[cfg(feature = "log_table_debug")]
                 {
                     let output_len = if let Some(buf) = &write_buf {
@@ -537,6 +541,7 @@ impl<
         async move {
             let write_buf = tr.prepare_registered(PrepareConflictKind::First).await?;
             if tr.is_writable() {
+                // 与 prepare() 相同，这是 LogOrdered 子表级 Begin，不是根事务唯一 Begin。
                 #[cfg(feature = "log_table_debug")]
                 {
                     let output_len = if let Some(buf) = &write_buf {
@@ -705,7 +710,9 @@ impl<
                             KVActionLog::Read => (),
                         }
                     }
-                    //跟踪提交
+                    // FIND-DEBUG-001：只跟踪要求持久化的 LogOrdered 子表。这里的 size 是
+                    // Key/Value 估算字节数，不是动作条数。事件数据不参与事务判断，但 accessor
+                    // panic 会发生在 waits 登记前，所以启用 feature 必须先初始化日志器。
                     #[cfg(feature = "log_table_debug")]
                     {
                         let current_check_point = confirm
@@ -1562,7 +1569,9 @@ async fn collect_waits<
         // LogOrdered 类型；事件模型待单独对齐，本轮只标注而不修改。
         //指定了监听器
         for (wait_tr, confirm) in waits {
-            //跟踪提交
+            // FIND-DEBUG-001：该确认事件只描述 LogOrdered 表日志已完成；根 WAL 最终确认
+            // 仍由 KVDBCommitConfirm 推进。但 accessor 位于 confirm 回调之前，未初始化
+            // panic 会阻止本次确认，不能把错误配置下的调试路径视为无副作用。
             #[cfg(feature = "log_table_debug")]
             {
                 let event = TransactionDebugEvent::CommitConfirm(wait_tr.get_transaction_uid().unwrap(),
@@ -1600,7 +1609,7 @@ async fn collect_waits<
     } else {
         //未指定监听器
         for (wait_tr, confirm) in waits {
-            //跟踪提交
+            // FIND-DEBUG-001：无 listener 分支保持相同的 LogOrdered 专用诊断语义。
             #[cfg(feature = "log_table_debug")]
             {
                 let event = TransactionDebugEvent::CommitConfirm(wait_tr.get_transaction_uid().unwrap(),

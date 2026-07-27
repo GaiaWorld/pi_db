@@ -9,6 +9,7 @@ ddl_remove_crash_durability -
 ddl_reserved_meta_safety -
 empty_wal_commit -
 iterator_snapshot_safety -
+inspector_replay_lifecycle -
 key_version_api_contract -
 key_version_btree_empty_query -
 key_version_btree_restart_consistency -
@@ -21,6 +22,7 @@ key_version_ttl_early_expiry -
 key_version_ttl_index -
 kv_action_contract -
 manager_contract -
+manager_listener_contract -
 manager_startup_configuration -
 manager_table_maintenance -
 ordinary_multi_table_concurrency -
@@ -28,6 +30,7 @@ ordinary_multi_table_conflict_rollback -
 ordinary_multi_table_ordering -
 ordinary_multi_table_recovery -
 prepare_conflict_regression test_prepare_conflict_active_tables
+root_transaction_construction -
 root_transaction_lifecycle -
 schema_protocol_neutral -
 schema_protocol_recovery -

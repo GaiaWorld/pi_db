@@ -64,6 +64,9 @@ use pi_ordmap::asbtree::Tree;
 use pi_ordmap::ordmap::{ImOrdMap, OrdMap};
 use pi_store::log_store::log_file::LogMethod;
 
+// FIND-DEBUG-001：以下 TransactionDebugEvent/transaction_debug_logger 是历史残留 import；
+// 本模块当前没有自动事件发送点，不能据此认为 Btree 已接入 `log_table_debug`。该能力已暂挂，
+// 只记录现状而不在本轮清理 import，详见 docs/TRANSACTION_DEBUG_LOGGER_BOUNDARY.md。
 use crate::{Binary, KVAction, KVActionLog, KVDBCommitConfirm, KVTableTrError, TableKeyConflict, TableTrQos, TransactionDebugEvent, transaction_debug_logger, db::{KVDBChildTrList, KVDBTransaction}, key_version::{KeyVersions,
                                                                                                                                                                                                                                                       PrepareMode,
                                                                                                                                                                                                                                                       PreparedActions,

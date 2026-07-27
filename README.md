@@ -8,12 +8,24 @@
 
 `KVDBManagerBuilder::startup` 和 `startup_with_listener` 默认通过 `try_repair` 重放尚未最终
 确认的根事务前导日志。`enable_accelerated_repair` 只控制 Btree/redb 的快速崩溃恢复写入
-模式，不会选择其它根日志恢复路径，也不会跳过 WAL 或提前确认事务。
+模式，不会选择其它根日志恢复路径，也不会跳过 WAL 或提前确认事务。该值只作用于本次从 Meta
+加载或由根 WAL repair-create 的 Btree，并由这些表保存供后续 redb 写事务使用；它不是 manager
+级建表默认值，启动后显式创建 Btree 仍使用建表 API 自己的参数。真实三进程
+`false -> true -> false` 重启、两次非正常进程退出、collector、最终数据与空 WAL 一致性由
+`tests/key_version_btree_restart_consistency.rs` 验证；该功能专项不代表性能 A/B 结论。
 
 启动阶段会以最多 8192 条 Meta 记录为一批装配用户表；该值只是内部临时内存和单批异步工作
 规模，不是公开表数量上限。跨批边界的当前记录会进入下一批，因此第 8193、16385 等位置的
 合法表定义不会被静默跳过；权威 Meta 中的全部定义必须成功装配后，启动才会继续进入根 WAL
 修复和可用状态。
+
+启动的 `IOResult` 当前只覆盖明确传播的 TTL 配置、目录创建、表名校验、部分批量装配及根 WAL
+repair 错误，并不覆盖全部失败。Meta/持久表构造和受信元数据 decoder 仍有 panic 分支；异步
+批量加载中的表任务 panic 或 runtime 拒绝任务时，共享完成值可能不再推进，startup future
+可能持续等待。失败前创建的目录、文件、表对象或 collector 也不会自动 rollback。普通文件
+阻断数据库目录的 Linux 真实专项已证明目录错误保留 `NotADirectory`，且不会调用 listener、
+创建事务或写根 WAL；损坏 Meta/redb 的 panic/挂起策略仍分别由 `FIND-CODEC-001` 和
+`FIND-CTOR-001` 管理，当前不是最终或最佳错误模型，不能把现状 panic/挂起当作稳定 API 契约。
 
 <a id="startup-repair-execution-context"></a>
 
@@ -47,7 +59,96 @@ runtime 唯一 worker 的特定窗口必须在有限截止内精确命中特征�
 panic、channel 断开或测试进程永久挂起。完整证据与未来候选方案见
 `docs/STARTUP_REPAIR_RUNTIME_LIVENESS_BUG.md`。
 
+<a id="offline-inspector-lifecycle"></a>
+
+### 离线日志检查器
+
+`CommitLogInspector` 和 `LogTableInspector` 是专用、离线、单消费者、单实例一次性使用的诊断
+工具，不允许在生产数据库运行期间使用，也不能与在线数据库共享 logger、表目录或 runtime
+生命周期。它们不修改数据库表数据、不执行 repair，但“诊断读取”不等于物理文件严格只读：
+根 WAL replay 可以分裂日志、调整 checkpoint 或标记 `.bak`，`LogFile::open` 也可能创建初始
+日志或整理目录。重复检查必须在上一次结束后创建新 Inspector。
+
+`CommitLogInspector` 的 pull 和 callback 模式都会在 `start_replay*` 正常返回 `Ok/Err` 后调用
+`finish_replay`。callback 的最终 `None` 只在 finish 尝试及状态复位后发出；它表示后台检查
+生命周期已闭合，不表示 WAL 解析或缓冲确认一定成功，具体错误只写日志。可信 WAL 解析或用户
+callback panic、runtime 被提前终止仍不保证异步 finish，调用方必须废弃该一次性诊断
+runtime/进程。`LogTableInspector` 不进入 `CommitLogger` replay，因此不调用 `finish_replay`。
+完整边界与红绿证据见 `docs/INSPECTOR_REPLAY_LIFECYCLE_FIX.md`。
+
+<a id="transaction-debug-logger-boundary"></a>
+
+### `log_table_debug` 历史诊断 feature
+
+`log_table_debug` 是 `pi_db` crate 自身的可选 Cargo feature，不是 `tools/` 下的独立子库，
+也不是 `log::debug!`、OpenTelemetry tracing、根 WAL 或事务管理器的一部分。
+`TransactionDebugLogger`、`TransactionDebugEvent`、`init_transaction_debug_logger` 等公开 API
+无论 feature 是否启用都会编译；该 feature 只打开少量自动事件发送点。
+
+当前自动事件链并不覆盖任意事务树。`Begin/Commit/CommitConfirm` 只由 LogOrdered 子表发送，
+`End` 则由所有进入最终根 WAL 确认分支的事务发送。单个持久化 LogOrdered 子表的简单根事务
+可以形成相对完整的链；同一根包含多个 LogOrdered 子表会重复发送同一 TID 的 `Begin`，其它表
+可能只有 `End`，非持久化 LogOrdered 还可能没有用于清理时间表的 `End`。因此日志中的
+“Transaction id conflict”或“transaction not exist”不能直接解释为真实事务冲突或提交失败。
+
+启用 feature 不会自动初始化全局日志器。调用方必须在事务开始前从不会占尽同一 runtime
+执行能力的上下文恰好调用一次 `init_transaction_debug_logger`；否则自动发送点会 panic。
+日志器使用非有界队列、永久后台任务和独立 `LogFile` 目录，没有 shutdown/drain 回执；重复
+初始化会先构造临时实例，重复 `startup` 会产生多个消费者，后台 spawn/日志 commit 错误不会
+形成事务错误回执。必须特别区分：自动发送点是内联调用，未初始化全局日志器导致的 panic
+可以中断 LogOrdered prepare、持久化队列登记或确认回调；这也是当前禁止把它当作透明观测能力
+的原因。其输出只可用于历史诊断，绝不能作为提交成功、持久化完成、WAL 确认或恢复正确性的
+判定依据。
+
+该 feature 当前未被 `pi_db_server`、`pi_db_terminal` 或 `pi-launcher` 的生产装配启用，项目已
+决定暂时忽略其功能演进、修复和动态测试，只保留兼容并详尽标注现状。重新启用生产用途、要求
+覆盖任意表/多表事务、要求可关闭/可重复初始化或依赖日志作正确性判断时，必须先重新冻结设计。
+完整归档见 `docs/TRANSACTION_DEBUG_LOGGER_BOUNDARY.md`（FIND-DEBUG-001）。
+
+<a id="manager-soft-close-boundary"></a>
+
+### Manager 软关闭边界
+
+`KVDBManager::close()` 当前是立即返回的软关闭标记，不是 graceful shutdown。它会阻止后续
+`transaction()` 创建新根，但不会取消 close 前已经创建的根，也不会阻断已经 Prepared 的普通/
+版本提交或可恢复失败事务的 rollback；需要根 WAL 的既有提交仍沿原链确认。最后一个活跃事务
+结束后状态不会自动从 Closing 推进 Closed，需再次调用 `close()`。
+
+该方法不等待 collector/listener 退出、文件句柄释放、所有异步数据持久化或根 WAL 确认，
+因此返回不代表数据库已经可以安全地在同一路径重建。`tests/manager_contract.rs` 使用真实
+runtime、事务管理器、CommitLogger、Memory 表和文件系统验证上述当前行为，并同时检查最终值、
+版本回执、事务计数、根 WAL append 以及确认完成数/等待数的严格守恒；它不要求 `close()`
+返回时其它既有异步确认已经完成。并发创建与 close 的线性化、关闭后 maintenance/listener 行为
+及完整资源释放仍不属于现有保证。完整调用链、状态边界和验收矩阵见
+`docs/MANAGER_SOFT_CLOSE_ACCEPTANCE.md`；本轮只读审计发现但尚未动态确认的 listener、路径与
+maintenance 后续项见 `docs/MANAGER_AUDIT_FOLLOWUPS.md`。
+
+Manager 的路径和表查询 API 不参与事务，也不读取软关闭状态：路径 getter 返回构建时词法
+路径，逐表查询在当前 registry 中查找，未注册的空名、超限名和已删表按缺表返回；
+Closing/Closed 后只要句柄仍存活就可继续查询。删表在动作阶段已经移除 registry，提交负责
+Meta tombstone 的根 WAL 闭环，但不会删除旧物理目录；多次查询之间不构成共同快照。当前精确
+矩阵、锁边界、统计限制和真实验收见 `docs/MANAGER_QUERY_PATH_ACCEPTANCE.md`。这不是路径
+containment、删表 rollback 或 graceful shutdown 保证。
+
+`startup_with_listener` 使用无界事件通道和单个长期 runtime 任务串行调用同步回调。持续有事件
+时每批最多 3072 项并在满批后立即交付；不足上限时会等待最多五轮 10ms 空闲窗口再交付，因此
+它不是实时通知 SLA。框架会复用批次 `Vec`，回调必须在返回前 `drain` 或 `clear` 已处理事件。
+回调阻塞会占用 worker，panic 会终止当前 listener 任务；生产速度持续超过消费速度会导致无界
+队列增长。`ConfirmCommited` 只表示对应表持久化后同步确认器返回成功，不证明根 WAL 异步确认
+和 `.bak` 已完成。Meta 与 LogOrdered 当前都携带 `BtreeOrdTab` 标签，这是已归档且非最终的
+事件模型边界，不能按准确表类型解释。正常路径的真实装配、严格断言和未覆盖异常见
+`docs/MANAGER_LISTENER_ACCEPTANCE.md`。
+
 ### 事务树身份与根 WAL
+
+`KVDBManager::transaction` 只构造一个尚未开始 2PC 的共享根：初始状态为 `Start`，没有
+TID/CID、子节点、manager 登记或 WAL 副作用。`source`、writable 和两个 `u64` timeout 原样保存
+并传给后续子节点；timeout 当前不执行实际截止。clone 共享同一逻辑根，首次 prepare 的
+`start` 才分配 TID、递归发布身份并登记唯一外层根。表子节点按首次触表顺序且每表唯一；
+`KVDBChildTrList` clone 是节点集合快照，不是第二棵事务树。真实构造、未 prepare Drop、两表
+身份继承、manager 计数、WAL 确认和最终数据由
+`tests/root_transaction_construction.rs` 验证；完整边界见
+`docs/ROOT_TRANSACTION_CONSTRUCTION_ACCEPTANCE.md`。
 
 一次公开事务生命周期只注册一个外层根，根及全部子表事务共享同一个事务 ID；需要写根 WAL 时
 还共享同一个提交 ID。子表事务是根拥有的内部节点，不得独立调用 `start/prepare/commit/

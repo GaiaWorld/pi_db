@@ -6,11 +6,14 @@
 //!
 //! - 启动路径、内部 Meta 注册和五类用户表的 registry/路径/属性/空表统计；
 //! - Memory `persistence=false/true` 都无数据目录，后者仅表示动作可以进入根 WAL；
-//! - 缺表查询与 maintenance 当前的 `None`/`Ok(())` 边界；
+//! - 缺表、非法长度名称、已删表以及 Closing/Closed 状态下的管理查询边界；
+//! - 删表动作立即移除 registry，但不删除原物理目录，提交仍进入根 WAL 和确认闭环；
+//! - 缺表 maintenance 当前的 `Ok(())` 边界；
 //! - `append_new_commit_log` 真实轮换 checkpoint，但不增加业务 WAL 计数；
 //! - listener 通道实际执行同步批量回调，回调清空事件后不会保留旧批次；
 //! - 无 listener 时报告请求返回 `ConnectionAborted`；
-//! - clone 共享软关闭状态，新事务立即被拒绝，但 close 前已创建或已注册的事务当前仍可完成。
+//! - clone 共享软关闭状态，新事务立即被拒绝，但 close 前已创建或已注册的普通提交、可恢复
+//!   冲突 rollback 和版本提交当前仍可完成，且持久化 Memory 的根 WAL 继续进入确认闭环。
 //!
 //! 最后一项只描述 `Q-CLOSE-001` / `FIND-CLOSE-001` 的当前实现，不是最终或最佳 shutdown
 //! 契约。Btree 非空 overlay 的长度风险由 `FIND-TABLE-002` 和后续表专项负责，本 target 只对
@@ -34,12 +37,16 @@ use pi_async_rt::rt::{
     multi_thread::{MultiTaskRuntime, MultiTaskRuntimeBuilder},
     startup_global_time_loop, AsyncRuntime,
 };
-use pi_async_transaction::{manager_2pc::Transaction2PcManager, AsyncCommitLog};
+use pi_async_transaction::{
+    manager_2pc::Transaction2PcManager, AsyncCommitLog, ErrorLevel, Transaction2Pc,
+};
 use pi_atom::Atom;
+use pi_bon::{Encode, WriteBuffer};
 use pi_db::{
     db::{KVDBManager, KVDBManagerBuilder, KVDBTransaction},
+    tables::TableKV,
     utils::{CreateTableOptions, KVDBEvent},
-    KVDBTableType, KVTableMeta,
+    Binary, KVDBTableType, KVTableMeta, TableKeyVersion, Version, MAX_TABLE_NAME_BYTES,
 };
 use pi_guid::{Guid, GuidGen};
 use pi_sinfo::EnumType;
@@ -74,6 +81,7 @@ fn test_manager_current_contract_matrix() {
         create_user_tables(&fixture).await?;
         verify_user_table_registry(&fixture).await?;
         verify_missing_and_maintenance_contract(&fixture).await?;
+        verify_removed_table_query_contract(&fixture).await?;
         verify_checkpoint_rotation(&fixture).await?;
         verify_no_listener_error(&rt, &root_path).await?;
         verify_soft_close_contract(&fixture).await?;
@@ -229,21 +237,17 @@ async fn create_user_tables(fixture: &Fixture) -> TestResult<()> {
     }
 
     let append_before = fixture.logger.append_total_count();
-    let confirm_before = fixture.logger.confirm_total_count();
+    let confirmation_before = confirmation_accounting_snapshot(&fixture.logger).await?;
     commit_transaction(&transaction, "manager DDL").await?;
     expect_eq(
         "DDL root WAL append count",
         &fixture.logger.append_total_count(),
         &(append_before + 1),
     )?;
-    let confirmed = fixture.logger.confirm_total_count();
-    let waiting = fixture.logger.waiting_confirm_count().await;
-    require(
-        (confirmed == confirm_before && waiting == 1)
-            || (confirmed == confirm_before + 1 && waiting == 0),
-        &format!(
-            "DDL WAL left an invalid confirmation state: before={confirm_before}, confirmed={confirmed}, waiting={waiting}"
-        ),
+    expect_eq(
+        "DDL confirmation accounting",
+        &confirmation_accounting_snapshot(&fixture.logger).await?,
+        &(confirmation_before + 1),
     )
 }
 
@@ -389,6 +393,14 @@ async fn verify_missing_and_maintenance_contract(fixture: &Fixture) -> TestResul
         &fixture.db.table_cache_size(&missing).await,
         &None,
     )?;
+    assert_absent_table_queries(fixture, &Atom::from(""), "empty table name", 6).await?;
+    assert_absent_table_queries(
+        fixture,
+        &Atom::from("x".repeat(MAX_TABLE_NAME_BYTES + 1)),
+        "over-limit table name",
+        6,
+    )
+    .await?;
     fixture
         .db
         .ready_collect_table(&missing)
@@ -415,6 +427,100 @@ async fn verify_missing_and_maintenance_contract(fixture: &Fixture) -> TestResul
         "Memory record count after maintenance",
         &fixture.db.table_record_size(&memory).await,
         &Some(0),
+    )
+}
+
+/// 验证删表的 registry 可见性、查询返回、物理目录非目标及根 WAL 确认闭环。
+async fn verify_removed_table_query_contract(fixture: &Fixture) -> TestResult<()> {
+    let table = Atom::from(LOG_ORDERED);
+    let physical_path = fixture.db.tables_path().join(LOG_ORDERED);
+    require(
+        physical_path.is_dir(),
+        "LogOrdered physical directory was missing before removal",
+    )?;
+
+    let transaction = transaction(&fixture.db, "manager remove table", true, 10_000, 10_000)?;
+    let append_before = fixture.logger.append_total_count();
+    let confirmation_before = confirmation_accounting_snapshot(&fixture.logger).await?;
+    transaction
+        .remove_table(table.clone())
+        .await
+        .map_err(|error| format!("staging manager table removal failed: {error}"))?;
+
+    assert_absent_table_queries(fixture, &table, "staged removed table", 5).await?;
+    expect_eq(
+        "remove action WAL append count",
+        &fixture.logger.append_total_count(),
+        &append_before,
+    )?;
+    require(
+        physical_path.is_dir(),
+        "remove action unexpectedly deleted the LogOrdered physical directory",
+    )?;
+
+    commit_transaction(&transaction, "manager remove table").await?;
+    assert_absent_table_queries(fixture, &table, "committed removed table", 5).await?;
+    expect_eq(
+        "remove commit WAL append count",
+        &fixture.logger.append_total_count(),
+        &(append_before + 1),
+    )?;
+    expect_eq(
+        "remove commit confirmation accounting",
+        &confirmation_accounting_snapshot(&fixture.logger).await?,
+        &(confirmation_before + 1),
+    )?;
+    require(
+        physical_path.is_dir(),
+        "committed removal unexpectedly deleted the LogOrdered physical directory",
+    )
+}
+
+/// 对任意未注册名称验证所有逐表管理查询都使用同一“缺表”结果。
+async fn assert_absent_table_queries(
+    fixture: &Fixture,
+    table: &Atom,
+    label: &str,
+    expected_table_size: usize,
+) -> TestResult<()> {
+    expect_eq(
+        &format!("{label} existence"),
+        &fixture.db.is_exist(table).await,
+        &false,
+    )?;
+    expect_eq(
+        &format!("{label} path"),
+        &fixture.db.table_path(table).await,
+        &None,
+    )?;
+    expect_eq(
+        &format!("{label} persistence"),
+        &fixture.db.is_persistent_table(table).await,
+        &None,
+    )?;
+    expect_eq(
+        &format!("{label} ordering"),
+        &fixture.db.is_ordered_table(table).await,
+        &None,
+    )?;
+    expect_eq(
+        &format!("{label} record count"),
+        &fixture.db.table_record_size(table).await,
+        &None,
+    )?;
+    expect_eq(
+        &format!("{label} cache bytes"),
+        &fixture.db.table_cache_size(table).await,
+        &None,
+    )?;
+    expect_eq(
+        &format!("{label} table count"),
+        &fixture.db.table_size().await,
+        &expected_table_size,
+    )?;
+    require(
+        !fixture.db.tables().await.iter().any(|name| name == table),
+        &format!("{label} unexpectedly appeared in tables()"),
     )
 }
 
@@ -485,28 +591,112 @@ async fn verify_no_listener_error(rt: &MultiTaskRuntime<()>, root: &Path) -> Tes
 
 /// 验证 close 的可观察软关闭行为，不把它扩大成完整 shutdown 保证。
 async fn verify_soft_close_contract(fixture: &Fixture) -> TestResult<()> {
+    let ordinary_key = encode_usize(51_001);
+    let ordinary_value = encode_usize(61_001);
+    let rejected_value = encode_usize(61_002);
+    let version_key = encode_usize(51_002);
+    let version_value = encode_usize(61_003);
+
     let precreated = transaction(&fixture.db, "created before close", true, 0, 0)?;
-    let active = transaction(&fixture.db, "registered before close", true, 0, 0)?;
+    let observer = transaction(&fixture.db, "observer created before close", false, 0, 0)?;
+    let active = transaction(&fixture.db, "ordinary registered before close", true, 0, 0)?;
+    let rollback = transaction(&fixture.db, "rollback registered before close", true, 0, 0)?;
+    let version = transaction(&fixture.db, "version registered before close", true, 0, 0)?;
     let produced_before = fixture.tr_manager.produced_transaction_total();
     let consumed_before = fixture.tr_manager.consumed_transaction_total();
     let append_before = fixture.logger.append_total_count();
+    let confirmation_before = confirmation_accounting_snapshot(&fixture.logger).await?;
 
+    active
+        .upsert(vec![TableKV::new(
+            Atom::from(MEMORY_VOLATILE),
+            ordinary_key.clone(),
+            Some(ordinary_value.clone()),
+        )])
+        .await
+        .map_err(|error| format!("staging ordinary close write failed: {error:?}"))?;
     let active_prepare = active
-        .prepare_modified()
+        .prepare_modified_conflicts()
         .await
         .map_err(|error| format!("preparing active close transaction failed: {error:?}"))?;
-    expect_eq(
-        "active empty prepare output",
-        &active_prepare.is_empty(),
-        &true,
+
+    rollback
+        .upsert(vec![TableKV::new(
+            Atom::from(MEMORY_VOLATILE),
+            ordinary_key.clone(),
+            Some(rejected_value),
+        )])
+        .await
+        .map_err(|error| format!("staging rollback close write failed: {error:?}"))?;
+    let rollback_error = rollback
+        .prepare_modified_conflicts()
+        .await
+        .expect_err("the competing ordinary transaction must fail before close");
+    require(
+        rollback_error.is_conflicts()
+            && !rollback_error.is_all_conflicts()
+            && matches!(rollback_error.level(), ErrorLevel::Normal),
+        &format!(
+            "competing ordinary transaction returned an invalid error: {rollback_error:?}"
+        ),
     )?;
+    let rollback_conflict = rollback_error
+        .conflicts()
+        .ok_or_else(|| "ordinary conflict did not expose its table and key".to_owned())?;
+    expect_eq(
+        "ordinary close conflict table",
+        &rollback_conflict.0.as_str(),
+        &MEMORY_VOLATILE,
+    )?;
+    expect_eq(
+        "ordinary close conflict key",
+        rollback_conflict.1,
+        &ordinary_key,
+    )?;
+
+    let (initial_version_value, initial_version) = fixture
+        .db
+        .query_with_version(Atom::from(MEMORY_WAL), version_key.clone())
+        .await
+        .map_err(|error| format!("loading close version baseline failed: {error:?}"))?;
+    expect_eq(
+        "close version baseline value",
+        &initial_version_value,
+        &None,
+    )?;
+    require(
+        matches!(&initial_version, Version::Delete(_)),
+        &format!(
+            "absent close version baseline was not Delete: {initial_version:?}"
+        ),
+    )?;
+    let version_prepare = version
+        .prepare_with_version(
+            vec![TableKeyVersion {
+                table: Atom::from(MEMORY_WAL),
+                key: version_key.clone(),
+                version: initial_version,
+            }],
+            vec![TableKV::new(
+                Atom::from(MEMORY_WAL),
+                version_key.clone(),
+                Some(version_value.clone()),
+            )],
+        )
+        .await
+        .map_err(|error| format!("preparing version close transaction failed: {error:?}"))?;
+    let version_uid = version
+        .get_transaction_uid()
+        .ok_or_else(|| "version close prepare did not allocate a transaction UID".to_owned())?;
+
     expect_eq(
         "active transaction registry before close",
         &fixture.tr_manager.transaction_len(),
-        &1,
+        &3,
     )?;
 
     fixture.db.clone().close();
+    verify_management_queries_after_close(fixture, "Closing").await?;
     require(
         fixture
             .db
@@ -520,8 +710,32 @@ async fn verify_soft_close_contract(fixture: &Fixture) -> TestResult<()> {
         .commit_modified(active_prepare)
         .await
         .map_err(|error| format!("active transaction could not finish after close: {error:?}"))?;
+    rollback
+        .rollback_modified()
+        .await
+        .map_err(|error| format!("failed transaction could not rollback after close: {error:?}"))?;
+    let receipt = version
+        .commit_with_version(version_prepare)
+        .await
+        .map_err(|error| format!("version transaction could not finish after close: {error:?}"))?;
+    expect_eq("close version receipt count", &receipt.len(), &1usize)?;
     expect_eq(
-        "active transaction registry after commit",
+        "close version receipt table",
+        &receipt[0].table.as_str(),
+        &MEMORY_WAL,
+    )?;
+    expect_eq(
+        "close version receipt key",
+        &receipt[0].key,
+        &version_key,
+    )?;
+    expect_eq(
+        "close version receipt version",
+        &receipt[0].version,
+        &Version::Upsert(version_uid),
+    )?;
+    expect_eq(
+        "active transaction registry after close completions",
         &fixture.tr_manager.transaction_len(),
         &0,
     )?;
@@ -536,15 +750,41 @@ async fn verify_soft_close_contract(fixture: &Fixture) -> TestResult<()> {
             format!("pre-created transaction could not commit after close: {error:?}")
         })?;
 
+    let observed = observer
+        .query(vec![
+            TableKV::new(
+                Atom::from(MEMORY_VOLATILE),
+                ordinary_key,
+                None,
+            ),
+            TableKV::new(
+                Atom::from(MEMORY_WAL),
+                version_key,
+                None,
+            ),
+        ])
+        .await;
+    expect_eq("close observer result count", &observed.len(), &2usize)?;
+    expect_eq(
+        "ordinary committed value after close",
+        &observed[0],
+        &Some(ordinary_value),
+    )?;
+    expect_eq(
+        "version committed value after close",
+        &observed[1],
+        &Some(version_value),
+    )?;
+
     expect_eq(
         "close lifecycle produced count",
         &fixture.tr_manager.produced_transaction_total(),
-        &(produced_before + 2),
+        &(produced_before + 4),
     )?;
     expect_eq(
         "close lifecycle consumed count",
         &fixture.tr_manager.consumed_transaction_total(),
-        &(consumed_before + 2),
+        &(consumed_before + 4),
     )?;
     expect_eq(
         "close lifecycle final transaction registry",
@@ -552,12 +792,18 @@ async fn verify_soft_close_contract(fixture: &Fixture) -> TestResult<()> {
         &0,
     )?;
     expect_eq(
-        "empty close lifecycle WAL count",
+        "close lifecycle WAL append count",
         &fixture.logger.append_total_count(),
-        &append_before,
+        &(append_before + 1),
+    )?;
+    expect_eq(
+        "close lifecycle confirmation accounting",
+        &confirmation_accounting_snapshot(&fixture.logger).await?,
+        &(confirmation_before + 1),
     )?;
 
     fixture.db.close();
+    verify_management_queries_after_close(fixture, "Closed").await?;
     require(
         fixture
             .db
@@ -565,6 +811,71 @@ async fn verify_soft_close_contract(fixture: &Fixture) -> TestResult<()> {
             .is_none(),
         "repeated close unexpectedly reopened the database",
     )
+}
+
+/// 管理查询不读取软关闭状态；Closing 和 Closed 都继续暴露同一 registry 当前值。
+async fn verify_management_queries_after_close(
+    fixture: &Fixture,
+    phase: &str,
+) -> TestResult<()> {
+    expect_eq(
+        &format!("{phase} Meta path derivation"),
+        &fixture.db.tables_meta_path(),
+        &&*fixture.db.db_path().join(META_TABLE),
+    )?;
+    expect_eq(
+        &format!("{phase} user-table path derivation"),
+        &fixture.db.tables_path(),
+        &&*fixture.db.db_path().join(".tables"),
+    )?;
+    expect_eq(
+        &format!("{phase} table count"),
+        &fixture.db.table_size().await,
+        &5usize,
+    )?;
+    expect_table_names(
+        &fixture.db,
+        &[META_TABLE, MEMORY_VOLATILE, MEMORY_WAL, LOG_WRITE, BTREE],
+    )
+    .await?;
+
+    expect_eq(
+        &format!("{phase} existing table"),
+        &fixture.db.is_exist(&Atom::from(MEMORY_WAL)).await,
+        &true,
+    )?;
+    expect_eq(
+        &format!("{phase} Btree path"),
+        &fixture.db.table_path(&Atom::from(BTREE)).await,
+        &Some(fixture.db.tables_path().join(BTREE).join("table.dat")),
+    )?;
+    expect_eq(
+        &format!("{phase} volatile Memory persistence"),
+        &fixture
+            .db
+            .is_persistent_table(&Atom::from(MEMORY_VOLATILE))
+            .await,
+        &Some(false),
+    )?;
+    expect_eq(
+        &format!("{phase} Btree ordering"),
+        &fixture.db.is_ordered_table(&Atom::from(BTREE)).await,
+        &Some(true),
+    )?;
+    expect_eq(
+        &format!("{phase} Meta record count"),
+        &fixture.db.table_record_size(&Atom::from(META_TABLE)).await,
+        &Some(4),
+    )?;
+    require(
+        fixture
+            .db
+            .table_cache_size(&Atom::from(META_TABLE))
+            .await
+            .is_some_and(|size| size > 0),
+        &format!("{phase} Meta cache bytes were absent or zero"),
+    )?;
+    assert_absent_table_queries(fixture, &Atom::from(LOG_ORDERED), phase, 5).await
 }
 
 /// 等待 listener 回调实际交付一个含报告请求的批次。
@@ -611,6 +922,38 @@ async fn expect_table_names(db: &RealDb, expected: &[&str]) -> TestResult<()> {
 
 fn table_meta(table_type: KVDBTableType, persistence: bool) -> KVTableMeta {
     KVTableMeta::new(table_type, persistence, EnumType::Usize, EnumType::Usize)
+}
+
+fn encode_usize(value: usize) -> Binary {
+    let mut buffer = WriteBuffer::new();
+    value.encode(&mut buffer);
+    Binary::new(buffer.bytes)
+}
+
+/// `CommitLogger` 在同一检查点锁内把一个事务从 waiting 转移到 confirmed。
+///
+/// 指标 API 分开暴露两个计数，直接各读一次可能撞上转移中间态。这里仅在确认累计值前后
+/// 一致时接受夹在中间的 waiting 读数，从而得到某一稳定瞬间的守恒总量；不等待队列清空，
+/// 也不把 Manager 的软关闭语义扩大成 graceful shutdown。
+async fn confirmation_accounting_snapshot(logger: &CommitLogger) -> TestResult<usize> {
+    let deadline = Instant::now() + OBSERVATION_TIMEOUT;
+    loop {
+        let confirmed_before = logger.confirm_total_count();
+        let waiting = logger.waiting_confirm_count().await;
+        let confirmed_after = logger.confirm_total_count();
+        if confirmed_before == confirmed_after {
+            return confirmed_after
+                .checked_add(waiting)
+                .ok_or_else(|| "CommitLogger confirmation accounting overflowed usize".to_owned());
+        }
+
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "CommitLogger confirmation accounting did not reach a stable observation within {:?}",
+                OBSERVATION_TIMEOUT
+            ));
+        }
+    }
 }
 
 fn transaction(

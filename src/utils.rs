@@ -58,8 +58,8 @@ pub enum CreateTableOptions {
 /// 替代事务 API 返回值、WAL 状态或恢复检查。clone 的 Atom/Guid/枚举成本为 O(1)，事件
 /// 值本身无内部可变性、无 I/O，可在 `Cid: Send` 时跨线程移动。
 ///
-/// 字段和值对象分类由 `tests/utils_contract.rs` 验证；生产投递链和缺口见
-/// `CONTRACT-EVENT-001`。
+/// 字段和值对象分类由 `tests/utils_contract.rs` 验证；正常批处理和真实 collector payload 由
+/// `tests/manager_listener_contract.rs` 验证，生产投递链和缺口见 `CONTRACT-EVENT-001`。
 #[derive(Debug, Clone)]
 pub enum KVDBEvent<Cid: Debug + Clone + Send + PartialEq + Eq + 'static> {
     /// 由 `KVDBManager::report_transaction_info` 主动发送的无 payload 请求标记。

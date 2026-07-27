@@ -1,14 +1,21 @@
 //! Btree Key 版本在 overlay、redb collector 与冷启动之间的一致性专项。
 //!
-//! 本 target 只使用公开数据库 API，并拆成两个独立进程：`setup` 先以真实根 WAL 提交一个
-//! 版本化写事务，再用合法 `Str -> Usize` 大批次触发生产 1 MiB Btree collector 阈值；
-//! `inspect-data-only` 随后使用全新空 WAL 打开同一数据目录。测试据此同时验证：
+//! 本 target 只使用公开数据库 API，并拆成三个独立进程：`setup` 以
+//! `enable_accelerated_repair=false` 提交一个版本化写事务，再用合法 `Str -> Usize` 大批次
+//! 触发生产 1 MiB Btree collector 阈值；`accelerated-reopen-write` 以 `true` 重开同一 Btree、
+//! 验证基线并再次完成版本写和 collector；`inspect-data-only` 最后以 `false` 和全新空 WAL
+//! 打开同一数据目录。前两个进程均在数据和根 WAL 确认闭合后直接 `_exit`，不依赖正常析构。
+//! 测试据此同时验证：
 //!
 //! - collector 前 overlay 中的值与 `commit_with_version` 回执严格匹配；
 //! - collector 把值写入 redb、清理 overlay 后，不得改变该 Key 的已发布版本；
+//! - `false -> true -> false` 三次启动与两次非正常进程退出不改变 Btree 逻辑值；
 //! - 冷启动只从 Meta/Btree 数据文件恢复值，Key 版本缓存不会跨进程持久化；
 //! - 冷启动后的首次 `query_with_version` 为已存在值生成新的 `Upsert(Guid)`，重复读取稳定；
 //! - data-only 检查使用的空 WAL 保持零 append、零 confirm、零 waiting。
+//!
+//! `enable_accelerated_repair` 是否到达 redb `set_quick_repair` 由生产调用链静态审查证明；本功能
+//! target 只证明模式切换兼容性，不把运行时间解释为稳定的恢复或提交性能收益。
 //!
 //! 根 WAL 自身的磁盘空间、配额、只读文件系统、设备 I/O、runtime 拒绝或文件大小限制失败属于
 //! `LIMIT-ROOT-WAL-IO-001`，不在当前事务安全保证内，本 target 不注入也不扩大该边界。
@@ -48,13 +55,16 @@ const PHASE_ENV: &str = "PI_DB_KEY_VERSION_BTREE_RESTART_PHASE";
 const ROOT_ENV: &str = "PI_DB_KEY_VERSION_BTREE_RESTART_ROOT";
 const TABLE_NAME: &str = "key_version_btree_restart";
 const UID_FILE: &str = "committed-version-uid";
+const ACCELERATED_UID_FILE: &str = "accelerated-committed-version-uid";
 const TARGET_INDEX: usize = 137;
 const FILLER_KEY_BASE: usize = 10_000;
+const ACCELERATED_FILLER_KEY_BASE: usize = 20_000;
 const FILLER_KEYS: usize = 320;
 const PERSISTED_KEY_BYTES: usize = 4 * 1024;
 const BTREE_WAIT_THRESHOLD: usize = 1024 * 1024;
 const PROCESS_TIMEOUT: Duration = Duration::from_secs(110);
 const SETUP_TIMEOUT: Duration = Duration::from_secs(90);
+const ACCELERATED_TIMEOUT: Duration = Duration::from_secs(45);
 const INSPECTION_TIMEOUT: Duration = Duration::from_secs(30);
 const PERSISTENCE_TIMEOUT: Duration = Duration::from_secs(75);
 
@@ -72,7 +82,7 @@ fn test_key_version_btree_restart_consistency() {
 
     let root = unique_temp_root();
     fs::create_dir_all(&root).expect("creating Btree restart root must succeed");
-    for phase in ["setup", "inspect-data-only"] {
+    for phase in ["setup", "accelerated-reopen-write", "inspect-data-only"] {
         if let Err(error) = run_phase_process(&root, phase, PROCESS_TIMEOUT) {
             panic!(
                 "Btree restart consistency failed in phase {phase}; evidence is preserved at {:?}: {error}",
@@ -91,6 +101,12 @@ fn run_child_phase(phase: &str, root: &Path) -> TestResult<()> {
                 phase_setup(rt, root).await
             })
         },
+        "accelerated-reopen-write" => {
+            let root = root.to_path_buf();
+            run_on_runtime(4, ACCELERATED_TIMEOUT, move |rt| async move {
+                phase_accelerated_reopen_and_write(rt, root).await
+            })
+        },
         "inspect-data-only" => {
             let root = root.to_path_buf();
             run_on_runtime(2, INSPECTION_TIMEOUT, move |rt| async move {
@@ -104,7 +120,8 @@ fn run_child_phase(phase: &str, root: &Path) -> TestResult<()> {
 async fn phase_setup(rt: MultiTaskRuntime<()>, root: PathBuf) -> TestResult<()> {
     let (db, manager, logger) = build_database(&rt,
                                                 &root.join("database"),
-                                                &root.join("root-wal")).await?;
+                                                &root.join("root-wal"),
+                                                false).await?;
     create_btree_table(&db).await?;
 
     let table = Atom::from(TABLE_NAME);
@@ -201,33 +218,146 @@ async fn phase_setup(rt: MultiTaskRuntime<()>, root: PathBuf) -> TestResult<()> 
                          &target_value,
                          &Version::Upsert(transaction_uid.clone()),
                          "post-collector redb").await?;
-    if manager.transaction_len() != 0 {
-        return Err(format!(
-            "Btree setup left {} active transactions",
-            manager.transaction_len(),
-        ));
-    }
+    assert_manager_totals(&manager, 3, "Btree setup")?;
+    expect_eq("Btree setup WAL append count", &logger.append_total_count(), &3usize)?;
+    expect_eq("Btree setup WAL confirm count", &logger.confirm_total_count(), &3usize)?;
+    expect_eq("Btree setup WAL waiting count", &logger.waiting_confirm_count().await, &0usize)?;
 
     fs::write(root.join(UID_FILE), transaction_uid.0.to_le_bytes())
         .map_err(|error| format!("writing committed version UID evidence failed: {error}"))?;
-    Ok(())
+    // 所有数据与根 WAL 已确认后直接结束进程，下一阶段不得依赖 redb、runtime 或 manager 析构。
+    // SAFETY: 这是父测试创建的专用子进程；证据文件已关闭，业务数据和三个根 WAL 均已确认，
+    // 不存在必须由 Rust Drop 才能完成的测试断言，且 `_exit` 正是本专项要模拟的非正常终止边界。
+    unsafe { libc::_exit(0) }
+}
+
+async fn phase_accelerated_reopen_and_write(
+    rt: MultiTaskRuntime<()>,
+    root: PathBuf,
+) -> TestResult<()> {
+    let original_uid = read_uid(&root.join(UID_FILE), "original committed version")?;
+    let (db, manager, logger) = build_database(&rt,
+                                                &root.join("database"),
+                                                &root.join("accelerated-root-wal"),
+                                                true).await?;
+    expect_eq("accelerated reopen table count", &db.table_size().await, &2usize)?;
+
+    let table = Atom::from(TABLE_NAME);
+    let target_key = encode_string(persisted_key(TARGET_INDEX));
+    let baseline_value = encode_usize(0x5a17_0137);
+    let (loaded_value, loaded_version) = db
+        .query_with_version(table.clone(), target_key.clone())
+        .await
+        .map_err(|error| format!("loading accelerated-reopen Btree version failed: {error:?}"))?;
+    expect_binary("accelerated-reopen baseline value",
+                  loaded_value.as_ref(),
+                  Some(&baseline_value))?;
+    let loaded_uid = match &loaded_version {
+        Version::Upsert(uid) => uid,
+        other => {
+            return Err(format!(
+                "accelerated reopen of an existing value must create Upsert evidence, observed {other:?}",
+            ));
+        },
+    };
+    if loaded_uid.0 == original_uid {
+        return Err("accelerated reopen unexpectedly restored the old in-memory version".to_owned());
+    }
+    expect_eq("accelerated pre-write WAL append count", &logger.append_total_count(), &0usize)?;
+    expect_eq("accelerated pre-write WAL confirm count", &logger.confirm_total_count(), &0usize)?;
+    expect_eq("accelerated pre-write WAL waiting count",
+              &logger.waiting_confirm_count().await,
+              &0usize)?;
+
+    let updated_value = encode_usize(0xa551_0137);
+    let transaction = db
+        .transaction(Atom::from("Btree accelerated version writer"), true, 10_000, 10_000)
+        .ok_or_else(|| "database rejected accelerated Btree version writer".to_owned())?;
+    let prepare = transaction
+        .prepare_with_version(
+            vec![TableKeyVersion {
+                table: table.clone(),
+                key: target_key.clone(),
+                version: loaded_version,
+            }],
+            vec![TableKV::new(table.clone(),
+                              target_key.clone(),
+                              Some(updated_value.clone()))],
+        )
+        .await
+        .map_err(|error| format!("preparing accelerated Btree version writer failed: {error:?}"))?;
+    let transaction_uid = transaction
+        .get_transaction_uid()
+        .ok_or_else(|| "accelerated Btree prepare did not allocate a transaction UID".to_owned())?;
+    let receipt = transaction
+        .commit_with_version(prepare)
+        .await
+        .map_err(|error| format!("committing accelerated Btree version writer failed: {error:?}"))?;
+    assert_single_receipt(&receipt, &table, &target_key, &transaction_uid)?;
+    assert_query_version(&db,
+                         &table,
+                         target_key.clone(),
+                         &updated_value,
+                         &Version::Upsert(transaction_uid.clone()),
+                         "accelerated pre-collector overlay").await?;
+
+    rt.timeout(10).await;
+    let filler = db
+        .transaction(Atom::from("Btree accelerated collector trigger"), true, 10_000, 10_000)
+        .ok_or_else(|| "database rejected accelerated Btree collector trigger".to_owned())?;
+    filler
+        .upsert(
+            (0..FILLER_KEYS)
+                .map(|index| {
+                    TableKV::new(
+                        table.clone(),
+                        encode_string(persisted_key(ACCELERATED_FILLER_KEY_BASE + index)),
+                        Some(encode_usize(index + 1)),
+                    )
+                })
+                .collect(),
+        )
+        .await
+        .map_err(|error| format!("writing accelerated Btree collector filler failed: {error:?}"))?;
+    commit_ordinary(&filler, "accelerated Btree collector filler").await?;
+    wait_for_btree_persistence(&rt,
+                               &db,
+                               &logger,
+                               &table,
+                               PERSISTENCE_TIMEOUT).await?;
+    assert_query_version(&db,
+                         &table,
+                         target_key,
+                         &updated_value,
+                         &Version::Upsert(transaction_uid.clone()),
+                         "accelerated post-collector redb").await?;
+    expect_eq("accelerated WAL append count", &logger.append_total_count(), &2usize)?;
+    expect_eq("accelerated WAL confirm count", &logger.confirm_total_count(), &2usize)?;
+    expect_eq("accelerated WAL waiting count",
+              &logger.waiting_confirm_count().await,
+              &0usize)?;
+    assert_manager_totals(&manager, 2, "accelerated Btree write")?;
+
+    fs::write(root.join(ACCELERATED_UID_FILE), transaction_uid.0.to_le_bytes())
+        .map_err(|error| format!("writing accelerated committed UID evidence failed: {error}"))?;
+    // 与 setup 相同，数据确认后直接退出，最终 false 模式冷启动必须独立恢复文件状态。
+    // SAFETY: 当前专用子进程的两个根事务已消费且 WAL 已确认，证据文件已关闭；故意跳过 Drop
+    // 才能验证下一进程不依赖 runtime、manager 或 redb 的正常析构，进程中无其它测试共享状态。
+    unsafe { libc::_exit(0) }
 }
 
 async fn phase_inspect_data_only(rt: MultiTaskRuntime<()>, root: PathBuf) -> TestResult<()> {
-    let uid_bytes = fs::read(root.join(UID_FILE))
-        .map_err(|error| format!("reading committed version UID evidence failed: {error}"))?;
-    let uid_bytes: [u8; 16] = uid_bytes
-        .try_into()
-        .map_err(|bytes: Vec<u8>| format!("committed version UID has {} bytes", bytes.len()))?;
-    let committed_uid = u128::from_le_bytes(uid_bytes);
+    let committed_uid = read_uid(&root.join(ACCELERATED_UID_FILE),
+                                 "accelerated committed version")?;
 
     let (db, manager, logger) = build_database(&rt,
                                                 &root.join("database"),
-                                                &root.join("inspection-empty-wal")).await?;
+                                                &root.join("inspection-empty-wal"),
+                                                false).await?;
     expect_eq("data-only table count", &db.table_size().await, &2usize)?;
     let table = Atom::from(TABLE_NAME);
     let key = encode_string(persisted_key(TARGET_INDEX));
-    let expected_value = encode_usize(0x5a17_0137);
+    let expected_value = encode_usize(0xa551_0137);
     let (value, version) = db
         .query_with_version(table.clone(), key.clone())
         .await
@@ -259,7 +389,7 @@ async fn phase_inspect_data_only(rt: MultiTaskRuntime<()>, root: PathBuf) -> Tes
     expect_eq("data-only WAL append count", &logger.append_total_count(), &0usize)?;
     expect_eq("data-only WAL confirm count", &logger.confirm_total_count(), &0usize)?;
     expect_eq("data-only WAL waiting count", &logger.waiting_confirm_count().await, &0usize)?;
-    expect_eq("data-only active transaction count", &manager.transaction_len(), &0usize)
+    assert_manager_totals(&manager, 0, "data-only Btree inspection")
 }
 
 async fn create_btree_table(db: &RealDb) -> TestResult<()> {
@@ -356,6 +486,7 @@ async fn build_database(
     rt: &MultiTaskRuntime<()>,
     db_path: &Path,
     wal_path: &Path,
+    enable_accelerated_repair: bool,
 ) -> TestResult<(RealDb, Transaction2PcManager<usize, CommitLogger>, CommitLogger)> {
     fs::create_dir_all(wal_path)
         .map_err(|error| format!("creating WAL path {wal_path:?} failed: {error}"))?;
@@ -370,10 +501,35 @@ async fn build_database(
     let db = KVDBManagerBuilder::new(rt.clone(), manager.clone(), db_path)
         .key_version_ttl(Duration::ZERO)
         .key_version_ttl_poll_interval(Duration::ZERO)
-        .startup(false)
+        .startup(enable_accelerated_repair)
         .await
         .map_err(|error| format!("starting database at {db_path:?} failed: {error}"))?;
     Ok((db, manager, logger))
+}
+
+fn read_uid(path: &Path, label: &str) -> TestResult<u128> {
+    let uid_bytes = fs::read(path)
+        .map_err(|error| format!("reading {label} evidence at {path:?} failed: {error}"))?;
+    let uid_bytes: [u8; 16] = uid_bytes
+        .try_into()
+        .map_err(|bytes: Vec<u8>| format!("{label} evidence has {} bytes", bytes.len()))?;
+    Ok(u128::from_le_bytes(uid_bytes))
+}
+
+fn assert_manager_totals(
+    manager: &Transaction2PcManager<usize, CommitLogger>,
+    expected: usize,
+    label: &str,
+) -> TestResult<()> {
+    expect_eq(&format!("{label} active transaction count"),
+              &manager.transaction_len(),
+              &0usize)?;
+    expect_eq(&format!("{label} produced transaction count"),
+              &manager.produced_transaction_total(),
+              &expected)?;
+    expect_eq(&format!("{label} consumed transaction count"),
+              &manager.consumed_transaction_total(),
+              &expected)
 }
 
 fn encode_usize(value: usize) -> Binary {

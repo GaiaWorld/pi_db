@@ -444,17 +444,27 @@ impl<
 > KVDBManagerBuilder<C, Log> {
     /// 启动不带事件回调的数据库。
     ///
-    /// `enable_accelerated_repair` 只传给 Btree 打开/恢复相关路径；无论它为 `false` 还是
-    /// `true`，启动都会执行完整的内部 `try_repair` 根 WAL 扫描，而不是切换成另一套
-    /// `try_quick_repair` 前导日志协议。该开关不改变 Meta、Memory、LogOrdered 或 LogWrite
-    /// 的逻辑数据语义。
+    /// `enable_accelerated_repair` 只传给本次从 Meta 加载以及根 WAL repair-create 的 Btree；
+    /// Btree 保存该值并在后续 redb 写事务中调用 `set_quick_repair`。构建器不会把它保存成
+    /// manager 的全局建表默认值，启动后显式创建 Btree 仍使用对应建表 API 自己的同名参数。
+    /// 无论该值为 `false` 还是 `true`，启动都会执行完整的内部 `try_repair` 根 WAL 扫描，而
+    /// 不是切换成另一套 `try_quick_repair` 前导日志协议；Meta、Memory、LogOrdered 和 LogWrite
+    /// 不使用该开关。
     ///
     /// 成功返回共享的 [`KVDBManager`]。未安装 listener，因此
-    /// [`KVDBManager::report_transaction_info`] 会返回 `ConnectionAborted`。错误保留底层目录、
-    /// 表加载或恢复原因，但启动不具备 rollback/cancellation 原子性，失败前已产生的文件系统
-    /// 副作用不会由本 API 撤销。
+    /// [`KVDBManager::report_transaction_info`] 会返回 `ConnectionAborted`。TTL 校验、目录创建、
+    /// 表名校验、批量装配的显式错误和根 WAL repair 错误通过 [`IOResult`] 返回；其中部分错误会
+    /// 被附加启动上下文。当前并非所有启动失败都能返回 `Err`：Meta/持久表构造及受信元数据解码
+    /// 仍有 panic 分支；批量表任务 panic 或 runtime 拒绝任务时，共享完成值可能永远不被设置，
+    /// 使启动 future 持续等待。这不是最终或最佳错误模型，调用方不能依赖 panic 文本或无限等待
+    /// 作为稳定契约，详见 `FIND-CTOR-001`、`FIND-CODEC-001`。
+    ///
+    /// 启动不具备 rollback/cancellation 原子性，失败前已产生的目录、文件、已注册表或表 collector
+    /// 可能保留；listener、版本 TTL 和 trace 只在表加载及根 WAL repair 成功后启动。
     /// 唯一保证零数据库副作用的配置拒绝是“TTL 非零且轮询间隔为 ZERO”：它在创建数据库目录、
     /// 表、channel 和后台任务前返回 `InvalidInput`。TTL 为 ZERO 时轮询值不生效，ZERO 合法。
+    /// 目录创建自身的错误也会在 manager/表/listener 建立前返回，但调用前已经存在的路径和调用方
+    /// 已构造的根 logger 不属于本 API 的回滚对象。
     ///
     /// 运行时间为 O(t + w)，t 为 Meta 中用户表数，w 为待扫描/重放 WAL 字节数，并包含真实
     /// 异步文件 I/O、同步锁和表引擎打开成本。存在未确认 WAL 时，当前 replay callback 会同步
@@ -478,13 +488,16 @@ impl<
     ///
     /// `db_event_listener=None` 不创建事件通道。传入 `Some` 时，回调被保存到一个长期 runtime
     /// 任务中，并以 `FnMut(&KVDBManager, &Transaction2PcManager, &mut Vec<KVDBEvent>)` 形式同步、
-    /// 串行调用。回调必须在返回前 `drain` 或 `clear` 已处理元素；框架不会清空 Vec。回调阻塞
-    /// 会占用 worker，panic 会终止监听任务；通道无界，生产速度长期超过消费速度会增长内存。
-    /// 回调可以读取共享 manager，但重入异步维护/DDL 时必须自行避免锁顺序问题。
+    /// 串行调用。单批上限是 3072：持续有事件时达到上限立即回调；不足上限时在最多五轮 10ms
+    /// 空闲等待后回调。这个等待是聚合窗口而不是实时交付 SLA。框架跨轮复用同一个 Vec，回调
+    /// 必须在返回前 `drain` 或 `clear` 已处理元素；框架不会清空 Vec。回调阻塞会占用 worker，
+    /// panic 会终止监听任务；通道无界，生产速度长期超过消费速度会增长内存。回调可以读取共享
+    /// manager，但重入异步维护/DDL 时必须自行避免锁顺序问题。
     ///
     /// 返回、错误、副作用、取消安全和复杂度与 [`Self::startup`] 相同。启动过程会分配表注册表、
     /// channel 和表对象并执行文件 I/O；不是幂等的“探测”操作，也不保证多个进程或 manager
-    /// 可以同时打开同一路径。真实 listener 契约由 `tests/manager_contract.rs` 验证。
+    /// 可以同时打开同一路径。基础管理行为由 `tests/manager_contract.rs` 验证，正常批处理和真实
+    /// collector 事件由 `tests/manager_listener_contract.rs` 验证。
     pub async fn startup_with_listener<F>(
         self,
         enable_accelerated_repair: bool,
@@ -536,7 +549,8 @@ impl<
         };
         let db_mgr = KVDBManager(Arc::new(inner));
 
-        //加载并注册元信息表
+        // 加载并注册元信息表。MetaTable::new 当前没有 Result 通道，底层日志 open/load 失败会
+        // panic，而不是沿 startup 的 IOResult 返回；这是 FIND-CTOR-001 的非最终错误边界。
         let meta_table_name = Atom::from(DEFAULT_DB_TABLES_META_DIR);
         let meta_table: MetaTable<C, Log> =
             MetaTable::new(db_mgr.0.rt.clone(),
@@ -596,6 +610,9 @@ impl<
                 //忽略元信息表
                 continue;
             }
+            // Meta value 来自持久化受信编码；当前无错误 decoder 对截断/非法判别值可能 panic。
+            // 不得把前面的表名 InvalidData 分支外推成“所有损坏 Meta 都返回 Err”，见
+            // FIND-CODEC-001。
             let table_meta = KVTableMeta::from(value);
 
             let table_options = match table_meta.table_type() {
@@ -810,7 +827,8 @@ impl<
     ///
     /// 返回值与 `self` 生命周期相同，是构建时路径的词法副本，不保证 canonical、存在、可写，
     /// 也不表示 commit logger 的 WAL 路径。O(1)、纯只读、无分配、无锁和无 I/O；所有 clone
-    /// 返回相同路径内容。
+    /// 返回相同路径内容。该借用不读取数据库状态，调用 [`Self::close`] 后只要 manager owner
+    /// 仍存活就继续有效。
     pub fn db_path(&self) -> &Path {
         &self.0.db_path
     }
@@ -818,7 +836,7 @@ impl<
     /// 借用内部 Meta 表目录。
     ///
     /// 路径固定为 `db_path/.tables_meta`，启动成功时应已存在；它是 Meta 表数据目录，不是
-    /// 根 WAL 目录。返回借用不转移所有权，O(1)、无锁、无分配和无 I/O。
+    /// 根 WAL 目录。返回借用不转移所有权，O(1)、无锁、无分配和无 I/O；软关闭不改变路径。
     pub fn tables_meta_path(&self) -> &Path {
         &self.0.tables_meta_path
     }
@@ -826,27 +844,37 @@ impl<
     /// 借用持久化用户表的父目录。
     ///
     /// 路径固定为 `db_path/.tables`。Memory 表即使 `persistence=true` 也没有该目录下的数据
-    /// 文件；该标志只使动作进入根 WAL。返回借用为 O(1)、只读、无锁、无分配和无 I/O。
+    /// 文件；该标志只使动作进入根 WAL。返回借用为 O(1)、只读、无锁、无分配和无 I/O；
+    /// 软关闭不改变路径。
     pub fn tables_path(&self) -> &Path {
         &self.0.tables_path
     }
 
     /// 创建尚未注册到两阶段管理器的根事务句柄。
     ///
-    /// `source` 被事务持有并用于 UID/统计/事件；`is_writable` 决定 prepare/commit 主路径，
-    /// 但当前动作 API 没有统一拒绝只读写入，只读写可能先返回成功、随后在 prepare 快路中
-    /// 被静默丢弃。这是 `FIND-TR-001` 的当前实现事实，不是最终或最佳只读契约。
-    /// `prepare_timeout` 和 `commit_timeout` 仅保存并传给子事务，当前没有计时、取消或错误路径，
-    /// 见 `FIND-TIMEOUT-001`；`0` 也不会被本函数拒绝。
+    /// `source` 是事务来源标签，会原样传给全部子事务，并供 `Transaction2PcManager` 的来源
+    /// 计数/限流以及表级诊断和事件使用；它不参与 TID/CID 生成，事务身份只在后续 `start`
+    /// 中由 `GuidGen` 分配。当前上游来源计数的严格并发线性化尚未验收，见
+    /// `FIND-TR-SOURCE-001`，因此不能把本函数保存标签解释为并发限流已经形成强保证。
+    ///
+    /// `is_writable` 决定 prepare/commit 主路径，但当前动作 API 没有统一拒绝只读写入，只读写
+    /// 可能先返回成功、随后在 prepare 快路中被静默丢弃。这是 `FIND-TR-001` 的当前实现事实，
+    /// 不是最终或最佳只读契约。`prepare_timeout` 和 `commit_timeout` 仅按原始 `u64` 保存并传给
+    /// 子事务，当前没有计时、取消或错误路径，见 `FIND-TIMEOUT-001`；`0` 和 `u64::MAX` 都不会
+    /// 被本函数拒绝或归一化。
     ///
     /// 数据库状态为初始化中或已初始化时返回 `Some(RootTr)`；调用 [`Self::close`] 后返回
-    /// `None`。创建本身不会分配事务 UID、注册 active transaction 或写 WAL，这些发生在
-    /// [`KVDBTransaction::prepare_modified`]。在 close 前已经创建的句柄当前仍可继续 prepare/
-    /// commit，这是软关闭边界而不是 graceful shutdown 保证。
+    /// `None`。创建本身不会分配事务 UID、注册 active transaction 或写 WAL；普通
+    /// [`KVDBTransaction::prepare_modified`] / [`KVDBTransaction::prepare_modified_conflicts`]
+    /// 或版本 [`KVDBTransaction::prepare_with_version`] 才按各自协议进入首次 start/prepare。
+    /// 在 close 前已经创建的句柄当前仍可继续 prepare/commit，这是软关闭边界而不是
+    /// graceful shutdown 保证。
     ///
     /// 根事务是否需要持久化由实际触达且需要持久化的写子事务决定。函数为摊销 O(1)，会分配
     /// Arc 和空的子事务 map/list，不执行文件 I/O、不 await；句柄反向持有 manager clone，因而
     /// 会延长数据库对象生命周期，但没有从 manager 指回该事务的环，直到 prepare 注册为止。
+    /// 完整构造、共享 owner、子节点继承、登记和性能契约见
+    /// `docs/ROOT_TRANSACTION_CONSTRUCTION_ACCEPTANCE.md#root-transaction-construction-index`。
     pub fn transaction(&self,
                        source: Atom,
                        is_writable: bool,
@@ -915,8 +943,10 @@ impl<
     /// 若两阶段管理器当前没有已注册事务，状态直接设为 Closed；否则设为 Closing。所有 clone
     /// 立即观察同一关闭结果，重复调用不会重新开放数据库。调用无返回值，不等待活跃事务、
     /// 子表异步持久化、根 WAL 确认、collector/listener 退出或文件句柄释放，也不取消 close 前
-    /// 已创建但尚未 prepare 的事务句柄。最后一个 active transaction 完成后当前没有自动把
-    /// Closing 推进为 Closed；再次调用本方法才会重写状态。
+    /// 已创建但尚未 prepare 的事务句柄。close 前已经进入 Prepared 的普通/版本事务仍可提交；
+    /// close 前已经进入可恢复失败状态的普通事务仍可 rollback；这些终结路径会正常注销事务，
+    /// 需要根 WAL 的提交也仍按原确认链推进。最后一个 active transaction 完成后当前没有自动
+    /// 把 Closing 推进为 Closed；再次调用本方法才会重写状态。
     ///
     /// 这是 `Q-CLOSE-001` / `FIND-CLOSE-001` 记录的当前实现，不是最终或最佳 shutdown API。
     /// 操作为 O(1)，读取事务 registry 长度并原子写状态，不执行文件 I/O、不 await、不调用
@@ -1022,7 +1052,9 @@ impl<
     /// 判断表名当前是否注册。
     ///
     /// `table_name` 不会被保存；内部 `.tables_meta` 也计为存在。结果是调用时 registry 状态，
-    /// 不是事务快照，返回后可立即因 DDL 改变。平均 O(1)，获取一次异步读锁，无文件 I/O。
+    /// 不是事务快照，返回后可立即因 DDL 改变。查询不执行表名长度/路径校验，任何未注册名称
+    /// 都返回 `false`；也不检查 manager 状态，Closing/Closed 后仍可读取 registry。平均 O(1)，
+    /// 获取一次异步读锁，无文件 I/O。
     pub async fn is_exist(&self, table_name: &Atom) -> bool {
         self.0.tables.read().await.contains_key(table_name)
     }
@@ -1030,7 +1062,8 @@ impl<
     /// 返回当前 registry 条目数。
     ///
     /// 数量包含内部 `.tables_meta`，不只包含用户表；是瞬时值而非跨调用稳定快照。平均 O(1)，
-    /// 获取一次异步读锁，无分配和文件 I/O。
+    /// 获取一次异步读锁，无分配和文件 I/O。调用不检查 manager 状态，Closing/Closed 后仍
+    /// 返回当前 registry 条目数。
     pub async fn table_size(&self) -> usize {
         self.0.tables.read().await.len()
     }
@@ -1039,7 +1072,8 @@ impl<
     ///
     /// 返回列表包含内部 `.tables_meta`，顺序来自 hash map，未排序且不稳定。每个 [`Atom`] clone
     /// 保持名称有效，但不保持表仍注册；调用方需要稳定顺序时必须自行排序。O(n) 时间和 O(n)
-    /// 新空间，迭代期间持异步 registry 读锁，不执行文件 I/O。
+    /// 新空间，迭代期间持异步 registry 读锁，不执行文件 I/O。一次调用得到的是同一读临界区
+    /// 内的完整名称集合；它不检查 manager 状态，Closing/Closed 后仍可调用。
     pub async fn tables(&self) -> Vec<Atom> {
         let mut table_names = Vec::new();
         for key in self.0.tables.read().await.keys() {
@@ -1058,7 +1092,8 @@ impl<
     /// 统一当作目录执行操作。
     ///
     /// 返回路径不保证 canonical、当前存在或可访问。平均 O(1) 查找加 O(p) 路径复制，短暂持
-    /// registry 读锁，不访问文件系统。
+    /// registry 读锁，不访问文件系统。查询不校验名称；未注册名称返回 `None`。它不检查
+    /// manager 状态，Closing/Closed 后仍可读取当前 registry。
     pub async fn table_path(&self, table_name: &Atom) -> Option<PathBuf> {
         match self.0.tables.read().await.get(table_name).map(|registered| &registered.table) {
             None => None,
@@ -1105,6 +1140,7 @@ impl<
     /// 缺表返回 `None`；存在时返回 `Some`。Meta、LogOrdered、LogWrite、Btree 当前总为
     /// `Some(true)`；Memory 返回建表元信息中的标志。Memory 的 `true` 仅表示动作进入根 WAL，
     /// 不会创建数据文件。结果是表实例属性，不表示当前事务已有待持久化动作或最终确认完成。
+    /// 查询不校验名称或 manager 状态；未注册名称返回 `None`，Closing/Closed 后仍可读取。
     /// 平均 O(1)，短暂持 registry 读锁，无分配和文件 I/O。
     pub async fn is_persistent_table(&self, table_name: &Atom) -> Option<bool> {
         match self.0.tables.read().await.get(table_name).map(|registered| &registered.table) {
@@ -1131,7 +1167,8 @@ impl<
     ///
     /// 缺表返回 `None`。当前五种内部/用户表都返回 `Some(true)`，包括只写语义的 LogWrite；
     /// 该布尔值不能推导某表支持 query/delete/stream 的完整能力。平均 O(1)，短暂持 registry
-    /// 读锁，无分配和文件 I/O。
+    /// 读锁，无分配和文件 I/O。查询不校验名称或 manager 状态；未注册名称返回 `None`，
+    /// Closing/Closed 后仍可读取。
     pub async fn is_ordered_table(&self, table_name: &Atom) -> Option<bool> {
         match self.0.tables.read().await.get(table_name).map(|registered| &registered.table) {
             None => None,
@@ -1162,7 +1199,8 @@ impl<
     ///
     /// 调用持 registry 异步读锁并进入表内同步锁；Btree 还可能在 runtime worker 上执行同步
     /// 文件支持读取，复杂度约 O(c log d)，c 为 cache key 数、d 为 redb 记录数。其它表通常
-    /// 为 O(1)。结果是调用时观察值，不与外部事务建立原子快照。
+    /// 为 O(1)。结果是调用时观察值，不与外部事务建立原子快照。查询不校验名称或 manager
+    /// 状态；未注册名称返回 `None`，Closing/Closed 后仍可读取。
     pub async fn table_record_size(&self, table_name: &Atom) -> Option<usize> {
         match self.0.tables.read().await.get(table_name).map(|registered| &registered.table) {
             None => None,
@@ -1191,7 +1229,8 @@ impl<
     /// 文件或后台任务开销，不能当作进程 RSS。Btree 只统计只写 cache，不统计 redb 数据。
     ///
     /// 调用短暂持 registry 异步读锁和表内同步锁，通常 O(1)、无文件 I/O；并发写入后返回值
-    /// 只代表本次读取时刻，不是事务快照。
+    /// 只代表本次读取时刻，不是事务快照。查询不校验名称或 manager 状态；未注册名称返回
+    /// `None`，Closing/Closed 后仍可读取。
     pub async fn table_cache_size(&self, table_name: &Atom) -> Option<u64> {
         match self.0.tables.read().await.get(table_name).map(|registered| &registered.table) {
             None => None,
@@ -1348,7 +1387,8 @@ impl<
     ///
     /// 发送为异步安全且允许多线程并发，但通道无背压，持续调用可能增长内存。该 API 不持表
     /// registry 锁、不执行文件 I/O、不等待用户回调，也不保证事件相对 collector 通知的全局
-    /// 顺序。真实投递由 `tests/manager_contract.rs` 验证。
+    /// 顺序。基础投递由 `tests/manager_contract.rs` 验证，3072 边界和真实 collector payload
+    /// 由 `tests/manager_listener_contract.rs` 验证。
     pub async fn report_transaction_info(&self) -> IOResult<()> {
         if let Some(notifier) = self.0.notifier.as_ref() {
             if let Err(e) = notifier.send(KVDBEvent::ReportTrInfo).await {
@@ -1662,10 +1702,15 @@ fn install_registered_table<
 /// `pi_async_transaction` 遍历事务树。许多公开 wrapper 在子表 variant 上会 panic，这些
 /// variant 公开可构造并不代表它们属于合法应用调用域。
 ///
-/// clone 为共享句柄 clone，不复制事务快照或状态。类型可在线程间移动/共享以支持 runtime
-/// 调度，但同一逻辑事务上的并发动作、prepare/commit/rollback 越序调用不提供可串行化保证；
-/// 当前状态防线不足见 `FIND-TR-002`。真实根生命周期见
-/// `tests/root_transaction_lifecycle.rs`。
+/// clone 为共享句柄 clone，不复制事务快照或状态；从任一 clone 创建的子事务、分配的 TID/CID
+/// 和状态转换会被其它 clone 观察到。根节点在 trait 视图中是 `Safe` QoS 的事务树，不是 unit
+/// 或 sequence；表子节点是由根拥有的 unit。根和内置子节点都选择串行
+/// prepare/commit/rollback，顺序由 [`KVDBChildTrList`] 固定。
+///
+/// 类型可在线程间移动/共享以支持 runtime 调度，但同一逻辑事务上的并发动作、
+/// prepare/commit/rollback 越序调用不提供可串行化保证；当前状态防线不足见 `FIND-TR-002`。
+/// 真实根生命周期见 `tests/root_transaction_lifecycle.rs`，构造、clone、子节点继承和单根登记
+/// 契约见 `tests/root_transaction_construction.rs`。
 #[derive(Clone)]
 pub enum KVDBTransaction<
     C: Clone + Send + 'static,
@@ -3135,9 +3180,16 @@ impl<
     }
 }
 
+/// 根事务拥有的有序子事务快照。
 ///
-/// 键值对数据库的根事务的子事务列表
+/// 根在每张表首次产生需要参加 2PC 的动作时，把该表唯一子事务追加到列表；顺序是首次触表
+/// 顺序，不是表名或表类型顺序。同表后续动作复用既有 owner，不重复追加。公开调用方通常只会
+/// 通过 [`TransactionTree::to_children`] 取得本类型，不能直接构造或修改根列表。
 ///
+/// clone 会复制 `VecDeque` 并克隆其中的共享事务句柄，时间和新增空间为 O(n)；所得对象是取得
+/// 时的节点集合快照，后续根新增子事务不会出现在旧 clone 中。`Iterator::next` 只从该快照头部
+/// O(1) 弹出一个句柄，不会删除根中的节点或改变 2PC 顺序。持有快照会延长其中子事务及其表
+/// 快照的生命周期，但不会创建新的逻辑事务或 manager 登记。
 #[derive(Clone)]
 pub struct KVDBChildTrList<
     C: Clone + Send + 'static,
@@ -3159,19 +3211,19 @@ impl<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>,
 > KVDBChildTrList<C, Log> {
-    /// 构建一个键值对数据库的根事务的子事务列表
+    /// 构建空的根子事务列表，不分配子节点或登记 manager。
     #[inline]
     pub(crate) fn new() -> Self {
         KVDBChildTrList(VecDeque::default())
     }
 
-    /// 获取子事务的数量
+    /// 获取当前列表快照中的子事务数量。
     #[inline]
     pub(crate) fn len(&self) -> usize {
         self.0.len()
     }
 
-    /// 加入一个指定的子事务
+    /// 把共享子事务句柄追加到尾部并返回追加后的数量。
     #[inline]
     pub(crate) fn join(&mut self, tr: KVDBTransaction<C, Log>) -> usize {
         self.0.push_back(tr);
@@ -3190,6 +3242,13 @@ impl<
 /// 应用通常不直接构造或匹配本类型，而通过 [`KVDBTransaction::RootTr`] 使用。clone 共享同一
 /// 状态机和子事务，不创建独立事务。根持有 manager，prepare 后 manager registry 又持有根；
 /// 正常 commit/rollback 的 `finish` 会解除 registry 边，非法/取消流程可能延长生命周期。
+///
+/// [`KVDBManager::transaction`] 返回时，本节点是 `Start`、没有 TID/CID、没有子节点且尚未向
+/// manager 登记；创建本身不执行 WAL、表 I/O 或异步调度。首次 prepare 调用上游 `start` 后，
+/// manager 只登记这个外层根，并把同一个 TID 发布给当时整棵 owned tree；根需要 WAL 时再把
+/// 同一个 CID 发布给全部节点。根的 `persistence` 只聚合“是否写根 WAL”，不表示根拥有数据
+/// 文件。完整证据见
+/// `docs/ROOT_TRANSACTION_CONSTRUCTION_ACCEPTANCE.md#root-transaction-construction-index`。
 #[derive(Clone)]
 pub struct RootTransaction<
     C: Clone + Send + 'static,
@@ -3946,7 +4005,13 @@ impl<
         }
     }
 
-    /// 异步创建表，表名可以是用文件分隔符分隔的路径，但必须是相对路径，且不允许使用".."
+    /// 异步创建表。
+    ///
+    /// 当前实现只校验表名 UTF-8 字节长度为 `1..=4096`，不会拒绝绝对路径、`.`、`..`、平台
+    /// 分隔符、Windows 特殊名称或 symlink 别名；持久表随后直接执行
+    /// `tables_path.join(name)`。调用方必须按可信相对逻辑名称使用，数据库尚不提供路径
+    /// containment 保证。该现状不是最终/最佳设计，见
+    /// `docs/SEMANTIC_CONTRACTS.md#q-path-001` 和 `FIND-PATH-001`。
     #[inline]
     async fn create_table_with_options(&self,
                                        name: Atom,
@@ -4322,7 +4387,10 @@ impl<
             }
         }
 
-        //并发创建待创建的表
+        // 并发创建待创建的表。当前每个任务只有在正常返回时才递减 count；spawn 返回值被忽略，
+        // 表构造 panic 或 runtime 拒绝任务时 result 可能永远不完成，调用方会持续等待。这是
+        // FIND-CTOR-001/FIND-SPAWN-001 已归档的非最终启动错误边界，不能误读为 IOResult 已覆盖
+        // 所有表加载失败。
         let result = AsyncValue::new();
         let count = Arc::new(AtomicU64::new(require_create_tables.len() as u64));
         for (name, meta, options) in require_create_tables.clone() {
@@ -6094,26 +6162,40 @@ struct VersionPrepareGroup<
     has_write: bool,
 }
 
+/// 根事务共享状态。
 ///
-/// 内部键值对数据库的根事务
-///
+/// 所有字段都随 [`KVDBManager::transaction`] 一次性构造。同步锁只保护短内存状态，不能替代
+/// 外部对单次 prepare/commit/rollback 和非并发生命周期调用的协议保证。
 struct InnerRootTransaction<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>,
 > {
-    source:             Atom,                                               //事件源
-    tid:                SpinLock<Option<Guid>>,                             //事务唯一id
-    cid:                SpinLock<Option<Guid>>,                             //事务提交唯一id
-    status:             SpinLock<Transaction2PcStatus>,                     //事务状态
-    writable:           bool,                                               //事务是否可写
-    protocol:           AtomicU8,                                           //根业务协议，SchemaCreate 不单独选择模式
-    persistence:        AtomicBool,                                         //事务是否持久化
-    prepare_timeout:    u64,                                                //事务预提交超时时长，单位毫秒
-    commit_timeout:     u64,                                                //事务提交超时时长，单位毫秒
-    childs_map:         SpinLock<XHashMap<Atom, KVDBTransaction<C, Log>>>,  //子事务表
-    childs:             SpinLock<KVDBChildTrList<C, Log>>,                  //子事务列表
-    db_mgr:             KVDBManager<C, Log>,                                //键值对数据库管理器
-    version_context:    SpinLock<Option<RootVersionContext>>,               //版本协议表身份和提交回执
+    /// 原样继承到子事务的来源标签；参与来源计数/限流、诊断和事件，不参与 UID 生成。
+    source:             Atom,
+    /// 上游 `start` 为外层根生成并递归发布给全部 owned 子节点的事务 ID。
+    tid:                SpinLock<Option<Guid>>,
+    /// 需要根 WAL 时在 prepare 前生成并递归发布的提交确认占位 ID。
+    cid:                SpinLock<Option<Guid>>,
+    /// 共享 2PC 状态；锁保证内存安全，不允许并发或重复生命周期调用。
+    status:             SpinLock<Transaction2PcStatus>,
+    /// 创建时固定的读写能力；当前动作入口仍有 `FIND-TR-001` 所述只读写入缺口。
+    writable:           bool,
+    /// 原子 `Unselected/Ordinary/Versioned` 业务协议；SchemaCreate 不增加第四种根模式。
+    protocol:           AtomicU8,
+    /// 整棵事务树是否写根 WAL 的权威聚合位，不表示存在根数据文件。
+    persistence:        AtomicBool,
+    /// 原样传给子节点但当前不执行计时的 prepare timeout。
+    prepare_timeout:    u64,
+    /// 原样传给子节点但当前不执行计时的 commit timeout。
+    commit_timeout:     u64,
+    /// 按表名保存每表唯一 2PC owner；与 `childs` 的固定锁序是 map -> list。
+    childs_map:         SpinLock<XHashMap<Atom, KVDBTransaction<C, Log>>>,
+    /// 按首次触表顺序保存 manager 遍历的 owned 子节点。
+    childs:             SpinLock<KVDBChildTrList<C, Log>>,
+    /// 反向持有数据库 manager，保证事务使用期间表注册表、runtime 和 2PC manager 存活。
+    db_mgr:             KVDBManager<C, Log>,
+    /// 仅版本协议安装的表身份、预期写集合和提交回执 owner。
+    version_context:    SpinLock<Option<RootVersionContext>>,
 }
 
 /// trace 构建以最终 owner 析构作为事务对象关闭的唯一观测点。

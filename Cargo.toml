@@ -1,6 +1,6 @@
 [package]
 name = "pi_db"
-version = "0.19.8"
+version = "0.19.9"
 authors = ["vmos <vmosone007@gmail.com>"]
 edition = "2021"
 description = "Full cache based database，support transaction"
@@ -11,6 +11,8 @@ keywords = ["pi", "database", "transaction"]
 [features]
 default = []
 trace = ["opentelemetry", "pi_logger"]
+# 历史 LogOrdered 事务诊断埋点；不是 tools 子库，也不是完整事务树观测能力。
+# 当前仅保留兼容并暂停演进，真实边界见 docs/TRANSACTION_DEBUG_LOGGER_BOUNDARY.md。
 log_table_debug = []
 
 [dependencies]

@@ -1,8 +1,14 @@
 //! 根提交日志与单个日志表的同步拉取式诊断读取器。
 //!
-//! inspector 在 `MultiTaskRuntime` 上异步 replay，但 `new`/`next` 通过有界通道同步等待；它们
-//! 是运维与离线诊断工具，不应放在数据库事务热路径或不能阻塞的 runtime owner 线程中。
-//! 解析器信任日志由当前 `pi_db` 版本生成，不能把任意不可信字节作为输入。
+//! inspector 在 `MultiTaskRuntime` 上异步 replay/load，但 `new`/`next` 通过有界通道同步等待；
+//! 它们是专用、离线、单消费者、单实例一次性使用的诊断工具，不应与在线数据库共享 logger，
+//! 也不应放在事务热路径或不能阻塞的 runtime owner 线程中。解析器信任日志由当前 `pi_db`
+//! 版本生成，不能把任意不可信字节作为输入。
+//!
+//! “诊断读取”只表示不修改数据库表数据、不执行 repair。`CommitLogInspector` 使用
+//! `start_replay*` 建立稳定遍历边界，底层可以分裂 WAL、调整检查点或把空日志标记为 `.bak`；
+//! `LogTableInspector::new` 使用 `LogFile::open`，也可能创建初始日志或整理目录。调用方必须在
+//! 已停止生产访问的专用目录/logger 上使用，并允许检查完成后直接结束 runtime/进程。
 
 use std::fmt::Debug;
 use std::convert::TryInto;
@@ -30,7 +36,7 @@ use crate::{KVTableMeta,
 /// [`Self::begin`] 与 [`Self::next`] 组成单消费者 pull 协议；
 /// [`Self::begin_with_callback`] 是互斥的 callback 协议。实例用原子状态禁止两种协议同时
 ///启动，但不保证多个线程并发调用 `next` 时响应归属稳定，因此每次检查只应有一个消费者。
-/// inspector 不修改 WAL 的确认、`.bak`、repair 或数据库数据状态。
+/// 每次检查必须使用新实例；底层 replay 的文件与检查点副作用见模块级说明。
 pub struct CommitLogInspector {
     rt:                 MultiTaskRuntime<()>,                                           //运行时
     logger:             CommitLogger,                                                   //提交日志
@@ -52,7 +58,8 @@ impl CommitLogInspector {
     /// 构造一个尚未开始 replay 的根提交日志 inspector。
     ///
     /// O(1)，只 clone logger/runtime 并创建容量为 1 的请求/响应通道，不读取文件。logger 和
-    /// runtime 必须在后续整个检查期间保持可用；共享句柄由本实例持有。
+    /// runtime 必须在后续整个检查期间保持可用；共享句柄由本实例持有。该 logger 必须属于
+    /// 已停止生产访问的离线诊断上下文，不能与数据库提交、确认或 collector 并发使用。
     pub fn new(rt: MultiTaskRuntime<()>, logger: CommitLogger) -> Self {
         let (request_sender, request_receiver) = bounded(1);
         let (response_sender, response_receiver) = bounded(1);
@@ -72,8 +79,10 @@ impl CommitLogInspector {
     ///
     /// 返回 `false` 表示本实例已有进行中的 pull 或 callback replay；返回 `true` 仅表示状态已
     /// 切换且任务已提交，不表示 WAL 已成功打开、解析或读取。每个动作都会等待一次
-    /// [`Self::next`] 请求，消费者停止调用会让 replay 任务停在通道等待处。底层 replay 错误
-    /// 当前不会通过本 API 返回；截断或格式不匹配的 prepare buffer 可能 panic。
+    /// [`Self::next`] 请求，消费者停止调用会让 replay 任务停在通道等待处。`start_replay`
+    /// 的正常成功或错误返回都会先配对 `finish_replay`，再发布结束状态；底层错误仅写日志，
+    /// 当前不会通过本 API 返回。截断或格式不匹配的 prepare buffer 可能 panic；panic 或
+    /// runtime 被终止不属于正常返回，离线调用方应直接废弃该 Inspector 和 runtime。
     pub fn begin(&self) -> bool {
         match self.status.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed) {
             Err(_) => {
@@ -189,7 +198,18 @@ impl CommitLogInspector {
         let request_receiver = self.request_receiver.clone();
         let response_sender = self.response_sender.clone();
         let _ = self.rt.spawn(async move {
-            let _ = logger.start_replay(Arc::new(inspect_callback)).await;
+            let replay_result = logger.start_replay(Arc::new(inspect_callback)).await;
+            // start_replay 在检查空 WAL 和任何后续错误前已经设置 replay 状态。无论正常结果
+            // 是 Ok 还是 Err，都必须执行 finish_replay；否则 collector 会持续跳过工作，
+            // 后续 confirm 也只会进入 replay 缓冲。finish 可能应用离线检查期间意外到达的
+            // confirm，因此本工具禁止与在线数据库共享 logger。
+            let finish_result = logger.finish_replay().await;
+            if let Err(e) = replay_result {
+                log::error!("Inspect commit log replay failed, reason: {:?}", e);
+            }
+            if let Err(e) = finish_result {
+                log::error!("Finish inspected commit log replay failed, reason: {:?}", e);
+            }
 
             //侦听已结束
             let _ = status.compare_exchange(1,
@@ -251,8 +271,10 @@ impl CommitLogInspector {
     /// callback 在 runtime replay 任务中同步执行；每条记录依次收到
     /// `(tid, cid, table, method, timestamp, key, value)`，结束时收到一次 `None`。长时间阻塞、
     /// panic 或重入 callback 会直接影响 replay 任务，调用方必须自行把重工作转交其它执行器。
-    /// 返回 `false` 表示已有检查正在进行；`true` 只表示任务已提交，底层 replay 错误当前不
-    /// 向调用方回传。本模式不与 [`Self::next`] 联用。
+    /// 返回 `false` 表示已有检查正在进行；`true` 只表示任务已提交。正常 `Ok/Err` replay
+    /// 返回后都会先执行 `finish_replay`，随后才把状态切为结束并回调一次 `None`；`None`
+    /// 表示生命周期已闭合，不表示 replay 一定成功，底层错误当前只写日志。本模式不与
+    /// [`Self::next`] 联用。
     pub fn begin_with_callback(&self,
                                callback: impl Fn(Option<(Guid, Guid, String, LogMethod, u64, Vec<u8>, Vec<u8>)>) + Send + Sync + 'static)
         -> bool
@@ -268,6 +290,8 @@ impl CommitLogInspector {
             },
         }
 
+        let callback = Arc::new(callback);
+        let callback_for_replay = callback.clone();
         let inspect_callback = move |response: Option<(Guid, LogMethod, u64, Vec<u8>)>| -> Result<()>
             {
                 let (commit_uid,
@@ -277,8 +301,8 @@ impl CommitLogInspector {
                 {
                     response
                 } else {
-                    //侦听已完成
-                    callback(None);
+                    // pi_store 的 None 只表示 WAL load 已结束；CommitLogger 仍处于 replay
+                    // 状态。公开完成通知必须延迟到外层 finish_replay 成功尝试之后。
                     return Ok(());
                 };
 
@@ -327,7 +351,7 @@ impl CommitLogInspector {
                                                      time,
                                                      table_name.as_str().as_bytes().to_vec(),
                                                      format!("{:?}", table_meta).as_bytes().to_vec()));
-                                callback(response);
+                                callback_for_replay(response);
                             } else {
                                 //无值，则删除表
                                 let table_name = Atom::from(write.key.as_ref());
@@ -340,7 +364,7 @@ impl CommitLogInspector {
                                                      time,
                                                      table_name.as_str().as_bytes().to_vec(),
                                                      vec![0]));
-                                callback(response);
+                                callback_for_replay(response);
                             }
                         }
                     } else {
@@ -355,7 +379,7 @@ impl CommitLogInspector {
                                                      time,
                                                      write.key.as_ref().to_vec(),
                                                      write.value.unwrap().as_ref().to_vec()));
-                                callback(response);
+                                callback_for_replay(response);
                             } else {
                                 //无值，则回调用户表的删除日志
                                 let response = Some((transaciton_uid.clone(),
@@ -365,7 +389,7 @@ impl CommitLogInspector {
                                                      time,
                                                      write.key.as_ref().to_vec(),
                                                      vec![0]));
-                                callback(response);
+                                callback_for_replay(response);
                             }
                         }
                     }
@@ -379,14 +403,25 @@ impl CommitLogInspector {
 
         let logger = self.logger.clone();
         let status = self.status.clone();
+        let callback_for_completion = callback;
         let _ = self.rt.spawn(async move {
-            let _ = logger.start_replay_ext(Arc::new(inspect_callback)).await;
+            let replay_result = logger.start_replay_ext(Arc::new(inspect_callback)).await;
+            // 与 pull 模式相同，空 WAL 和错误返回也必须闭合 replay 状态；公开 None 不能早于
+            // finish，否则调用方可能在 logger 仍缓冲 confirm 时误判检查已经完成。
+            let finish_result = logger.finish_replay().await;
+            if let Err(e) = replay_result {
+                log::error!("Inspect commit log replay with callback failed, reason: {:?}", e);
+            }
+            if let Err(e) = finish_result {
+                log::error!("Finish inspected commit log replay with callback failed, reason: {:?}", e);
+            }
 
             //侦听已结束
             let _ = status.compare_exchange(1,
                                             0,
                                             Ordering::Acquire,
                                             Ordering::Relaxed);
+            callback_for_completion(None);
         });
 
         true
@@ -395,8 +430,10 @@ impl CommitLogInspector {
 
 /// 逐项检查单个 LogOrdered/日志格式表目录的 pull 式读取器。
 ///
-/// 该工具读取日志记录而不修改表，不建立事务快照，也不提供数据库查询语义。调用方必须按
-/// `new -> begin -> next* -> None` 使用，并保持单消费者。
+/// 该工具读取日志记录而不修改数据库表，不建立事务快照，也不提供数据库查询语义。构造时
+/// 使用的 `LogFile::open` 可能创建初始日志、清理非日志文件或调整 `.bak` 文件拓扑，因此
+/// “读取”不等于物理目录严格只读；只能对已停止生产访问的专用离线目录使用。调用方必须按
+/// `new -> begin -> next* -> None` 使用并保持单消费者，每次检查创建新实例。
 pub struct LogTableInspector {
     rt:                 MultiTaskRuntime<()>,                               //运行时
     log_file:           LogFile,                                            //日志文件
@@ -417,8 +454,9 @@ impl LogTableInspector {
     /// 打开指定表目录并构造尚未开始加载的 inspector。
     ///
     /// 文件打开在 `rt` 上异步执行，但本函数同步等待有界通道，因此可能阻塞当前 OS 线程。
-    /// 打开或通道失败返回 `io::ErrorKind::Other`；成功不表示日志内容已完整校验。不要在无法
-    /// 继续调度打开任务的 runtime owner 线程中调用。
+    /// 打开或通道失败返回 `io::ErrorKind::Other`；成功不表示日志内容已完整校验。底层 open
+    /// 具有模块级说明中的目录维护副作用，不得指向在线表目录。不要在无法继续调度打开任务的
+    /// runtime owner 线程中调用。
     pub fn new<P: AsRef<Path> + Debug + Clone + Send + Sync + 'static>(rt: MultiTaskRuntime<()>,
                                                                        table_path: P) -> Result<Self> {
         let rt_copy = rt.clone();

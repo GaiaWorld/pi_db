@@ -1004,6 +1004,11 @@ impl<
                 }
                 #[cfg(feature = "log_table_debug")]
                 {
+                    // FIND-DEBUG-001：End 位于根 WAL 最终确认任务中，覆盖所有进入本分支的
+                    // 持久事务；但 Begin/Commit/CommitConfirm 目前只由 LogOrdered 子表发送。
+                    // 因此非 LogOrdered 或多 LogOrdered 事务可能产生无 Begin 或重复 Begin 的
+                    // 诊断序列。该历史 feature 已暂挂，不能把日志解释为完整事务状态机证据。
+                    // 详见 docs/TRANSACTION_DEBUG_LOGGER_BOUNDARY.md。
                     let event = TransactionDebugEvent::End(tid.clone(), cid.clone());
                     let logger = transaction_debug_logger();
                     logger.log(event);
@@ -1184,18 +1189,31 @@ impl KVTableTrError {
 }
 
 use std::sync::OnceLock;
+// FIND-DEBUG-001：这是 pi_db crate 内的历史进程级诊断单例，不是 tools/ 下的子库。
+// API 始终编译；Cargo feature `log_table_debug` 只启用少量自动事件发送点。
+// 当前冻结为暂挂能力，完整边界见 docs/TRANSACTION_DEBUG_LOGGER_BOUNDARY.md。
 static TRANSACTION_DEBUG_LOGGER: OnceLock<TransactionDebugLogger> = OnceLock::new();
 
 /// 初始化进程级事务调试日志器并启动周期性落盘任务。
 ///
-/// `path` 是调试日志文件路径；`interval` 是事件批次轮询间隔，`timeout` 是单次日志提交超时，
+/// `path` 是交给 `pi_store::LogFile::open` 的调试日志目录，不是普通单文件路径；`interval`
+/// 是事件批次轮询间隔，`timeout` 是单次日志提交超时，
 /// 两者单位均为毫秒且小于 1000 的值会被提升为 1000。首次成功设置全局槽位的调用启动一个
 /// 永久后台任务；后续调用不会替换全局实例，但当前实现仍会先同步构造并打开一个临时日志器
 /// 再将其丢弃，因此该 API 应在进程初始化阶段恰好调用一次。
 ///
-/// 构造过程会把打开文件的异步任务提交给 `rt`，随后同步等待结果。文件打开失败、runtime
-/// 无法执行任务或内部通道异常会 panic；不要在无法继续调度该任务的 runtime owner 线程上
-/// 调用。该诊断设施不参与事务提交、确认或恢复正确性，也没有显式 shutdown API。
+/// 构造过程会把打开目录的异步任务提交给 `rt`，随后在当前 OS 线程同步等待结果。打开任务
+/// 执行后若文件打开或内部通道失败会 panic；若 runtime 没有 worker 能首次 poll 该任务，或
+/// 拒绝任务但没有使等待通道断开，调用可能无限阻塞。不要从会占尽同一 runtime 执行能力的
+/// owner 上下文调用。
+///
+/// `TransactionDebugLogger` 等公开 API 无论 feature 是否启用都会存在；`log_table_debug` 只在
+/// 当前少量生产位置自动发送事件。启用该 feature 后必须在任何可能触发这些位置的事务之前
+/// 恰好初始化一次，否则 [`transaction_debug_logger`] 会 panic。当前自动链只对单个持久化
+/// LogOrdered 子表的简单根事务相对完整，多表、其它表和非持久化事务不能据此判定事务正确性。
+/// 诊断数据不是事务状态机输入，但自动发送点是内联调用：未初始化 panic 可以中断 prepare、
+/// LogOrdered 持久化登记或确认回调。该历史能力已暂挂，不参与事务验收，且没有显式 shutdown
+/// API。完整现状和禁用边界见 `docs/TRANSACTION_DEBUG_LOGGER_BOUNDARY.md`（FIND-DEBUG-001）。
 pub fn init_transaction_debug_logger<P: AsRef<Path>>(rt: MultiTaskRuntime<()>,
                                                      path: P,
                                                      interval: usize,
@@ -1209,7 +1227,9 @@ pub fn init_transaction_debug_logger<P: AsRef<Path>>(rt: MultiTaskRuntime<()>,
 /// 返回进程级事务调试日志器的共享引用。
 ///
 /// 必须先成功调用 [`init_transaction_debug_logger`]，否则本函数 panic。返回引用由静态
-/// [`OnceLock`] 持有，可跨线程共享，读取为 O(1)，不分配、不执行 I/O，也不刷新日志。
+/// [`OnceLock`] 持有，可跨线程共享，读取为 O(1)，不分配、不执行 I/O，也不刷新日志。启用
+/// `log_table_debug` 不会自动初始化该槽位；自动埋点同样调用本函数，因此初始化顺序是调用方
+/// 前置条件。当前 feature 已按 FIND-DEBUG-001 暂挂。
 pub fn transaction_debug_logger<'a>() -> &'a TransactionDebugLogger {
     TRANSACTION_DEBUG_LOGGER
         .get()
@@ -1221,15 +1241,23 @@ use pi_async_transaction::manager_2pc::Transaction2PcStatus;
 /// 事务调试日志器能够记录的生命周期事件。
 ///
 /// 这些事件只用于诊断，不推进事务状态，也不能代替 WAL、提交确认或 manager 计数。调用方
-/// 必须按真实事务时序发送；日志器会记录缺失 Begin、重复 TID 等异常，但不会修复事务。
+/// 必须按真实事务时序发送；日志器会记录缺失 Begin、重复 TID 等异常，但不会修复事务。当前
+/// 自动埋点并不覆盖完整事务树：`Begin/Commit/CommitConfirm` 仅来自 LogOrdered 子事务，
+/// `End` 来自根 WAL 最终确认。由此产生的“事务不存在”或“TID 冲突”可能只是事件拓扑不完整，
+/// 不能直接证明数据库事务异常。完整限制见 FIND-DEBUG-001。
 pub enum TransactionDebugEvent {
-    /// 事务开始：`(tid, 当前状态, 是否可写, 是否要求根 WAL, 预提交输出容量)`。
+    /// LogOrdered 子事务 prepare 完成：`(tid, 当前状态, 是否可写, 是否要求根 WAL,
+    /// 预提交输出字节数)`；同一根含多个 LogOrdered 子表时会为同一 TID 发送多次。
     Begin(Guid, Transaction2PcStatus, bool, bool, usize),
-    /// 子表提交：`(tid, cid, 当前状态, 表名, 动作数, WAL/表日志索引)`。
+    /// 持久化 LogOrdered 子表提交：`(tid, cid, 当前状态, 表名, 动作估算字节数,
+    /// 根 WAL/提交日志索引)`；第五项虽在内部命名为 `actions_len`，当前实际是 Key/Value
+    /// 字节数之和，不是动作条数。
     Commit(Guid, Guid, Transaction2PcStatus, Atom, usize, usize),
-    /// 子表提交确认：`(tid, cid, 表名, 是否可写, 是否要求根 WAL)`。
+    /// 持久化 LogOrdered 表日志成功后的子表提交确认：
+    /// `(tid, cid, 表名, 是否可写, 是否要求根 WAL)`。
     CommitConfirm(Guid, Guid, Atom, bool, bool),
-    /// 根事务结束：`(tid, cid)`；处理后会移除该 TID 的开始时间记录。
+    /// 根 WAL 最终确认任务结束：`(tid, cid)`；处理后会移除该 TID 的开始时间记录。
+    /// 该事件覆盖面宽于前三类，因此可能找不到对应的 `Begin`。
     End(Guid, Guid),
 }
 
@@ -1243,7 +1271,9 @@ use pi_store::log_store::log_file::{LogFile, LogMethod};
 ///
 /// clone 仅增加内部 `Arc` 引用。生产者调用 [`Self::log`] 时不等待磁盘 I/O，但如果消费者
 /// 长期停滞，非有界队列会持续占用内存；后台 [`Self::startup`] 任务会永久持有实例，当前
-/// 没有停止或 drain 完成回执。该类型不是事务一致性组件，日志缺失不能改变提交结果。
+/// 没有停止或 drain 完成回执。TID 时间表也只在收到 `End` 后删除；不完整事件链会使记录
+/// 长期保留。该类型不是事务一致性组件，日志缺失、乱序或误诊不能改变提交结果，也不能作为
+/// 提交成功、持久化完成或恢复正确性的证据。当前能力已按 FIND-DEBUG-001 暂挂。
 pub struct TransactionDebugLogger(Arc<InnerTransactionDebugLogger>);
 
 // SAFETY: 内部 runtime/通道/并发 Map/LogFile 均通过各自线程安全接口共享，外层只移动 Arc
@@ -1263,9 +1293,10 @@ impl TransactionDebugLogger {
     /// 打开调试日志并构造尚未启动消费者循环的日志器。
     ///
     /// 本函数提交异步文件打开任务后同步等待，所以可能阻塞当前 OS 线程；文件打开、任务
-    /// 调度或内部通道失败会 panic。成功只表示日志文件已打开，调用方仍须恰好调用一次
-    /// [`Self::startup`] 才会消费事件。路径、runtime 和日志文件句柄会保留到所有 clone 及
-    /// 永久后台任务释放为止。
+    /// 执行后的 panic 或内部通道断开会使本函数 panic；任务无法开始执行时可能无限等待。
+    /// `path` 是 `LogFile` 目录。成功只表示日志已打开，调用方仍须恰好调用一次
+    /// [`Self::startup`] 才会消费事件。目录、runtime 和日志文件句柄会保留到所有 clone 及
+    /// 永久后台任务释放为止。该阻塞构造模式未作为通用 runtime 内调用能力验收。
     pub fn new<P: AsRef<Path>>(rt: MultiTaskRuntime<()>,
                                path: P) -> Self {
         let (sender, receiver) = unbounded();
@@ -1315,7 +1346,8 @@ impl TransactionDebugLogger {
     ///
     /// 当前实现没有防重复 guard；同一实例多次调用会创建多个消费者并改变事件分配与提交
     /// 顺序，因此只允许启动一次。后台任务没有显式停止接口，会持有 runtime、日志文件和
-    /// 内部 `Arc` 直至 runtime/进程结束。
+    /// 内部 `Arc` 直至 runtime/进程结束。spawn 返回值和每轮日志 commit 错误均被忽略；
+    /// 启动失败或持久化失败只会造成诊断事件积压/丢失，不反馈给事务，也没有完成回执。
     pub fn startup(self,
                    mut interval: usize,
                    mut timeout: usize) {
@@ -1335,6 +1367,8 @@ impl TransactionDebugLogger {
                 for event in events {
                     match event {
                         TransactionDebugEvent::Begin(tid, status, writable, require_persistence, output_size) => {
+                            // 当前 Map 只允许每个根 TID 有一个 Begin；多 LogOrdered 子表会
+                            // 进入 Occupied 并被写成“TID 冲突”，这不是可靠的事务冲突证据。
                             match logger.0.times.entry(tid.clone()) {
                                 Entry::Occupied(o) => {
                                     //事务ID冲突
@@ -1365,6 +1399,8 @@ impl TransactionDebugLogger {
                             }
                         },
                         TransactionDebugEvent::Commit(tid, cid, status, table, actions_len, log_index) => {
+                            // 找不到 TID 只说明诊断事件链没有匹配的 Begin；其它表事务以及
+                            // 手工/不完整事件输入都可能合法形成该观察结果。
                             if let Some(item) = logger.0.times.get(&tid) {
                                 //事务存在
                                 let time = item.value().elapsed();
@@ -1395,6 +1431,7 @@ impl TransactionDebugLogger {
                             }
                         },
                         TransactionDebugEvent::CommitConfirm(tid, cid, table, writable, require_persistence) => {
+                            // 与 Commit 相同，本分支只校验历史诊断时间表，不校验事务状态机。
                             if let Some(item) = logger.0.times.get(&tid) {
                                 //事务存在
                                 let time = item.value().elapsed();
@@ -1423,6 +1460,8 @@ impl TransactionDebugLogger {
                             }
                         },
                         TransactionDebugEvent::End(tid, cid) => {
+                            // End 来自根最终确认而 Begin 只来自 LogOrdered；“不存在”不能
+                            // 反向证明根事务异常。只有匹配项会从时间表释放。
                             if let Some((_tid, now)) = logger.0.times.remove(&tid) {
                                 //事务存在
                                 let time = now.elapsed();
@@ -1465,9 +1504,9 @@ impl TransactionDebugLogger {
 }
 
 struct InnerTransactionDebugLogger {
-    rt:         MultiTaskRuntime<()>,               //运行时
-    sender:     Sender<TransactionDebugEvent>,      //事务事件发送器
-    receiver:   Receiver<TransactionDebugEvent>,    //事务事件接收器
-    times:      DashMap<Guid, Instant>,             //事务时间表
-    log:        LogFile,                            //日志文件
+    rt:         MultiTaskRuntime<()>,               // 独立日志打开、消费和超时所使用的运行时
+    sender:     Sender<TransactionDebugEvent>,      // 非有界事务诊断事件发送器
+    receiver:   Receiver<TransactionDebugEvent>,    // 只能由恰好一个 startup 循环可靠消费
+    times:      DashMap<Guid, Instant>,             // 以根 TID 为键、等待 End 清理的诊断时间表
+    log:        LogFile,                            // 独立诊断 LogFile，不是根 WAL 或表数据日志
 }
