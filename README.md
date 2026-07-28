@@ -201,6 +201,21 @@ rollback 后预留残留。所有失败根关闭后，全新根必须成功重�
 事务树 commit，以释放 prepare 阶段建立的读预留；空输出只会跳过 WAL append/flush。删表仍应
 使用独立普通根事务，不能与同根建表前导或版本事务混用。
 
+### Key 锁兼容钩子
+
+`KVDBTransaction::lock_key/unlock_key` 当前不是实际 Key 锁。五类表实现都会忽略 Key 并立即成功，
+不提供排他、等待、owner、重入、内存可见性或事务隔离；未锁、非 owner、重复解锁和多个根同时
+“锁定”同一 Key 都会成功，不能用它们保护业务临界区。
+
+根层调用仍有事务副作用：它在查表前选择 Ordinary；缺表也保留该选择；首次命中已有表会创建
+非持久化 managed 子事务，固定当时数据 COW/cache 根并租用版本 revision。后续同表普通写复用
+这条较早冲突基线并按需提升 persistence。纯 hook 的空普通 2PC 不写 WAL、数据或版本，也不得
+覆盖并发事务已经发布的新根。当前每次表 hook 还会分配一个首次 poll 即完成的 boxed future。
+
+这是经接受的当前实现说明，不是最终或最佳锁 API。合法 Key 仍须是非空、匹配表类型且编码长度
+不超过 `u16::MAX` 的规范 BON 数据；Meta 不允许外部直接操作，LogWrite 仍不允许外部使用。完整
+调用链、取消/锁边界、真实矩阵与六项性能口径见 `docs/ROOT_KEY_HOOK_CONTRACT.md`。
+
 当前事务安全保证以根 WAL append/flush 能在健康存储和可用 runtime 上完成为环境前提。根 WAL
 自身因磁盘空间/配额不足、只读或故障文件系统、设备 I/O、runtime 拒绝任务、文件大小限制而失败
 时，不保证事务仍具备原子性、可回滚性、checkpoint 收口或确定的重启结果。现有普通 I/O 错误不

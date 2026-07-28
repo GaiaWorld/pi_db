@@ -494,8 +494,13 @@ pub trait KVAction: Send + Sync + 'static {
     ///
     /// **当前五类内置表全部忽略 `key` 并立即返回 `Ok(())`**：不建立排他锁，不等待，不
     /// 检查 owner/重入，不提供内存可见性或事务隔离保证。该现状记录在 `FIND-LOCK-001`，
-    /// 不是最终或最佳锁 API；不得用它保护并发临界区。操作为 O(1)、无分配、无 I/O、无
-    /// 锁副作用且取消安全。
+    /// 不是最终或最佳锁 API；不得用它保护并发临界区。直接调用表事务方法不会登记动作、
+    /// prepare、WAL 或版本，但每次调用都会为返回的 boxed future 分配一次；future 首次 poll
+    /// 即完成，不跨 yield 持锁或执行 I/O，丢弃未 poll/已完成 future 不留下表级状态。
+    ///
+    /// 当前实现不解析 Key，不等于空或畸形 Key 已成为合法输入。数据库公开协议仍要求非空、
+    /// 与表 Key 类型匹配的规范 BON 编码，且编码长度不超过 `u16::MAX`。根事务包装层还会选择
+    /// Ordinary 并可能创建数据/版本快照子事务；完整边界见 `ROOT-KEY-HOOK-001`。
     fn lock_key(&self, key: <Self as KVAction>::Key)
         -> BoxFuture<Result<(), <Self as KVAction>::Error>>;
 
@@ -503,7 +508,7 @@ pub trait KVAction: Send + Sync + 'static {
     ///
     /// 与 [`KVAction::lock_key`] 相同，当前所有内置实现都是忽略 Key 的 O(1) 成功 no-op；
     /// 即使此前未调用 `lock_key` 也成功，不做 owner 校验。它不释放任何真实锁，也不能作为
-    /// 并发同步原语。
+    /// 并发同步原语。它具有相同的 boxed future 分配、合法 Key 前提和根包装层副作用。
     fn unlock_key(&self, key: <Self as KVAction>::Key)
         -> BoxFuture<Result<(), <Self as KVAction>::Error>>;
 }

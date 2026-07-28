@@ -2942,12 +2942,25 @@ impl<
     ///
     /// **当前五类内置表的钩子均为立即成功的 no-op**：不建立排他锁、不等待、不校验 owner 或
     /// 重入，也不提供内存可见性和事务隔离保证；不得用本 API 保护业务临界区。缺表同样返回
-    /// `Ok(())`。存在表时仍会创建/复用一个非持久化子事务，因此调用不是完全无状态的纯函数。
+    /// `Ok(())`。Key 当前不会被解释，但合法公开调用仍须传入非空、匹配表 Key 类型、长度不超过
+    /// `u16::MAX` 的规范 BON 编码；空或畸形 Key 的行为不是兼容契约。
     ///
-    /// 本方法选择 Ordinary 协议，属于普通操作族；禁止与版本事务或 dirty-only 根混用。已选择
-    /// Versioned 时返回 Normal 协议错误，对子表 variant 调用会 panic。操作不写用户值、WAL 或
-    /// 数据文件，除 registry/子事务选择外为 O(1)；当前设计状态见 `FIND-LOCK-001` 和
-    /// `tests/kv_action_contract.rs`。
+    /// 本方法在表查找前原子选择 Ordinary，所以缺表成功也会阻止同一根随后选择 Versioned。
+    /// 已选择 Versioned 时返回 Normal 协议错误；对子表 variant 调用会 panic。存在表时创建或
+    /// 复用该表唯一的非持久化 managed 子事务：首次调用固定当时数据 COW/cache 根和版本
+    /// revision 租约，后续同表普通写复用这条较早冲突基线并按表元信息提升 persistence。因此
+    /// 调用不是无状态探测，长生命周期根也可能延后版本 TTL 回收。
+    ///
+    /// 纯 hook 不写值、根 WAL、表日志或数据文件；可写根按协议仍应完成一次空普通 2PC，空动作
+    /// commit 不发布旧根或版本。直接释放未 prepare 根只释放快照/租约；只读根无需 commit。
+    /// 首次已有表路径会分配 managed 子事务及表 hook boxed future，复用路径仍分配 boxed future；
+    /// 缺表路径不创建 child。当前实现持有表 registry 读 guard 和 `childs_map` guard 等待表 hook，
+    /// 但五类 hook 首次 poll 都立即完成；若未来实现真正异步等待，必须先重构 guard 边界。
+    ///
+    /// future 在首次 poll 前被丢弃没有副作用；首次 poll 选择 Ordinary 后可能在等待 registry
+    /// 读锁时被取消，从而留下已选择的协议。当前表 hook 自身不会 pending。完整现状、测试和
+    /// 基准见 `ROOT-KEY-HOOK-001`、`FIND-LOCK-001`、`tests/root_key_hook_contract.rs` 与
+    /// `benches/root_key_hook.rs`。
     pub async fn lock_key(&self,
                           table_name: Atom,
                           key: Binary) -> Result<(), KVTableTrError> {
@@ -2964,7 +2977,8 @@ impl<
     /// 当前五类实现与 [`Self::lock_key`] 一样都是 no-op：未锁、非 owner、重复解锁和缺表均返回
     /// `Ok(())`，不会释放任何真实同步原语。存在表时仍可能创建非持久化子事务。该方法选择
     /// Ordinary 协议，禁止与版本事务或 dirty-only 根混用；对子表 variant 调用会 panic。
-    /// 不得把成功返回解释为临界区所有权已经释放或其它线程已可见。
+    /// 不得把成功返回解释为临界区所有权已经释放或其它线程已可见。Key 前提、快照/revision
+    /// 租约、持久化提升、空 2PC、分配、取消和 guard 边界与 [`Self::lock_key`] 完全相同。
     pub async fn unlock_key(&self,
                             table_name: Atom,
                             key: Binary) -> Result<(), KVTableTrError> {
@@ -5486,12 +5500,16 @@ impl<
         }
     }
 
-    /// 锁住指定表的指定关键字
+    /// 分派当前立即成功的 Key 锁兼容钩子；完整公开契约见 `ROOT-KEY-HOOK-001`。
     #[inline]
     async fn lock_key(&self,
                       table_name: Atom,
                       key: Binary) -> Result<(), KVTableTrError> {
         self.select_ordinary_protocol("Lock table key")?;
+        // Ordinary 在 registry await 之前已经选定；取消该 await 会保留协议选择，但尚未创建 child。
+        // 当前 if-let 临时值把 registry 读 guard 保持到分支结束，childs_map guard 又保持到表 hook
+        // await 完成。五类内置 hook 首次 poll 都立即返回；未来若引入真正等待，必须先缩短这两个
+        // guard 的临界区，不能直接把阻塞/重入语义塞进现有分派结构。
         if let Some(table) = self.0.db_mgr.0.tables.read().await.get(&table_name) {
             //指定名称的表存在，则获取表事务，并开始锁住指定表的指定关键字
             let mut childes_map = self.0.childs_map.lock();
@@ -5499,7 +5517,8 @@ impl<
                 //指定名称的表的子事务存在
                 table_tr.clone()
             } else {
-                //指定名称的表的子事务不存在，则创建指定表的事务，因为是锁定操作，所以初始化指定表的子事务为非持久化事务
+                // 首次 hook 创建非持久化 managed owner，同时固定数据根和版本 revision 租约；
+                // 后续普通写复用该 owner 并按需提升 persistence。
                 self.table_transaction(table_name, table, false, &mut *childes_map)
             };
 
@@ -5535,12 +5554,14 @@ impl<
         }
     }
 
-    /// 解锁指定表的指定关键字
+    /// 分派当前立即成功的 Key 解锁兼容钩子；状态和 guard 边界与 lock_key 相同。
     #[inline]
     async fn unlock_key(&self,
                         table_name: Atom,
                         key: Binary) -> Result<(), KVTableTrError> {
         self.select_ordinary_protocol("Unlock table key")?;
+        // 即使缺表，Ordinary 也已在 registry await 前选定。registry/childs_map guard 当前跨
+        // hook await；依赖的是五类内置 hook 立即 ready 的实现事实，而不是未来扩展许可。
         if let Some(table) = self.0.db_mgr.0.tables.read().await.get(&table_name) {
             //指定名称的表存在，则获取表事务，并开始解锁指定表的指定关键字
             let mut childes_map = self.0.childs_map.lock();
@@ -5548,7 +5569,8 @@ impl<
                 //指定名称的表的子事务存在
                 table_tr.clone()
             } else {
-                //指定名称的表的子事务不存在，则创建指定表的事务，因为是解锁操作，所以初始化指定表的子事务为非持久化事务
+                // unlock-before-lock 同样创建非持久化 managed owner并固定快照/revision；
+                // 它不创建、释放或证明任何真实 Key 锁所有权。
                 self.table_transaction(table_name, table, false, &mut *childes_map)
             };
 

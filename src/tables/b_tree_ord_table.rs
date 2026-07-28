@@ -1696,7 +1696,9 @@ impl<
     fn lock_key(&self, _key: <Self as KVAction>::Key)
                 -> BoxFuture<Result<(), <Self as KVAction>::Error>>
     {
-        // 当前兼容钩子无条件成功，不建立排他、owner、等待或内存可见性关系。
+        // Key 不被读取；boxed future 首次 poll 立即成功，不打开 redb 事务，也不触碰
+        // cache/cache_flags/actions/prepare/waits。根 managed overlay/revision 快照见
+        // ROOT-KEY-HOOK-001。
         async move {
             Ok(())
         }.boxed()
@@ -1705,7 +1707,7 @@ impl<
     fn unlock_key(&self, _key: <Self as KVAction>::Key)
                   -> BoxFuture<Result<(), <Self as KVAction>::Error>>
     {
-        // 未持锁、重复调用和任意 Key 均成功；不得把返回值解释为释放了真实 Key 锁。
+        // 未持锁、重复调用和任意 Key 均成功；只分配立即 ready 的 boxed future，不执行 redb I/O。
         async move {
             Ok(())
         }.boxed()

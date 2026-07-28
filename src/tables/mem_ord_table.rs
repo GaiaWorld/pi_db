@@ -815,6 +815,8 @@ impl<
 
     fn lock_key(&self, _key: <Self as KVAction>::Key)
                 -> BoxFuture<Result<(), <Self as KVAction>::Error>> {
+        // Key 不被读取；构造 boxed future 会分配一次，但首次 poll 立即完成且不触碰
+        // root/actions/prepare/version。根包装层的 managed 快照副作用见 ROOT-KEY-HOOK-001。
         async move {
             // 当前是兼容性 no-op，不建立互斥、预留或事务冲突边；见 FIND-LOCK-001。
             Ok(())
@@ -823,6 +825,7 @@ impl<
 
     fn unlock_key(&self, _key: <Self as KVAction>::Key)
                   -> BoxFuture<Result<(), <Self as KVAction>::Error>> {
+        // 与 lock_key 相同，只分配立即 ready 的 boxed future，不检查 owner 或既有锁状态。
         async move {
             // 与 lock_key 对称的 no-op；调用成功不证明当前线程/事务拥有任何锁。
             Ok(())

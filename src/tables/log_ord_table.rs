@@ -1014,7 +1014,8 @@ impl<
 
     fn lock_key(&self, _key: <Self as KVAction>::Key)
                 -> BoxFuture<Result<(), <Self as KVAction>::Error>> {
-        // LogOrdered 当前没有逐 Key 锁；该 trait 入口是成功 no-op，不能当作排他同步原语。
+        // LogOrdered 当前没有逐 Key 锁；Key 不被读取，boxed future 分配后首次 poll 立即完成，
+        // 不触碰 root/actions/prepare/waits/LogFile。根 managed 快照边界见 ROOT-KEY-HOOK-001。
         async move {
             Ok(())
         }.boxed()
@@ -1022,7 +1023,7 @@ impl<
 
     fn unlock_key(&self, _key: <Self as KVAction>::Key)
                   -> BoxFuture<Result<(), <Self as KVAction>::Error>> {
-        // 与 lock_key 对称地保持成功 no-op，不维护可重入或 owner 状态。
+        // 与 lock_key 对称地保持成功 no-op，不维护可重入或 owner 状态，也不操作表日志。
         async move {
             Ok(())
         }.boxed()

@@ -825,6 +825,9 @@ impl<
 
     fn lock_key(&self, _key: <Self as KVAction>::Key)
                 -> BoxFuture<Result<(), <Self as KVAction>::Error>> {
+        // LogWrite 当前禁止外部使用且相关重构/测试已挂起。本兼容钩子仍只是忽略 Key、分配
+        // boxed future 并在首次 poll 成功的 no-op，不触碰 root/actions/prepare/waits/LogFile。
+        // 现状仅作注释和文档归档，见 ROOT-KEY-HOOK-001。
         async move {
             Ok(())
         }.boxed()
@@ -832,6 +835,7 @@ impl<
 
     fn unlock_key(&self, _key: <Self as KVAction>::Key)
                   -> BoxFuture<Result<(), <Self as KVAction>::Error>> {
+        // 与 lock_key 对称，不检查 owner、不释放资源，也不建立同步关系。
         async move {
             Ok(())
         }.boxed()

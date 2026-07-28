@@ -998,7 +998,8 @@ impl<
 
     fn lock_key(&self, _key: <Self as KVAction>::Key)
                 -> BoxFuture<Result<(), <Self as KVAction>::Error>> {
-        // 当前兼容钩子是无条件成功的 no-op，不建立排他、owner 或内存可见性关系。
+        // 当前兼容钩子忽略 Key；boxed future 首次 poll 立即成功，不触碰 Meta root、prepare、
+        // waits 或日志。外部不得绕过专用 DDL API直接操作 Meta，见 ROOT-KEY-HOOK-001。
         async move {
             Ok(())
         }.boxed()
@@ -1006,7 +1007,7 @@ impl<
 
     fn unlock_key(&self, _key: <Self as KVAction>::Key)
                   -> BoxFuture<Result<(), <Self as KVAction>::Error>> {
-        // 未持锁、重复调用和任意 Key 都同样成功；不得把结果解释为释放了真实锁。
+        // 未持锁、重复调用和任意 Key 都同样成功；只分配立即 ready 的 boxed future。
         async move {
             Ok(())
         }.boxed()
