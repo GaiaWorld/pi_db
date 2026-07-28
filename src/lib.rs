@@ -326,7 +326,8 @@ impl Binary {
 /// `tests/iterator_snapshot_safety.rs`，Btree 删除旧值见
 /// `tests/btree_delete_old_value.rs`。根级逐表惰性快照、只读/可写纯读生命周期和普通/dirty
 /// 冲突矩阵见 `tests/root_query_contract.rs`；完整契约入口为 `CONTRACT-ACTION-001` 和
-/// `ROOT-QUERY-001`。
+/// `ROOT-QUERY-001`。根级 upsert 批次、逐表 dirty 冲突差异和完整 2PC/恢复闭环见
+/// [`ROOT-UPSERT-001`](../docs/ROOT_UPSERT_CONTRACT.md#root-upsert-contract-index)。
 pub trait KVAction: Send + Sync + 'static {
     /// Key 的 owned 类型。
     ///
@@ -381,7 +382,9 @@ pub trait KVAction: Send + Sync + 'static {
     /// `key`/`value` 均被 future 消费。当前实现不在这里拒绝只读事务、非法状态、畸形 Key
     /// 或空 Value，也不写 WAL/数据文件；成功仅表示私有动作已记录。COW/Btree 更新通常为
     /// O(log n)/O(log c)，LogWrite 动作表平均 O(1)，并可能分配 COW 节点。操作持有短期同步
-    /// 锁、不跨 yield，除内存分配外通常不阻塞。
+    /// 锁、不跨 yield，除内存分配外通常不阻塞。根级批次中的 `None` 不会调用本方法，但仍
+    /// 可能先创建子事务并提升根持久化标志；见
+    /// [`ROOT-UPSERT-001`](../docs/ROOT_UPSERT_CONTRACT.md#root-upsert-contract-index)。
     fn dirty_upsert(&self,
                     key: <Self as KVAction>::Key,
                     value: <Self as KVAction>::Value)
@@ -393,7 +396,8 @@ pub trait KVAction: Send + Sync + 'static {
     /// 根或 overlay，LogWrite 只记录动作。成功、输入校验、持久化时点、锁和复杂度边界与
     /// [`KVAction::dirty_upsert`] 相同，区别仅在当前冲突分类。该调用不是幂等的操作历史：
     /// 相同 Key 的后续动作覆盖动作表记录；相同值重复写在最终数据上可能等效，但仍会重写
-    /// 事务状态并参与 prepare。
+    /// 事务状态并参与 prepare。根级批次、失败边界与闭环证据见
+    /// [`ROOT-UPSERT-001`](../docs/ROOT_UPSERT_CONTRACT.md#root-upsert-contract-index)。
     fn upsert(&self,
               key: <Self as KVAction>::Key,
               value: <Self as KVAction>::Value)

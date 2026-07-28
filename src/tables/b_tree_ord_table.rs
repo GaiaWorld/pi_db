@@ -1202,6 +1202,8 @@ impl<
                     key: <Self as KVAction>::Key,
                     value: <Self as KVAction>::Value) -> BoxFuture<Result<(), <Self as KVAction>::Error>>
     {
+        // Btree 的公开 dirty 入口有意复用普通入口，因此登记的是 Write，并执行普通版本/值
+        // 冲突判断；本表 prepare 中兼容 DirtyWrite 的分支不是该公开入口的生产可达路径。
         self.upsert(key, value)
     }
 

@@ -2784,6 +2784,8 @@ impl<
     ///
     /// 每项平均包含一次 registry 查找和表内 O(log n) COW/overlay 更新；LogWrite 只登记动作，
     /// Btree dirty 当前复用普通 upsert。同步 guard 不用于文件 I/O，本方法自身不写磁盘。
+    /// 根级完整契约、逐表冲突差异和闭环证据见
+    /// [ROOT-UPSERT-001](../docs/ROOT_UPSERT_CONTRACT.md#root-upsert-contract-index)。
     pub async fn dirty_upsert(&self,
                               table_kv_list: Vec<TableKV>) -> Result<(), KVTableTrError> {
         match self {
@@ -2814,7 +2816,9 @@ impl<
     /// 和 `tests/kv_action_contract.rs`。
     ///
     /// 每项平均包含 registry 查找和 O(log n) COW/overlay 更新；同步 guard 不跨文件 I/O，动作
-    /// 阶段不写根 WAL 或数据文件。真实返回、缺表和逐表差异见 `tests/kv_action_contract.rs`。
+    /// 阶段不写根 WAL 或数据文件。真实返回、缺表和逐表差异见 `tests/kv_action_contract.rs`；
+    /// 根级完整契约和闭环证据见
+    /// [ROOT-UPSERT-001](../docs/ROOT_UPSERT_CONTRACT.md#root-upsert-contract-index)。
     pub async fn upsert(&self,
                         table_kv_list: Vec<TableKV>) -> Result<(), KVTableTrError> {
         match self {
@@ -4928,7 +4932,8 @@ impl<
         self.select_ordinary_protocol("Dirty upsert")?;
         for table_kv in table_kv_list {
             if let Some(table) = self.0.db_mgr.0.tables.read().await.get(&table_kv.table) {
-                //指定名称的表存在，则获取表事务，并开始插入或更新表的指定关键字的值
+                // 每项都先解析表并在首次触达时安装唯一子事务；childs_map 保证同表复用，
+                // childs 保留跨表首次触达顺序，后续 prepare/commit 必须沿该顺序推进。
                 let mut childes_map = self.0.childs_map.lock();
                 let table_tr = if let Some(table_tr) = childes_map.get(&table_kv.table) {
                     //指定名称的表的子事务存在
@@ -4953,6 +4958,8 @@ impl<
                     self.0.persistence.store(true, Ordering::Relaxed);
                 }
 
+                // 子事务创建和持久化提升有意发生在 value 判定之前。因此 None 不是删除，也不
+                // 登记表动作，但仍可能改变事务树拓扑；调用方不能把非空的 None 批次视为空批次。
                 match &table_tr {
                     KVDBTransaction::RootTr(_tr) => {
                         //忽略键值对数据库的根事务
@@ -5025,7 +5032,8 @@ impl<
         self.select_ordinary_protocol("Upsert")?;
         for table_kv in table_kv_list {
             if let Some(table) = self.0.db_mgr.0.tables.read().await.get(&table_kv.table) {
-                //指定名称的表存在，则获取表事务，并开始插入或更新表的指定关键字的值
+                // 每项都先解析表并在首次触达时安装唯一子事务；childs_map 保证同表复用，
+                // childs 保留跨表首次触达顺序，后续 prepare/commit 必须沿该顺序推进。
                 let mut childes_map = self.0.childs_map.lock();
                 let table_tr = if let Some(table_tr) = childes_map.get(&table_kv.table) {
                     //指定名称的表的子事务存在
@@ -5050,6 +5058,8 @@ impl<
                     self.0.persistence.store(true, Ordering::Relaxed);
                 }
 
+                // 子事务创建和持久化提升有意发生在 value 判定之前。因此 None 不是删除，也不
+                // 登记表动作，但仍可能改变事务树拓扑；调用方不能把非空的 None 批次视为空批次。
                 match &table_tr {
                     KVDBTransaction::RootTr(_tr) => {
                         //忽略键值对数据库的根事务
