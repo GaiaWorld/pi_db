@@ -423,7 +423,9 @@ pub trait KVAction: Send + Sync + 'static {
     /// 跨表返回矩阵见
     /// [`CONTRACT-ACTION-001`](../docs/SEMANTIC_CONTRACTS.md#contract-action-001) 与
     /// [`tests/kv_action_contract.rs`](../tests/kv_action_contract.rs)；Btree 完整边界与真实
-    /// 专项见 `CONTRACT-BTREE-DELETE-001` 和 `tests/btree_delete_old_value.rs`。
+    /// 专项见 `CONTRACT-BTREE-DELETE-001` 和 `tests/btree_delete_old_value.rs`。根级批次、
+    /// 最终动作和 2PC/恢复闭环见
+    /// [`ROOT-DELETE-001`](../docs/ROOT_DELETE_CONTRACT.md#root-delete-contract-index)。
     fn dirty_delete(&self, key: <Self as KVAction>::Key)
         -> BoxFuture<Result<Option<<Self as KVAction>::Value>, <Self as KVAction>::Error>>;
 
@@ -446,7 +448,9 @@ pub trait KVAction: Send + Sync + 'static {
     /// 跨表返回矩阵见
     /// [`CONTRACT-ACTION-001`](../docs/SEMANTIC_CONTRACTS.md#contract-action-001) 与
     /// [`tests/kv_action_contract.rs`](../tests/kv_action_contract.rs)；Btree 完整边界与真实
-    /// 专项见 `CONTRACT-BTREE-DELETE-001` 和 `tests/btree_delete_old_value.rs`。
+    /// 专项见 `CONTRACT-BTREE-DELETE-001` 和 `tests/btree_delete_old_value.rs`。根级批次、
+    /// 最终动作和 2PC/恢复闭环见
+    /// [`ROOT-DELETE-001`](../docs/ROOT_DELETE_CONTRACT.md#root-delete-contract-index)。
     fn delete(&self, key: <Self as KVAction>::Key)
         -> BoxFuture<Result<Option<<Self as KVAction>::Value>, <Self as KVAction>::Error>>;
 

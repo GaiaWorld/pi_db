@@ -1232,7 +1232,8 @@ impl<
                     -> BoxFuture<Result<Option<<Self as KVAction>::Value>, <Self as KVAction>::Error>>
     {
         // 当前 Btree dirty_delete 与 delete 共用动作类型、旧缓存值和 tombstone 语义；
-        // dirty 冲突差异不在本轮契约内，见 CONTRACT-BTREE-DELETE-001。
+        // 因此公开 dirty 仍执行普通冲突检查，不进入 prepare 的 DirtyWrite 放宽分支。
+        // 见 CONTRACT-BTREE-DELETE-001 与 ROOT-DELETE-001。
         self.delete(key)
     }
 

@@ -34,6 +34,7 @@ root_transaction_construction -
 root_transaction_lifecycle -
 root_query_contract -
 root_upsert_contract -
+root_delete_contract -
 schema_protocol_neutral -
 schema_protocol_recovery -
 startup_table_batch_boundary -

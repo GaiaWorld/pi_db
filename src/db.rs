@@ -2843,7 +2843,9 @@ impl<
     ///
     /// 返回 Vec 与输入同序等长；缺表返回一个 `None`，`TableKV::value` 被忽略。空输入不选择
     /// 协议；非空输入选择 Ordinary，但外部必须让该根只使用 `dirty_*` 点操作。当前入口不拒绝
-    /// 只读根，且批次后项错误不撤销此前私有删除。只能对根事务调用，否则 panic。
+    /// 只读根，且批次后项错误不撤销此前私有删除。只能对根事务调用，否则 panic。根级路由、
+    /// 逐表 dirty 差异、WAL/确认/repair 和测试边界见
+    /// [ROOT-DELETE-001](../docs/ROOT_DELETE_CONTRACT.md#root-delete-contract-index)。
     pub async fn dirty_delete(&self,
                         table_kv_list: Vec<TableKV>)
                         -> Result<Vec<Option<Binary>>, KVTableTrError> {
@@ -2870,6 +2872,8 @@ impl<
     /// 返回 Vec 与输入同序等长；缺表返回一个 `None`，`TableKV::value` 被忽略。空输入不选择
     /// 协议；非空输入选择 Ordinary，只能与普通 `query/upsert/delete` 点操作联合使用。当前
     /// 入口不拒绝只读根，且批次后项错误不撤销此前私有删除。只能对根事务调用，否则 panic。
+    /// 根级路由、最终动作、WAL/确认/repair 和测试边界见
+    /// [ROOT-DELETE-001](../docs/ROOT_DELETE_CONTRACT.md#root-delete-contract-index)。
     pub async fn delete(&self,
                         table_kv_list: Vec<TableKV>)
                         -> Result<Vec<Option<Binary>>, KVTableTrError> {
@@ -5129,7 +5133,11 @@ impl<
         Ok(())
     }
 
-    /// 异步删除指定多个表和键的值，并返回删除值的结果集，删除可能会被覆蓋
+    /// 按输入顺序登记 dirty tombstone，并返回与输入同序等长的逐表结果。
+    ///
+    /// `TableKV::value` 有意忽略；缺表只追加 `None`，不会创建 child。存在表的首次触达顺序
+    /// 决定唯一 child 和后续 2PC 顺序，同 Key 后续动作只覆盖最终动作。逐表返回与冲突差异见
+    /// `docs/ROOT_DELETE_CONTRACT.md#root-delete-contract-index`。
     #[inline]
     async fn dirty_delete(&self,
                           table_kv_list: Vec<TableKV>) -> Result<Vec<Option<Binary>>, KVTableTrError> {
@@ -5146,17 +5154,18 @@ impl<
                 let table_tr = if let Some(table_tr) = childes_map.get(&table_kv.table) {
                     //指定名称的表的子事务存在
                     if table.is_persistent() {
-                        //指定表需要持久化，且因为插入或更新操作，所以设置子事务为需要持久化
+                        // 持久表的删除动作需要进入根 WAL；复用只读子事务时必须先提升该标志。
                         table_tr.require_persistence();
                     }
                     table_tr.clone()
                 } else {
-                    //指定名称的表的子事务不存在，则创建指定表的事务
+                    // 首次触达存在表时创建唯一子事务；table_transaction 同时登记 map 和有序
+                    // child 列表，因此该分支的执行顺序就是后续 prepare/commit 顺序。
                     if table.is_persistent() {
-                        //指定表需要持久化，且因为插入或更新操作，所以初始化指定表的子事务为持久化事务
+                        // 持久表的删除动作必须初始化为需要根 WAL 的子事务。
                         self.table_transaction(table_kv.table, table, true, &mut *childes_map)
                     } else {
-                        //指定表不需要持久化，所以即使插入或更新操作，也初始化指定表的子事务为非持久化事务
+                        // 非持久表删除不单独要求根 WAL。
                         self.table_transaction(table_kv.table, table, false, &mut *childes_map)
                     }
                 };
@@ -5238,7 +5247,7 @@ impl<
                     },
                 }
             } else {
-                //指定名称的表不存在
+                // 缺表只占据当前输入对应的返回槽位；不创建 child，也不改变后续项顺序。
                 result.push(None);
             }
         }
@@ -5246,7 +5255,11 @@ impl<
         Ok(result)
     }
 
-    /// 异步删除指定多个表和键的值，并返回删除值的结果集
+    /// 按输入顺序登记普通 tombstone，并返回与输入同序等长的逐表结果。
+    ///
+    /// `TableKV::value` 有意忽略；缺表只追加 `None`，不会创建 child。存在表的首次触达顺序
+    /// 决定唯一 child 和后续 2PC 顺序，同 Key 后续动作只覆盖最终动作。逐表返回、WAL 与
+    /// repair 边界见 `docs/ROOT_DELETE_CONTRACT.md#root-delete-contract-index`。
     #[inline]
     async fn delete(&self,
                     table_kv_list: Vec<TableKV>) -> Result<Vec<Option<Binary>>, KVTableTrError> {
@@ -5263,17 +5276,18 @@ impl<
                 let table_tr = if let Some(table_tr) = childes_map.get(&table_kv.table) {
                     //指定名称的表的子事务存在
                     if table.is_persistent() {
-                        //指定表需要持久化，且因为插入或更新操作，所以设置子事务为需要持久化
+                        // 持久表的删除动作需要进入根 WAL；复用只读子事务时必须先提升该标志。
                         table_tr.require_persistence();
                     }
                     table_tr.clone()
                 } else {
-                    //指定名称的表的子事务不存在，则创建指定表的事务
+                    // 首次触达存在表时创建唯一子事务；table_transaction 同时登记 map 和有序
+                    // child 列表，因此该分支的执行顺序就是后续 prepare/commit 顺序。
                     if table.is_persistent() {
-                        //指定表需要持久化，且因为插入或更新操作，所以初始化指定表的子事务为持久化事务
+                        // 持久表的删除动作必须初始化为需要根 WAL 的子事务。
                         self.table_transaction(table_kv.table, table, true, &mut *childes_map)
                     } else {
-                        //指定表不需要持久化，所以即使插入或更新操作，也初始化指定表的子事务为非持久化事务
+                        // 非持久表删除不单独要求根 WAL。
                         self.table_transaction(table_kv.table, table, false, &mut *childes_map)
                     }
                 };
@@ -5355,7 +5369,7 @@ impl<
                     },
                 }
             } else {
-                //指定名称的表不存在
+                // 缺表只占据当前输入对应的返回槽位；不创建 child，也不改变后续项顺序。
                 result.push(None);
             }
         }
