@@ -273,6 +273,23 @@ Key、非空 upsert、delete 占位及最终 offset；真实 WAL 落地、提交
 Memory、Meta 和 LogOrdered 流持有创建时的 COW 根；Btree 流同时持有 overlay COW 根和
 redb 读事务。流正常耗尽、提前取消或 panic unwind 都会释放这些额外 owner。
 
+### 根事务普通与 dirty 点读
+
+`KVDBTransaction::query/dirty_query` 只在根事务上使用，批量返回与输入严格等长同序；重复
+Key 会重复返回，缺表返回 `None`，输入 `TableKV.value` 被忽略。非空调用选择 Ordinary 协议，
+普通族与 dirty 族不得在同一根中混用；空批次保持协议中立。
+
+根事务不是数据库级统一快照。每张表在首次触达时惰性创建子事务：Memory/LogOrdered 固定该
+时点的 COW 根；Btree 固定 overlay，但 overlay 缺席时每次重新读取 redb。因此同一根首次访问
+不同表可以跨越其它事务的提交边界，同一 Btree 根两次查询也可能返回不同 redb 值。Btree
+prepare 仍保留第一次读取确定的冲突基线，不会因后一次返回新值而刷新。
+
+显式只读根可以在查询后直接释放，不分配事务/提交 ID，也不写 WAL。可写根即使只有读动作，
+仍必须完成普通 prepare/commit；空 prepare 输出不代表可以跳过 commit。普通 query 会建立读
+冲突；dirty Memory/LogOrdered 不建立 Read 冲突，dirty Btree 仍委托普通 query。完整契约、
+真实三表/重启/TSan 专项和 Release 基准见 `docs/ROOT_QUERY_CONTRACT.md` 与
+`tests/root_query_contract.rs`。
+
 ### Btree 删除旧值
 
 `delete/dirty_delete` 对 Btree 使用三态只写缓存：缓存值返回 `Some(old)`；已有 tombstone

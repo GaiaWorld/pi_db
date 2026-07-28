@@ -2723,10 +2723,18 @@ impl<
     /// `dirty_*` 点操作，要么只使用普通 `query/upsert/delete`，非空动作不得混用；当前库不以
     /// 独立 guard 强制该约定，违规后的事务安全性没有保证。只读根可以合法查询。
     ///
+    /// 根事务不会在创建时固定全库快照。每张表在首次触达时才惰性创建自己的子事务，因此同一
+    /// 根首次访问不同表时可以观察不同提交边界。Memory/LogOrdered 后续读取固定的表级 COW
+    /// 私有根；Btree 只固定创建时 overlay，overlay 缺席时每次重新读取 redb。Btree 首次读建立
+    /// 的冲突基线不会随后续返回值刷新，完整区别见 `ROOT-QUERY-001`。
+    ///
     /// 调用按项串行查 registry 并惰性创建/复用非持久化子事务；Btree overlay 缺席时可能同步
-    /// 读取 redb 并短暂阻塞 worker。方法不写用户值、根 WAL 或数据文件，但可能改变子事务的
-    /// 读/冲突记录。当前无错误返回通道，逐表差异和合法测试入口见 `CONTRACT-ACTION-001`、
-    /// `Q-DIRTY-001` 与 `tests/kv_action_contract.rs`。
+    /// 读取 redb 并短暂阻塞 worker。显式只读根可在查询后直接释放；可写根即使只有读动作，
+    /// 仍必须完成普通 prepare/commit，以消费 Btree 可能建立的读预留并闭合 manager 生命周期，
+    /// 不能用空 prepare 输出推断可跳过 commit。方法不写用户值、根 WAL 或数据文件，但可能
+    /// 改变子事务的读/冲突记录。当前无错误返回通道，逐表差异和合法测试入口见
+    /// `CONTRACT-ACTION-001`、`Q-DIRTY-001`、`ROOT-QUERY-001` 与
+    /// `tests/kv_action_contract.rs`。
     pub async fn dirty_query(&self,
                              table_kv_list: Vec<TableKV>) -> Vec<Option<Binary>> {
         match self {
@@ -2745,9 +2753,13 @@ impl<
     /// panic。只读根可使用本方法，但只读事务不得随后执行写操作。
     ///
     /// Meta/Memory/LogOrdered/Btree 会登记普通 Read，并可能影响 prepare 冲突；LogWrite 固定
-    /// 返回 `None`。调用按项串行取得 registry 读锁和短期子事务索引锁，惰性创建非持久化表
-    /// 子事务；Btree 可能同步读取 redb 并阻塞 worker。方法不写根 WAL/数据文件，当前签名也
-    /// 无法结构化返回底层读取错误。合法矩阵见 `tests/kv_action_contract.rs`。
+    /// 返回 `None`。根不提供数据库级统一快照：各表在首次触达时分别固定起点；Btree 仅固定
+    /// overlay，overlay 缺席时每次 query 都建立独立 redb read transaction，但首次 Key 基线
+    /// 继续用于 prepare。调用按项串行取得 registry 读锁和短期子事务索引锁，惰性创建非持久化
+    /// 表子事务；Btree 可能同步读取 redb 并阻塞 worker。显式只读根可查询后直接释放；可写
+    /// 纯读根必须继续普通 2PC，即使 prepare 输出为空。方法不写根 WAL/数据文件，当前签名也
+    /// 无法结构化返回底层读取错误。合法矩阵见 `tests/kv_action_contract.rs` 和
+    /// `tests/root_query_contract.rs`，完整边界见 `ROOT-QUERY-001`。
     pub async fn query(&self,
                        table_kv_list: Vec<TableKV>) -> Vec<Option<Binary>> {
         match self {
@@ -4786,6 +4798,9 @@ impl<
         let mut result = Vec::new();
 
         for table_kv in table_kv_list {
+            // 每项独立取得 registry read guard；从 get 得到的 table 借用使 guard 覆盖本项
+            // 子事务查找/创建和表级 query。当前表级 query future 不产生异步 yield，但 Btree
+            // redb fallback 会同步占用 worker，并延长该读临界区。本循环不构成跨表原子快照。
             if let Some(table) = self.0.db_mgr.0.tables.read().await.get(&table_kv.table) {
                 //指定名称的表存在，则获取表事务，并开始查询表的指定关键字的值
                 let mut childes_map = self.0.childs_map.lock();
@@ -4850,6 +4865,8 @@ impl<
         let mut result = Vec::new();
 
         for table_kv in table_kv_list {
+            // 与 dirty_query 相同，registry guard 只覆盖当前输入项，但持续到该项表级 query
+            // 完成。不同表的首次子事务创建时点可以跨越其它根提交，因此结果不是全库统一快照。
             if let Some(table) = self.0.db_mgr.0.tables.read().await.get(&table_kv.table) {
                 //指定名称的表存在，则获取表事务，并开始查询表的指定关键字的值
                 let mut childes_map = self.0.childs_map.lock();

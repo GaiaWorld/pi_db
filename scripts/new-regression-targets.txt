@@ -32,6 +32,7 @@ ordinary_multi_table_recovery -
 prepare_conflict_regression test_prepare_conflict_active_tables
 root_transaction_construction -
 root_transaction_lifecycle -
+root_query_contract -
 schema_protocol_neutral -
 schema_protocol_recovery -
 startup_table_batch_boundary -

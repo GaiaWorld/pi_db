@@ -301,7 +301,8 @@ impl Binary {
 /// - Meta、Memory、LogOrdered 在子事务首次创建时克隆表的 COW 根，点读观察该根加本事务
 ///   后续修改；子事务由根事务首次访问某张表时惰性创建，不一定与根事务创建同一时刻。
 /// - Btree 在子事务创建时固定内存 overlay，但 overlay 缺席的点读会在每次调用时同步读取
-///   redb；因此它不是统一的“事务创建时磁盘快照”。普通/dirty 点读都会记录普通 `Read`。
+///   redb；因此它不是统一的“事务创建时磁盘快照”。普通/dirty 点读都会记录普通 `Read`，
+///   且只有第一次读确定的冲突基线会保留，后续 redb 返回值变化不会刷新该基线。
 /// - LogWrite 只接受 upsert 动作；query/delete 不观察日志内容，迭代器还有已归档的空哨兵
 ///   行为。不能仅凭本 trait 的方法集合推断每种表都支持完整 CRUD。
 /// - dirty 不是统一隔离级别：前三类 COW 表用 `DirtyWrite` 或不记读，Btree 的 dirty 方法
@@ -323,7 +324,9 @@ impl Binary {
 ///
 /// 当前合法点操作由 `tests/kv_action_contract.rs` 验证；流的生命周期和快照矩阵见
 /// `tests/iterator_snapshot_safety.rs`，Btree 删除旧值见
-/// `tests/btree_delete_old_value.rs`。完整契约入口为 `CONTRACT-ACTION-001`。
+/// `tests/btree_delete_old_value.rs`。根级逐表惰性快照、只读/可写纯读生命周期和普通/dirty
+/// 冲突矩阵见 `tests/root_query_contract.rs`；完整契约入口为 `CONTRACT-ACTION-001` 和
+/// `ROOT-QUERY-001`。
 pub trait KVAction: Send + Sync + 'static {
     /// Key 的 owned 类型。
     ///
@@ -350,7 +353,9 @@ pub trait KVAction: Send + Sync + 'static {
     ///
     /// COW 查找为 O(log n)，Btree 为 O(log c + log n) 且可能同步阻塞；LogWrite 为 O(1)。
     /// 方法不是纯函数：除 LogWrite 外可能读取共享存储，Btree 还可能更新事务的冲突参考
-    /// cache；但本方法不写用户值、WAL 或数据文件。当前签名不能返回读取错误。
+    /// cache；但本方法不写用户值、WAL 或数据文件。当前签名不能返回读取错误。显式只读根
+    /// 可以在读取后直接释放；可写根即使只有读取也必须完成普通 2PC，空 prepare 输出不表示
+    /// 可以跳过 commit。
     fn dirty_query(&self, key: <Self as KVAction>::Key)
         -> BoxFuture<Option<<Self as KVAction>::Value>>;
 
@@ -362,7 +367,8 @@ pub trait KVAction: Send + Sync + 'static {
     /// 错误当前被吞并为 `None`。LogWrite 不记录动作并始终返回 `None`。
     ///
     /// 返回值、复杂度、同步阻塞和无错误通道边界与 [`KVAction::dirty_query`] 相同。记录读
-    /// 动作会影响后续 prepare 冲突判断，因此本方法不是纯读取意义上的无副作用函数。
+    /// 动作会影响后续 prepare 冲突判断，因此本方法不是纯读取意义上的无副作用函数。根事务
+    /// 不在创建时固定全部表；本 trait 的表级快照也不能外推为数据库级统一快照。
     fn query(&self, key: <Self as KVAction>::Key)
         -> BoxFuture<Option<<Self as KVAction>::Value>>;
 

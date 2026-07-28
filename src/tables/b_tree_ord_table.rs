@@ -1164,6 +1164,10 @@ impl<
                     drop(locked);
                     // redb 读取结果只进入独立 KeyState 基线，禁止写入 cache_ref；后者必须保持
                     // 事务创建时 overlay 快照，供 commit COW 快路径和 collector 清理使用。
+                    // 每次 overlay-missing query 都建立新的 redb read transaction；collector
+                    // 在两次调用之间更新 redb 时，后一次可以返回新值。但下方
+                    // record_read_if_absent 只保留第一次确定的冲突基线，prepare 仍必须识别
+                    // 首读后的提交，不能把“后一次返回新值”解释为事务基线已经刷新。
                     // KVAction::query 没有错误通道，因此 begin_read/open_table/get 错误按当前实现
                     // 降级为 None，并把基线保留为 OverlayMissing。严格传播错误的版本协议读取
                     // 走表级 query_committed，由 query_with_version 映射为可恢复 Common 错误。
