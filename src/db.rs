@@ -2990,20 +2990,41 @@ impl<
         }
     }
 
-    /// 初始化并预提交整棵根事务树，返回随后 commit 所需的 opaque 字节。
+    /// 初始化并预提交整棵普通根事务树，返回随后 commit 所需的一次性 opaque token。
     ///
     /// 只能对 [`KVDBTransaction::RootTr`] 调用；对子表 variant 调用会 panic。首次调用先向
-    /// `Transaction2PcManager` 注册根事务并分配事务 UID，再按首次触表顺序 prepare 子事务。
-    /// 成功返回的 `Vec<u8>` 归调用方所有：需要根 WAL 时包含根事务 UID 和持久化子表动作；
-    /// 只读、无持久化动作及部分已完成 DDL 快路可返回空 Vec。
+    /// `Transaction2PcManager` 注册唯一外层根并为整棵树分配同一个事务 UID，再按首次触表顺序
+    /// prepare 子事务。需要根 WAL 时还会为整棵树分配同一个 commit UID。成功返回的
+    /// [`Vec<u8>`] 归调用方所有：只有根要求 WAL 且至少一个子表产生持久化动作时，输出才包含
+    /// 16 字节事务 UID 和子表 WAL 片段；非持久化、纯读、空动作及幂等 DDL 都可能返回空 Vec。
+    /// 空输出只表示后续 commit 跳过根 WAL append/flush，不能证明事务只读、没有 prepared
+    /// 预留或可以跳过 commit。
     ///
     /// 返回字节必须被视为一次性 opaque token，未经修改原样传给同一事务的
     /// [`Self::commit_modified`]。当前实现尚未校验 token 与事务身份/最近 prepare 输出绑定，
     /// 见 `FIND-TR-003`；篡改、跨事务交换、截断、附加或重复使用都不属于合法调用域。
     ///
-    /// 非 Fatal prepare 错误使事务树失败但可调用 [`Self::rollback_modified`]；Fatal 永不可
-    /// rollback。timeout 字段当前不执行实际截止。调用会获取多个同步锁并可能执行表级异步
-    /// 操作；取消 future 不是已冻结的自动 rollback，调用方不得假设 drop future 会注销事务。
+    /// 普通表冲突由本入口投影为 [`KVTableTrError::Common`] `Normal`；需要首个冲突表/Key 时应
+    /// 使用 [`Self::prepare_modified_conflicts`]。只有事务实际停在 `ActionFailed`、
+    /// `PrepareFailed` 或受支持的 `LogCommitFailed`，并且整棵树没有 Fatal 时，才可调用
+    /// [`Self::rollback_modified`]；不能把“错误等级不是 Fatal”单独当作 rollback 许可。
+    /// Fatal 永不可 rollback。
+    ///
+    /// 显式只读根的推荐合法闭环是完成读取后直接释放，不调用普通 2PC。当前防御性实现仍接受
+    /// 对只读根调用本方法：一旦调用，它会注册根并返回空 token，调用方必须继续以该 token
+    /// commit 才能从 manager 注销。可写根无论 token 是否为空都必须完成 commit 或合法 rollback。
+    ///
+    /// timeout 字段当前只保存而不执行实际截止。调用会 await manager/表 prepare，并取得各表
+    /// publication 读门或 prepare 同步锁；跨表按首次触表顺序串行，不在持锁时执行根 WAL I/O。
+    /// future 在首次 poll 前被丢弃没有副作用；开始执行后取消不自动 rollback/finish，调用方必须
+    /// 由独立 owner 推进到明确终态。时间和新增空间随子表数、最终动作数及 WAL payload 线性增长。
+    /// 完整契约、状态图、错误投影和证据见
+    /// `ROOT-ORDINARY-2PC-001`：`docs/ROOT_ORDINARY_2PC_CONTRACT.md`。
+    ///
+    /// # Panics
+    ///
+    /// 对非 RootTr variant 调用时 panic。合法协议还禁止重复 prepare、rollback 后复用和同一根
+    /// 并发生命周期调用；当前具体防御结果不是稳定 API 契约。
     pub async fn prepare_modified(&self) -> Result<Vec<u8>, KVTableTrError> {
         match self {
             KVDBTransaction::RootTr(tr) => {
@@ -3015,10 +3036,12 @@ impl<
 
     /// 以可定位冲突的路径初始化并预提交整棵根事务树。
     ///
-    /// 调用顺序、RootTr 前置条件、输出所有权、timeout、取消和错误恢复边界与
-    /// [`Self::prepare_modified`] 相同。差异是表实现检测到写冲突时返回
+    /// 调用顺序、RootTr 前置条件、只读/空 token、输出所有权、timeout、取消、复杂度和错误恢复
+    /// 边界与 [`Self::prepare_modified`] 相同。差异是表实现检测到写冲突时返回
     /// [`KVTableTrError::Conflicts`]，其中保存首个冲突表名和 Key，错误等级为 Normal；多个
     /// 冲突不保证全部报告，也不保证跨表诊断顺序独立于首次触表顺序。
+    /// [`Self::prepare_modified`] 对同一表级冲突返回 `Common(Normal, ..)`，两者不改变冲突检查、
+    /// prepared 预留、WAL token 或事务状态，只改变错误投影。
     ///
     /// 当前 manager 按首次触表顺序串行 prepare，并在首个错误处停止。因此多叶根失败时，冲突
     /// 之前的叶子可能已经 `Prepared`，冲突叶子为 `PrepareFailed`，尚未访问的叶子仍为
@@ -3039,6 +3062,9 @@ impl<
     /// `docs/ORDINARY_MULTI_TABLE_ORDERING_ACCEPTANCE.md#ordinary-multi-table-ordering-index`。
     /// 普通持久化 Memory 的 1/2/4/8 writer 与确定性冲突率性能基线由
     /// `benches/ordinary_memory_concurrency.rs` 承载；该基准不外推其它表或版本协议。
+    /// 两种普通 prepare 的同输入成功/冲突对照、状态/manager/WAL/最终值闭环和分阶段成本见
+    /// `tests/ordinary_2pc_api_contract.rs`、`benches/ordinary_2pc_phases.rs` 及
+    /// `docs/ROOT_ORDINARY_2PC_CONTRACT.md`。
     pub async fn prepare_modified_conflicts(&self) -> Result<Vec<u8>, KVTableTrError> {
         match self {
             KVDBTransaction::RootTr(tr) => {
@@ -3091,8 +3117,9 @@ impl<
 
     /// 提交一次已经成功 prepare 的根事务。
     ///
-    /// `prepare_output` 必须是同一事务最近一次成功 prepare 返回的完整 Vec，并且只能使用
-    /// 一次。只能对 RootTr 调用；子表 variant 会 panic。未先 prepare、重复 commit、传入其它
+    /// `prepare_output` 的所有权会被本方法消费；它必须是同一事务最近一次成功普通 prepare
+    /// 返回的完整 Vec，并且只能使用一次。只能对 RootTr 调用；子表 variant 会 panic。未先
+    /// prepare、重复 commit、传入其它
     /// 事务或修改后的 token 都是非法调用；当前部分非法路径可能返回 Normal 错误，另一些路径
     /// 会在内部 UID `unwrap` 处 panic，不能依赖其防御表现。
     ///
@@ -3100,10 +3127,16 @@ impl<
     /// 后才发布各子表 COW 根并安排最终数据文件持久化。`Ok(())` 表示第一阶段“事务提交成功”，
     /// 不表示所有数据文件已完成，也不表示根 WAL 已确认或改名 `.bak`。第二阶段只有全部持久化
     /// 子表发出成功信号后才由 [`KVDBCommitConfirm`] 异步确认，见 `CONTRACT-TR-002`。
+    /// 非持久化或空 token 的可写树跳过 WAL I/O，但仍后代优先提交全部 `Prepared` 子节点并
+    /// 释放预留。显式只读根若已经调用 prepare，也必须用空 token 调用本方法完成 manager 注销；
+    /// 推荐用法仍是只读根完全不进入 2PC。
     ///
-    /// 在尚未调用根 WAL append/flush 时产生的非 Fatal 逻辑失败可按状态 rollback；WAL 已成功
-    /// 后的数据文件失败不能 rollback，WAL 保持未确认并由重启 repair 补齐。方法会执行异步文件
-    /// I/O、同步锁和 runtime 任务投递，不保证取消安全；调用方必须等待明确结果并另行观察最终确认。
+    /// 只有当前状态属于事务框架允许的失败状态时，根 WAL 门禁前的非 Fatal 逻辑失败才可
+    /// rollback；WAL 已成功后的数据文件失败不能 rollback，WAL 保持未确认并由重启 repair
+    /// 补齐。成功后 `manager.finish` 只注销外层根并更新计数，不等待异步数据文件、确认或
+    /// `.bak`。方法会执行异步文件 I/O、同步锁和 runtime 任务投递，不保证取消安全；调用方必须
+    /// 等待明确结果并另行观察最终确认。时间/空间为 O(token bytes + 事务树节点数)，真实延迟
+    /// 还包含 WAL append/flush 和各节点同步提交成本；空 token 不包含 WAL I/O。
     /// 普通 Memory/LogOrdered/Btree 三叶事务的共享 TID/CID、单次根 WAL、异步确认、repair 和
     /// 移走 WAL 后最终数据由 `tests/ordinary_multi_table_recovery.rs` 提供真实闭环证据。
     ///
@@ -3113,6 +3146,11 @@ impl<
     /// 都不能证明 WAL 完全未落盘，也不能证明 checkpoint 与磁盘状态已经回到事务前。该限制与
     /// 空 prepare 输出无关，后者直接跳过 WAL I/O。完整现状链、外部处置边界和未来设计入口见
     /// `LIMIT-ROOT-WAL-IO-001`：`docs/ROOT_WAL_IO_FAILURE_BOUNDARY.md`。
+    ///
+    /// # Panics
+    ///
+    /// 对非 RootTr variant 调用时 panic。缺少事务 UID、越序/重复提交或非法 token 还可能触发
+    /// 内部不变量 panic；这些都不属于合法调用域。
     pub async fn commit_modified(&self,
                                  prepare_output: Vec<u8>) -> Result<(), KVTableTrError> {
         match self {
@@ -3163,8 +3201,8 @@ impl<
     ///
     /// 成功 rollback 会丢弃未发布的子表 COW 修改并从 manager 注销根事务；因为合法回滚点在
     /// 根 WAL 成功落地和数据文件写入之前，不会撤销已提交数据。Fatal 永不可 rollback。方法
-    /// 可能 await 子事务回滚并获取同步锁；成功后返回 `Ok(())`，失败保留错误等级和事务状态，
-    /// 不应继续复用严重失败句柄。
+    /// 可能 await 子事务回滚并获取同步锁；成功后才调用 `manager.finish` 注销唯一外层根，
+    /// 返回 `Ok(())`。失败不调用 finish，保留错误等级和事务状态，不应继续复用严重失败句柄。
     /// 多叶根在首个 prepare 冲突后仍会遍历全部叶子：此前 `Prepared`、冲突
     /// `PrepareFailed` 和尚未 prepare 的 `Inited` 叶子都必须进入 `Rollbacked`。成功回滚后旧
     /// 根及叶子即使仍有外部 `Arc` 也只是已关闭句柄；后续重试必须使用全新根和全新 TID/CID。
@@ -3176,6 +3214,13 @@ impl<
     /// 文件系统、设备、runtime 或文件大小限制错误，当前依赖链无法证明 0/部分/完整落盘状态，
     /// 即使本方法返回 `Ok(())` 也不承诺事务安全或 logger checkpoint 已清理；见
     /// `LIMIT-ROOT-WAL-IO-001`。
+    /// 遍历成本为 O(事务树节点数 + prepared 动作数)，不执行新的 WAL append；各表回滚会短暂
+    /// 取得 prepared/私有根锁。future 取消不会自动继续 rollback 或 finish。
+    ///
+    /// # Panics
+    ///
+    /// 对非 RootTr variant 调用时 panic。重复 rollback、Fatal 后 rollback 和成功终态后 rollback
+    /// 均属于协议违约，当前返回或 panic 形态不是稳定契约。
     pub async fn rollback_modified(&self) -> Result<(), KVTableTrError> {
         match self {
             KVDBTransaction::RootTr(tr) => {
@@ -5838,7 +5883,12 @@ impl<
             }
         }
 
-        //预提交键值对数据库的根事务
+        // 预提交键值对数据库的根事务。普通 manager.prepare 会把节点 prepare Err 重新包装为
+        // Common(Normal)，而 prepare_conflicts 保留节点原错误。当前五类内置表的合法在线
+        // prepare 失败都只产生 Normal 冲突/重复 TID，因此现有生产语义不受影响；若未来任一
+        // 节点在 prepare 阶段新增 Fatal，必须先修复并复验上游错误等级传播，不能依赖这里恢复。
+        // 静态证据与触发边界归档为 FIND-DEP-003：
+        // docs/REVIEW_FINDINGS.md#find-dep-003。
         match self
             .0
             .db_mgr
@@ -5893,7 +5943,9 @@ impl<
             }
         }
 
-        //预提交键值对数据库的根事务
+        // 与普通 prepare 使用相同顺序、预留和输出聚合；唯一公开差异是冲突错误保留首个
+        // Table/Key。上游本路径还会保留节点原错误等级，不能据此反向承诺 generic prepare
+        // 对未来 Fatal 也有相同行为，详见 FIND-DEP-003。
         match self
             .0
             .db_mgr
@@ -6050,7 +6102,9 @@ impl<
                                                     self.get_commit_uid(),
                                                     self.persistent_children_len());
 
-        //提交键值对数据库的根事务
+        // manager.commit 消费调用方原样交回的一次性 token。非持久化/空 token 只跳过 WAL
+        // append/flush，仍提交整棵 Prepared 可写树；显式只读根由上游短路节点 commit。只有
+        // manager 返回成功后才能 finish，避免提交失败时提前从活动表移除而丢失诊断/恢复状态。
         match self
             .0
             .db_mgr
@@ -6062,7 +6116,8 @@ impl<
             .await {
             Err(e) => Err(e),
             Ok(_) => {
-                //提交键值对数据库的根事务成功，则完成本次键值对数据库事务
+                // finish 只注销外层根并更新 produced/consumed/source 计数，不等待 detached
+                // 表持久化、根 WAL confirm 或 .bak。成功 API 与最终确认是两个有序阶段。
                 self
                     .0
                     .db_mgr
@@ -6079,7 +6134,8 @@ impl<
     ///
     #[inline]
     async fn rollback_modified(&self) -> Result<(), KVTableTrError> {
-        //回滚键值对数据库的根事务
+        // rollback 只适用于上游状态机允许的失败状态和无 Fatal 的事务树，不是任意时刻 cancel。
+        // manager 以后代优先顺序释放全部 prepared 预留/私有根；调用期间不能并发复用同一根。
         if let Err(e) = self
             .0
             .db_mgr
@@ -6091,7 +6147,8 @@ impl<
             return Err(e);
         }
 
-        //回滚键值对数据库的根事务成功，则完成本次键值对数据库事务
+        // 只有整树 rollback 成功才 finish；失败时保留 manager 登记和失败状态供诊断，调用方
+        // 不得通过强制 finish 把未释放的 prepared 项伪装成已关闭事务。
         self
             .0
             .db_mgr

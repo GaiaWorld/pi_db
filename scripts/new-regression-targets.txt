@@ -29,6 +29,7 @@ ordinary_multi_table_concurrency -
 ordinary_multi_table_conflict_rollback -
 ordinary_multi_table_ordering -
 ordinary_multi_table_recovery -
+ordinary_2pc_api_contract -
 prepare_conflict_regression test_prepare_conflict_active_tables
 root_transaction_construction -
 root_transaction_lifecycle -

@@ -197,9 +197,34 @@ rollback 后预留残留。所有失败根关闭后，全新根必须成功重�
 变化；future 被取消同样不会自动 rollback/finish，服务端必须由独立 owner 将 2PC 推进到明确
 终态。
 
-显式只读事务不需要 commit 回调。可写事务即使只有读动作、prepare 输出为空，也必须执行完整
-事务树 commit，以释放 prepare 阶段建立的读预留；空输出只会跳过 WAL append/flush。删表仍应
-使用独立普通根事务，不能与同根建表前导或版本事务混用。
+显式只读事务推荐在读取完成后直接释放，不进入 2PC。当前实现仍兼容对只读根调用 prepare；
+一旦这样做，根会登记到 manager 并返回空 token，必须继续 commit 才能注销。可写事务即使
+只有读动作、prepare 输出为空，也必须执行完整事务树 commit，以释放 prepare 阶段建立的读
+预留；空输出只会跳过 WAL append/flush。删表仍属于普通事务；`table_meta` 和位于首次业务动作
+前的 `create_table*` 可以作为普通/版本共享 schema prelude，完整 DDL rollback/取消原子性仍
+不保证。
+
+### 普通事务公开 2PC
+
+普通事务在 `prepare_modified` 与 `prepare_modified_conflicts` 中二选一。两者执行相同的
+事务启动、共享 TID/CID、表级冲突检查、prepared 预留和 WAL token 聚合；差异只在普通表冲突
+的公开错误投影：前者返回 `Common(Normal, ..)`，后者返回首个
+`Conflicts(Table, Key)`，不提供版本协议 `AllConflicts` 的完整集合。
+
+prepare 返回的 `Vec<u8>` 是与同一根最近一次成功 prepare 绑定的一次性 opaque token，调用方
+只能逐字节原样传给一次 `commit_modified`。当前实现没有在 commit 前校验 token 的事务身份、
+内容或重复使用；修改、截断、附加、跨事务交换和重复使用均不属于合法调用域。空 token 只表示
+本次不执行物理根 WAL append/flush，不表示事务只读或可以跳过 commit。
+
+只有事务实际处于 `ActionFailed`、`PrepareFailed` 或受支持的 `LogCommitFailed`，并且整棵树
+没有 Fatal 时，才能调用 `rollback_modified`。成功 rollback 会关闭旧根，稍后重试必须创建
+全新事务；Fatal 永不可 rollback。`commit_modified` 成功后 manager `finish` 只完成活动根注销，
+不等待表数据文件、根 WAL 异步确认或 `.bak`。
+
+完整签名、合法/禁止调用域、状态图、时序图、锁/取消/性能边界和真实证据见
+`docs/ROOT_ORDINARY_2PC_CONTRACT.md`。当前上游 generic prepare 对未来 Fatal prepare 错误存在
+等级降级风险，但五类内置表的合法 prepare 失败目前只产生 Normal，因此该分支在现有生产路径
+不可达；任何表未来新增 prepare Fatal 前必须先修复并复验上游传播。
 
 ### Key 锁兼容钩子
 
@@ -466,7 +491,7 @@ sanitizer 结论只适用于已测试的 `0.5.2` 依赖图，不能自动外推�
 
 ## Key 版本协议验收基线
 
-本轮正式无 patch 复验实际解析 `pi_async_transaction 0.12.1`、`pi-async-rt 0.5.2` 和
+本轮正式无 patch 复验实际解析 `pi_async_transaction 0.12.2`、`pi-async-rt 0.5.2` 和
 `pi_sinfo 0.6.0`；`Cargo.toml` 继续保持既有 `~0.12`、`~0.5` 和 `~0.6` 范围，不通过收窄版本
 约束代替兼容性验证。版本 API、完整冲突、四个在用表 publication、Btree 冷启动、TTL、快照
 生命周期和真实 WAL/回执聚焦目标均已通过；正确 ABI TSan 未报告数据竞争，ASan 未报告 UAF、
