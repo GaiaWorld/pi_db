@@ -1281,8 +1281,16 @@ impl<
     /// 幂等操作。它不会追加一条业务事务日志，`append_total_count` 不应因此增加。
     ///
     /// 该异步操作获取 logger checkpoint 锁并执行真实文件 I/O；并发 append/confirm/轮换按
-    /// `pi_store::CommitLogger` 锁顺序串行。错误原样作为 `io::Error` 返回，已发生的部分文件
-    /// 副作用不由本 API rollback。真实副作用由 `tests/manager_contract.rs` 验证。
+    /// `pi_store::CommitLogger` 锁顺序串行。轮换会先把已经登记到旧 checkpoint 的非空 current
+    /// WAL 完整提交到旧 writable，再 split 并发布新 checkpoint；因此允许与“已 append、尚未
+    /// flush”的正常事务并发。成功返回是显式 checkpoint/split 的完成屏障，不能用单独一次
+    /// `delay_commit` 返回值替代。
+    ///
+    /// 错误原样作为 `io::Error` 返回，已发生的部分文件副作用不由本 API rollback；维护 future
+    /// 必须运行到返回，不能把 drop 当作取消或 rollback。文件身份、零长度中间 checkpoint、
+    /// `.bak` 顺序和 Btree `try_repair` 最终数据由
+    /// `tests/root_wal_checkpoint_rotation.rs` 验证；完整契约见
+    /// `docs/ROOT_WAL_CHECKPOINT_ROTATION_BUG.md#bug-root-wal-checkpoint-acceptance`。
     pub async fn append_new_commit_log(&self) -> IOResult<usize> {
         let commit_logger = self.0.tr_mgr.commit_logger();
         commit_logger.append_check_point().await

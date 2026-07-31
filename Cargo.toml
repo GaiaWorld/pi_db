@@ -56,5 +56,9 @@ indexmap = { version = "~1.9", features = ["std"] }
 name = "ordinary_2pc_phases"
 harness = false
 
+[[bench]]
+name = "root_wal_checkpoint_rotation"
+harness = false
+
 #[patch.crates-io]
 #pi_ordmap = { path = "../pi_ordmap" }

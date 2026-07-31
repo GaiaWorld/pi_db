@@ -249,6 +249,25 @@ prepare 返回的 `Vec<u8>` 是与同一根最近一次成功 prepare 绑定的�
 写入。根 WAL 已成功后发生的子表数据文件持久化失败仍保留未确认 WAL，并继续适用既有启动恢复
 语义。
 
+### 根 WAL checkpoint 轮换
+
+`KVDBManager::append_new_commit_log` 允许与正常事务提交并发。轮换必须保证事务 CID 登记的
+checkpoint 就是该事务 WAL 实际写入的文件：当前实现会在根 logger 的 `check_points` 锁内先
+把非空 current 块完整提交到旧 writable，再 split 并发布新 checkpoint。这样即使事务已经
+append 但原始延迟 flush 尚未执行，也不会把其 WAL 写入轮换后的新文件。
+
+该修复位于 `pi_store::CommitLogger/LogFile`，没有修改 `pi_db` 公开签名、WAL 格式、普通/版本
+2PC、confirm、replay、`try_repair` 或表级日志语义。普通 append/flush 热路径只增加一次已提交
+句柄的 relaxed 原子快路；非空轮换会多一次低频任务派发并等待原本就必须完成的 WAL sync。
+公开 `LogFile::delay_commit` 成功只表示块写入和 waiter 唤醒，不是自动 split 已完成的文件
+拓扑屏障；维护方必须等待显式 checkpoint/split 返回。
+
+确认回收会把零长度只读 checkpoint 视为无需事务确认，但仍严格按队首连续顺序推进 `.bak`。
+因此零长度中间文件不会永久阻塞后继 WAL，也不能让后继非空已确认 WAL 越过更早的非空未确认
+WAL。`tests/root_wal_checkpoint_rotation.rs` 同时验证精确 replay、真实 manager/Memory 路径和
+Btree `try_repair` 最终数据，并在移走全部根 WAL 后连续两次冷启动；完整方案、安全/取消边界、
+修复前后性能和 E5 结果见 `docs/ROOT_WAL_CHECKPOINT_ROTATION_BUG.md`。
+
 ### 根 WAL 表片段格式
 
 根事务的 prepare buffer 以 16 字节事务 ID 开始，随后按子表 prepare 顺序拼接零个或多个表
