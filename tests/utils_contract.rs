@@ -9,7 +9,8 @@
 //! `FIND-COMPACT-001` 记录，后续真实 DDL/事件专项负责生产可达性。
 //!
 //! 被测入口：`pi_db::utils::{CreateTableOptions, KVDBEvent}`。
-//! 文档入口：`docs/SEMANTIC_CONTRACTS.md#contract-utils-001`。
+//! 文档入口：`docs/CORE_PUBLIC_TYPES_CONTRACT.md#core-public-types-errors-events`、
+//! `docs/SEMANTIC_CONTRACTS.md#contract-observability-events`。
 
 use std::thread;
 
@@ -19,9 +20,14 @@ use pi_db::{
     KVDBTableType,
 };
 
+/// 编译期约束当前无借用的公共工具值对象可在线程间移动和共享。
+fn assert_send_sync<T: Send + Sync>() {}
+
 /// 精确验证三个建表选项 variant 的字段顺序和值在 clone 后保持不变。
 #[test]
 fn test_create_table_options_preserve_exact_payloads() {
+    assert_send_sync::<CreateTableOptions>();
+
     assert!(matches!(
         CreateTableOptions::Empty.clone(),
         CreateTableOptions::Empty
@@ -45,11 +51,29 @@ fn test_create_table_options_preserve_exact_payloads() {
         }
         other => panic!("BtreeOrdTab clone changed variant: {other:?}"),
     }
+
+    // 值对象本身不做范围回退或合法性校验；这里只证明极值和 false 被原样保存，不能外推为
+    // 具体表引擎会按这些值成功创建。
+    match CreateTableOptions::LogOrdTab(0, usize::MAX, 1).clone() {
+        CreateTableOptions::LogOrdTab(file_limit, block_limit, load_len) => {
+            assert_eq!((file_limit, block_limit, load_len), (0, usize::MAX, 1));
+        }
+        other => panic!("boundary LogOrdTab changed variant: {other:?}"),
+    }
+    match CreateTableOptions::BtreeOrdTab(0, false).clone() {
+        CreateTableOptions::BtreeOrdTab(cache_size, enable_compact) => {
+            assert_eq!(cache_size, 0);
+            assert!(!enable_compact);
+        }
+        other => panic!("boundary BtreeOrdTab changed variant: {other:?}"),
+    }
 }
 
 /// 验证每个事件只命中自己的分类谓词，避免调用方把名称相近事件混为一类。
 #[test]
 fn test_event_predicates_are_mutually_exclusive() {
+    assert_send_sync::<KVDBEvent<u64>>();
+
     let report = KVDBEvent::<u64>::ReportTrInfo;
     assert!(report.is_report_transaction_info());
     assert!(!report.is_commit_failed());

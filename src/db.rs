@@ -981,8 +981,9 @@ impl<
     /// 读取一个 Key 的当前逻辑值及同一 publication 窗口中的公开版本。
     ///
     /// 该入口不创建事务、不获取 prepare 锁，也不写 WAL 或数据文件。版本命中时只读取记录；
-    /// 缺席时会分配独立 Guid 并登记首次观察和 TTL，因此它不是纯函数。LogWrite 的逻辑值固定
-    /// 为 `None`；Btree 的真实点读错误返回可恢复 `Common(Normal)`，绝不伪装成 Key 不存在。
+    /// 缺席时会分配独立 Guid 并登记首次观察和 TTL，因此它不是纯函数。统一分派仍能表达
+    /// LogWrite，并会以逻辑值 `None` 建立版本，但合法外部协议禁止这样使用；Btree 的真实点读
+    /// 错误返回可恢复 `Common(Normal)`，绝不伪装成 Key 不存在。
     ///
     /// 表名长度须为 1..=4096 字节，Key 长度须为 1..=u16::MAX。返回版本必须与值成对缓存，
     /// 并且只能进入 `prepare_with_version -> commit_with_version` 独立协议；禁止与普通事务 API
@@ -1192,8 +1193,10 @@ impl<
 
     /// 获取表实现当前报告的记录数。
     ///
-    /// 缺表返回 `None`。Meta/Memory/LogOrdered/LogWrite 从当前内存根读取；Btree 同步打开 redb
-    /// read transaction，再把只写 cache 粗略叠加到持久基线。Btree 当前会把 begin_read、
+    /// 缺表返回 `None`。Meta/Memory/LogOrdered/LogWrite 从当前内存根读取；LogWrite 的根在启动
+    /// loader 和在线 commit 时都会更新，因此这里返回当前内部唯一 Key 数，而不是仅启动基线。
+    /// Btree 同步打开 redb read transaction，再把只写 cache 粗略叠加到持久基线。Btree 当前
+    /// 会把 begin_read、
     /// open_table 或 `table.len()` 错误折叠为 `Some(0)`，且 tombstone/overlay 计数语义仍有
     /// `FIND-TABLE-002` 风险；因此该值不是可用于诊断存储健康的无损 Result。
     ///
@@ -1226,7 +1229,8 @@ impl<
     ///
     /// 缺表返回 `None`；存在空表通常返回 `Some(0)`。该值由表内 COW root/cache 的
     /// `full_bytes_size` 提供，不包含 Arc、树节点、allocator、文件缓存、redb 页面缓存、WAL
-    /// 文件或后台任务开销，不能当作进程 RSS。Btree 只统计只写 cache，不统计 redb 数据。
+    /// 文件或后台任务开销，不能当作进程 RSS。LogWrite 统计当前内部根的 payload，不统计
+    /// 独立 LogFile 或待确认 FIFO；Btree 只统计只写 cache，不统计 redb 数据。
     ///
     /// 调用短暂持 registry 异步读锁和表内同步锁，通常 O(1)、无文件 I/O；并发写入后返回值
     /// 只代表本次读取时刻，不是事务快照。查询不校验名称或 manager 状态；未注册名称返回
@@ -2790,8 +2794,9 @@ impl<
     /// 动作；成功只表示动作已登记，根 WAL、发布、数据文件持久化和确认仍由后续普通 2PC 完成。
     /// 当前未统一拒绝长度为 0 的 Value，调用方必须遵守禁止持久化空值的契约。
     ///
-    /// 每项平均包含一次 registry 查找和表内 O(log n) COW/overlay 更新；LogWrite 只登记动作，
-    /// Btree dirty 当前复用普通 upsert。同步 guard 不用于文件 I/O，本方法自身不写磁盘。
+    /// 每项平均包含一次 registry 查找和表内 O(log n) COW/overlay 更新；LogWrite 同时更新私有
+    /// COW 根和动作表，但不公开该根的点读，Btree dirty 当前复用普通 upsert。同步 guard 不用于
+    /// 文件 I/O，本方法自身不写磁盘。
     /// 根级完整契约、逐表冲突差异和闭环证据见
     /// [ROOT-UPSERT-001](../docs/ROOT_UPSERT_CONTRACT.md#root-upsert-contract-index)。
     pub async fn dirty_upsert(&self,

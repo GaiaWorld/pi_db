@@ -59,7 +59,8 @@ pub enum CreateTableOptions {
 /// 值本身无内部可变性、无 I/O，可在 `Cid: Send` 时跨线程移动。
 ///
 /// 字段和值对象分类由 `tests/utils_contract.rs` 验证；正常批处理和真实 collector payload 由
-/// `tests/manager_listener_contract.rs` 验证，生产投递链和缺口见 `CONTRACT-EVENT-001`。
+/// `tests/manager_listener_contract.rs` 验证，生产投递链和缺口见
+/// [`CONTRACT-OBS-002`](../docs/SEMANTIC_CONTRACTS.md#contract-observability-events)。
 #[derive(Debug, Clone)]
 pub enum KVDBEvent<Cid: Debug + Clone + Send + PartialEq + Eq + 'static> {
     /// 由 `KVDBManager::report_transaction_info` 主动发送的无 payload 请求标记。

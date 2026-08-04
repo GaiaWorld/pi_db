@@ -105,6 +105,25 @@ runtime/进程。`LogTableInspector` 不进入 `CommitLogger` replay，因此不
 覆盖任意表/多表事务、要求可关闭/可重复初始化或依赖日志作正确性判断时，必须先重新冻结设计。
 完整归档见 `docs/TRANSACTION_DEBUG_LOGGER_BOUNDARY.md`（FIND-DEBUG-001）。
 
+<a id="log-write-deferred-boundary"></a>
+
+### LogWrite 暂挂边界
+
+LogWrite 当前没有外部使用，也不允许外部业务直接构造、创建或操作。Rust 表类型枚举、统一
+trait 和数据库内部启动/DDL/repair 仍保留兼容路径，但这只表示实现可表达，不构成公开可用性
+承诺。其 query 固定返回 `None`，delete 是 no-op，keys/values 各产生一个非法业务空哨兵；这些
+都不是最终或最佳 CRUD 设计。
+
+内部共享 COW 根会由冷启动 loader 重建，并在根 WAL 成功后的在线 commit 中立即发布，因此
+`len` 返回当前内部唯一 Key 数，`size` 返回该根的 payload 估值，并非仅有启动基线。query 和
+iterator 故意不暴露这个根；统计也不表示独立表日志已经落盘。持久化事务随后进入表级 FIFO，
+只有 `LogFile::delay_commit` 成功才确认根 WAL，失败会保留 WAL 供启动 repair。
+
+本轮按 HC-059 只完成静态注释、文档和结构映射，不修改行为，也不新增 LogWrite 动态测试、
+sanitizer 或基准。未来下游准备启用该表时，必须先重新冻结 CRUD、统计、错误、关闭、恢复和
+性能语义。完整结构、锁序、生命周期与证据边界见
+`docs/LOG_WRITE_TABLE_INTERNAL_CONTRACT.md`。
+
 <a id="manager-soft-close-boundary"></a>
 
 ### Manager 软关闭边界
@@ -522,6 +541,37 @@ sanitizer 结论只适用于已测试的 `0.5.2` 依赖图，不能自动外推�
 跨硬件 SLA。详细证据保存在本地开发文档 `docs/KEY_VERSION_PUBLICATION_ACCEPTANCE.md`；事务树、
 根 WAL、提交确认、checkpoint、`.bak` 和 `try_repair` 的中文流程图、状态图及时序图保存在
 `docs/TRANSACTION_WAL_RECOVERY_FLOWS.md`。
+
+## 公共核心值对象验收基线
+
+`Binary`、表类型/Meta、QoS/动作载荷、版本载荷、`TableKV`、`KVTableTrError`、
+`CreateTableOptions` 和 `KVDBEvent` 已按当前合法调用域完成契约校准。该切片没有修改公开 API
+签名、生产执行逻辑、事务/WAL/repair/event 语义或下游协议；只补充公开注释、严格值对象测试和
+独立纯 CPU 基准。`TableKV::value` 必须由具体 API 解释：版本 write-set 中 `Some` 为 upsert、
+`None` 为 delete，普通根 `upsert` 跳过 `None`，而普通 `query/delete` 忽略输入 value。
+
+`nightly-2026-06-25` 下，值对象目标 Debug/Release 均 `12/12`，options/events 目标均 `3/3`；
+完整新回归共 128 个成功结果块、273 项测试通过、0 失败，旧 `tests/test.rs` 未进入。当前机器的
+首份基准为：4 KiB `Binary` 共享 clone `2.84ns`、slice 复制 `49.00ns`、Hash `581.05ns`，
+规范 u64 比较 `91.20ns`，嵌套 Meta encode/decode `77.50/100.70ns`，4 KiB value 的
+`TableKV` clone `10.54ns`。这些数值只用于同机同工具链回归，不是跨硬件 SLA。
+
+损坏/截断 codec、非法或空 Key、持久化空 Value、事件表类型偏差和 `Binary::cmp` 的既有额外
+格式化成本仍是独立归档项，不能因上述合法域验收而视为已解决。
+
+## 公开 API 主线验收边界
+
+本轮已按实际导出面逐组对账 crate 根值对象、`KVAction/KVTable`、Builder/Manager、根事务与
+普通/版本 2PC、五类表、listener/trace、Inspector 和历史 debug logger。面向外部生产使用的
+合法域均有独立新测试或对应的真实跨层专项；直接表构造和子事务 variant 仍只是框架兼容面，
+外部必须通过 `KVDBManager/KVDBTransaction` 使用。LogWrite 和 `log_table_debug` 分别保持既有
+静态 E2 暂挂，不因本轮收口而变成生产可用能力。
+
+“主线验收完成”只表示所有公开组均已分类、支持域已有严格证据、禁止/暂挂/非目标域已有稳定
+说明，不表示损坏输入、路径 containment、graceful shutdown、collector Join、统一 dirty 隔离、
+真实 Key 锁、事件标签和 DDL 完整 rollback 原子性已经实现。完整逐项矩阵、测试入口、性能与
+sanitizer 适用范围及保留问题见 `docs/PUBLIC_API_MAINLINE_ACCEPTANCE.md`；旧 `tests/test.rs`
+永远不进入新回归入口。
 
 ## 普通 Memory 并发基准
 

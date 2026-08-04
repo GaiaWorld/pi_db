@@ -35,7 +35,13 @@ const TTL_SCAN_BATCH_SIZE: usize = 256;
 /// 一个 Key 的公开版本。
 ///
 /// Upsert/Delete 都携带产生该版本的 transaction UID；首次观察使用事务管理器同一 Guid
-/// 生成器独立分配 UID，但不表示发生过真实事务提交。
+/// 生成器独立分配 UID，但不表示发生过真实事务提交。首次观察到 Key 不存在时也使用
+/// [`Version::Delete`]，其 Guid 只标识这次已发布的不存在状态，不能解释为 delete 事务回执。
+///
+/// `Guid` 是 owned `u128` 值；clone、相等和 Hash 均为 O(1)，不会借用或访问版本缓存，也不会
+/// 刷新 TTL。后续事务发布、TTL 淘汰或数据库关闭不会原地改变已经返回的 `Version`。该类型
+/// 本身不执行查询、写入、WAL、锁或 I/O；完整协议边界见
+/// [CORE-PUBLIC-TYPES-001](../docs/CORE_PUBLIC_TYPES_CONTRACT.md#core-public-types-version-payload)。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Version {
     /// 最新公开状态由插入或更新产生。
@@ -44,7 +50,14 @@ pub enum Version {
     Delete(Guid),
 }
 
-/// 表、Key 和公开版本的联合载荷。
+/// 表、Key 和公开版本的 owned 联合载荷。
+///
+/// 该结构同时用于 `query_with_version` 的观察结果、`prepare_with_version` 的 read-set 和
+/// `commit_with_version` 的业务回执；相同字段布局不表示三个阶段可以互换。返回值是创建时的
+/// 值对象而不是实时版本缓存 view，clone 会共享 `Atom`/`Binary` owner 并复制小型 `Version`。
+/// 构造字段不会验证表是否存在、Key 是否为匹配 Meta 的规范 BON，也不会登记 read-set、刷新
+/// TTL 或选择事务协议。相等和 Hash 按三字段内容计算，合法 Key 的比较前提与 [`crate::Binary`]
+/// 相同。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TableKeyVersion {
     /// 表名。
@@ -58,7 +71,8 @@ pub struct TableKeyVersion {
 /// 表名和 Key 的联合标识。
 ///
 /// 当前内部成功路径用它索引版本事务的最终写集合；版本冲突错误使用携带类型的
-/// [`TableKeyConflict`]。字段均为 owned 值，不借用表或事务。
+/// [`TableKeyConflict`]。字段均为 owned 值，不借用表或事务，也不是数据库存在性证明。clone
+/// 共享 `Atom`/`Binary` owner；相等和 Hash 按字段内容计算，不访问版本缓存、表、WAL 或 I/O。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TableKey {
     /// 表名。

@@ -1,8 +1,9 @@
 //! L1 核心值对象、元数据与错误类型的独立契约测试。
 //!
 //! 本 target 与历史 `tests/test.rs` 完全独立，覆盖 `Binary`、`KVDBTableType`、
-//! `KVTableMeta`、`TableTrQos`、`KVActionLog` 和 `KVTableTrError` 的合法公开调用域。测试只用
-//! 内存和标准线程，不依赖 runtime、文件系统、时钟、端口或执行顺序，可以离线稳定运行。
+//! `KVTableMeta`、`TableTrQos`、`KVActionLog`、版本值对象、`TableKV` 和 `KVTableTrError` 的
+//! 合法公开调用域。测试只用内存和标准线程，不依赖 runtime、文件系统、时钟、端口或执行
+//! 顺序，可以离线稳定运行。
 //!
 //! 这里刻意不把下列当前缺陷写成通过断言：畸形/空 Key 比较 panic、损坏元数据解码 panic、
 //! 持久化空 Value，以及非规范编码的 `Eq`/`Hash` 边界。它们分别由 `Q-KEY-001`、
@@ -11,7 +12,7 @@
 
 use std::{
     cmp::Ordering,
-    collections::hash_map::DefaultHasher,
+    collections::{HashSet, hash_map::DefaultHasher},
     hash::{Hash, Hasher},
     sync::{Arc, Weak},
     thread,
@@ -21,7 +22,10 @@ use pi_async_transaction::{ErrorLevel, TransactionConflictError, TransactionErro
 use pi_atom::Atom;
 use pi_bon::{Encode, WriteBuffer};
 use pi_db::{Binary, KVActionLog, KVDBTableType, KVTableMeta, KVTableTrError,
-            TableKeyConflict, TableTrQos, VersionConflictKind};
+            TableKey, TableKeyConflict, TableKeyVersion, TableTrQos, Version,
+            VersionConflictKind,
+            tables::TableKV};
+use pi_guid::Guid;
 use pi_ordmap::asbtree::TreeByteSize;
 use pi_sinfo::EnumType;
 
@@ -258,6 +262,106 @@ fn test_qos_and_action_log_value_contracts() {
     assert!(matches!(dirty_delete, KVActionLog::DirtyWrite(None)));
 }
 
+/// 验证公开版本载荷拥有字段、保持 variant、按内容相等/Hash，且不会借用版本缓存。
+///
+/// 固定 Guid 只用于值对象断言，不冒充事务管理器生成或已经提交的生产 transaction UID。
+#[test]
+fn test_version_and_table_key_value_object_contracts() {
+    assert_send_sync::<Version>();
+    assert_send_sync::<TableKeyVersion>();
+    assert_send_sync::<TableKey>();
+
+    let table = Atom::from("versioned_users");
+    let key = encode_bon(&71_u64);
+    let upsert_uid = Guid(0x1020_3040_5060_7080_90a0_b0c0_d0e0_f001);
+    let delete_uid = Guid(0x1020_3040_5060_7080_90a0_b0c0_d0e0_f002);
+    let upsert = Version::Upsert(upsert_uid.clone());
+    let delete = Version::Delete(delete_uid.clone());
+
+    match &upsert {
+        Version::Upsert(uid) => assert_eq!(uid, &upsert_uid),
+        other => panic!("upsert version changed variant: {other:?}"),
+    }
+    match &delete {
+        Version::Delete(uid) => assert_eq!(uid, &delete_uid),
+        other => panic!("delete version changed variant: {other:?}"),
+    }
+    assert_ne!(upsert, delete);
+
+    let observed = TableKeyVersion {
+        table: table.clone(),
+        key: key.clone(),
+        version: upsert,
+    };
+    let observed_clone = observed.clone();
+    assert_eq!(observed_clone, observed);
+    assert!(Binary::binary_equal(&observed.key, &observed_clone.key));
+    assert_eq!(hash_of(&observed), hash_of(&observed_clone));
+
+    let mut observed_set = HashSet::new();
+    assert!(observed_set.insert(observed.clone()));
+    assert!(!observed_set.insert(observed_clone));
+    assert_eq!(observed_set.len(), 1);
+
+    let table_key = TableKey {
+        table,
+        key,
+    };
+    let table_key_clone = table_key.clone();
+    assert_eq!(table_key_clone, table_key);
+    assert!(Binary::binary_equal(&table_key.key, &table_key_clone.key));
+    assert_eq!(hash_of(&table_key), hash_of(&table_key_clone));
+}
+
+/// 验证 `TableKV` 的 Some/None 载荷表达、O(1) clone 所有权和跨线程释放生命周期。
+///
+/// 该测试不调用数据库 API，因此不会把三元组构造误写为事务选择、表校验或 WAL 副作用。
+#[test]
+fn test_table_kv_owned_payload_and_lifetime_contract() {
+    assert_send_sync::<TableKV>();
+
+    let key_owner = encode_bon(&73_u64).to_shared();
+    let key_weak = Arc::downgrade(&key_owner);
+    let value_owner = Arc::new(vec![79, 83, 89]);
+    let value_weak = Arc::downgrade(&value_owner);
+    let action = TableKV::new(
+        Atom::from("owned_actions"),
+        Binary::from_shared(key_owner),
+        Some(Binary::from_shared(value_owner)),
+    );
+
+    assert!(action.exist_value());
+    assert_eq!(action.table.as_str(), "owned_actions");
+    assert_eq!(action.value.as_ref().expect("upsert value").as_ref(), &[79, 83, 89]);
+
+    let cloned = action.clone();
+    assert!(Binary::binary_equal(&action.key, &cloned.key));
+    assert!(Binary::binary_equal(
+        action.value.as_ref().expect("original value"),
+        cloned.value.as_ref().expect("cloned value"),
+    ));
+    thread::spawn(move || {
+        assert!(cloned.exist_value());
+        assert_eq!(cloned.table.as_str(), "owned_actions");
+    })
+    .join()
+    .expect("moving a cloned TableKV across an OS thread must not panic");
+
+    assert!(key_weak.upgrade().is_some());
+    assert!(value_weak.upgrade().is_some());
+    drop(action);
+    assert!(key_weak.upgrade().is_none());
+    assert!(value_weak.upgrade().is_none());
+
+    let delete = TableKV::new(
+        Atom::from("owned_actions"),
+        encode_bon(&97_u64),
+        None,
+    );
+    assert!(!delete.exist_value());
+    assert!(delete.value.is_none());
+}
+
 /// 验证 Common/Fatal/Conflicts 的分类、等级、诊断信息和 owned 冲突上下文。
 ///
 /// 断言严格区分不可恢复 Fatal 与固定为 Normal 的冲突；不执行事务 rollback，因为该行为由
@@ -288,6 +392,7 @@ fn test_table_transaction_error_contract() {
     assert!(matches!(fatal.level(), ErrorLevel::Fatal));
 
     let expected_key = encode_bon(&42_u64);
+    let original_key_owner = expected_key.clone();
     let expected_bytes = expected_key.as_ref().to_vec();
     let conflict = KVTableTrError::new_conflicts_error(Atom::from("users"), expected_key);
 
@@ -299,6 +404,10 @@ fn test_table_transaction_error_contract() {
         .expect("Conflicts must expose its owned context");
     assert_eq!(table.as_str(), "users");
     assert_eq!(key.as_ref(), expected_bytes.as_slice());
+    assert!(
+        !Binary::binary_equal(&original_key_owner, key),
+        "new_conflicts_error must own a copied Key allocation"
+    );
     assert!(conflict.all_conflicts().is_none());
 
     let all_conflicts =
@@ -334,6 +443,72 @@ fn test_table_transaction_error_contract() {
         .expect("AllConflicts must preserve the compatibility first position");
     assert_eq!(first.0, &classified[0].table);
     assert_eq!(first.1, &classified[0].key);
+}
+
+/// 验证事务框架冲突集合转换只转换冲突 variant、合并阶段只追加、最终构造才归一化。
+#[test]
+fn test_table_transaction_conflict_set_conversion_and_merge_contract() {
+    let ordinary_key = encode_bon(&101_u64);
+    let ordinary = KVTableTrError::new_conflicts_error(
+        Atom::from("ordinary"),
+        ordinary_key.clone(),
+    );
+    let ordinary_set = ordinary
+        .into_conflict_set()
+        .expect("ordinary conflict must convert into one classified item");
+    assert_eq!(ordinary_set.len(), 1);
+    assert_eq!(ordinary_set[0].table.as_str(), "ordinary");
+    assert_eq!(ordinary_set[0].key, ordinary_key);
+    assert_eq!(ordinary_set[0].kind, VersionConflictKind::TransactionConflict);
+
+    let common = <KVTableTrError as TransactionError>::new_transaction_error(
+        ErrorLevel::Normal,
+        "not-a-conflict",
+    );
+    let returned = common
+        .into_conflict_set()
+        .expect_err("Common must remain an error instead of becoming an empty conflict set");
+    assert!(returned.is_common());
+    assert!(!returned.is_conflicts());
+
+    let duplicate_key = encode_bon(&103_u64);
+    let mut target = vec![TableKeyConflict {
+        table: Atom::from("merged"),
+        key: duplicate_key.clone(),
+        kind: VersionConflictKind::TransactionConflict,
+    }];
+    let source = vec![
+        TableKeyConflict {
+            table: Atom::from("other"),
+            key: encode_bon(&107_u64),
+            kind: VersionConflictKind::TransactionConflict,
+        },
+        TableKeyConflict {
+            table: Atom::from("merged"),
+            key: duplicate_key,
+            kind: VersionConflictKind::ReadSetVersionMismatch,
+        },
+    ];
+    <KVTableTrError as TransactionConflictError>::merge_conflict_sets(&mut target, source);
+    assert_eq!(target.len(), 3, "merge must append without premature normalization");
+    assert_eq!(target[0].table.as_str(), "merged");
+    assert_eq!(target[1].table.as_str(), "other");
+    assert_eq!(target[2].table.as_str(), "merged");
+
+    let normalized = <KVTableTrError as TransactionConflictError>::from_conflict_set(target);
+    let classified = normalized
+        .all_conflicts()
+        .expect("final construction must produce a classified complete set");
+    assert_eq!(classified.len(), 2);
+    assert_eq!(classified[0].table.as_str(), "merged");
+    assert_eq!(classified[0].kind, VersionConflictKind::ReadSetVersionMismatch);
+    assert_eq!(classified[1].table.as_str(), "other");
+    let expected = classified.to_vec();
+
+    let round_trip = normalized
+        .into_conflict_set()
+        .expect("AllConflicts must return its owned normalized set");
+    assert_eq!(round_trip, expected);
 }
 
 /// 验证显式 `Send/Sync` 错误类型可被多个真实 OS 线程并发只读。

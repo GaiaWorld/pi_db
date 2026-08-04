@@ -16,7 +16,8 @@
 //! [`db::KVDBTransaction::commit_with_version`] 组成供外部缓存使用的独立版本事务协议。该协议
 //! 不得与同一事务上的普通 `query/upsert/delete/prepare/commit` 混用。详细架构、语义边界和
 //! 验收入口分别见仓库本地 `docs/PI_DB_ARCHITECTURE.md`、`docs/SEMANTIC_CONTRACTS.md` 与
-//! `docs/TEST_AND_BENCHMARK_STRATEGY.md`。
+//! `docs/TEST_AND_BENCHMARK_STRATEGY.md`；逐公开 API 的最终分类与证据入口见
+//! `docs/PUBLIC_API_MAINLINE_ACCEPTANCE.md`。
 //!
 //! 当前事务安全结论不覆盖根 WAL 自身因磁盘空间、配额、只读文件系统、设备 I/O、runtime
 //! 拒绝异步任务或文件大小限制而失败的环境域；这类失败的返回值不能证明 WAL 实际写入了
@@ -84,6 +85,8 @@ pub const MAX_TABLE_NAME_BYTES: usize = 4 * 1024;
 /// 原子引用计数操作；从 slice 构造为 O(n) 时间和 O(n) 新空间。实例可在线程间移动和共享，
 /// 不持锁、不执行 I/O、不回调用户代码。活跃 clone 会延长 payload 生命周期，但内部没有
 /// 反向引用，不形成引用环。
+/// 完整值对象契约、受信 codec 边界和性能证据入口见
+/// [CORE-PUBLIC-TYPES-001](../docs/CORE_PUBLIC_TYPES_CONTRACT.md#core-public-types-contract-index)。
 ///
 /// # Example
 ///
@@ -375,9 +378,9 @@ pub trait KVAction: Send + Sync + 'static {
 
     /// 在事务私有视图中插入或替换值，并采用该表实现的 dirty 写策略。
     ///
-    /// Meta/Memory/LogOrdered/LogWrite 记录 `DirtyWrite(Some(value))`；前三者还更新 COW 根，
-    /// LogWrite 只保留动作。Btree 当前直接复用普通 [`KVAction::upsert`]，记录 `Write` 而非
-    /// `DirtyWrite`。后续同 Key 动作会替换本次记录。
+    /// Meta/Memory/LogOrdered/LogWrite 记录 `DirtyWrite(Some(value))` 并更新事务私有 COW 根；
+    /// LogWrite 虽不公开读取，该根仍用于冲突基线和 commit 发布。Btree 当前直接复用普通
+    /// [`KVAction::upsert`]，记录 `Write` 而非 `DirtyWrite`。后续同 Key 动作会替换本次记录。
     ///
     /// `key`/`value` 均被 future 消费。当前实现不在这里拒绝只读事务、非法状态、畸形 Key
     /// 或空 Value，也不写 WAL/数据文件；成功仅表示私有动作已记录。COW/Btree 更新通常为
@@ -392,9 +395,9 @@ pub trait KVAction: Send + Sync + 'static {
 
     /// 在事务私有视图中插入或替换值，并记录普通写动作。
     ///
-    /// 所有内置实现记录 `Write(Some(value))`；Meta/Memory/LogOrdered/Btree 同时更新事务私有
-    /// 根或 overlay，LogWrite 只记录动作。成功、输入校验、持久化时点、锁和复杂度边界与
-    /// [`KVAction::dirty_upsert`] 相同，区别仅在当前冲突分类。该调用不是幂等的操作历史：
+    /// 所有内置实现记录 `Write(Some(value))` 并更新事务私有根或 overlay；LogWrite 的私有根
+    /// 只服务冲突与 commit，不改变其公开只写边界。成功、输入校验、持久化时点、锁和复杂度
+    /// 边界与 [`KVAction::dirty_upsert`] 相同，区别仅在当前冲突分类。该调用不是幂等的操作历史：
     /// 相同 Key 的后续动作覆盖动作表记录；相同值重复写在最终数据上可能等效，但仍会重写
     /// 事务状态并参与 prepare。根级批次、失败边界与闭环证据见
     /// [`ROOT-UPSERT-001`](../docs/ROOT_UPSERT_CONTRACT.md#root-upsert-contract-index)。
@@ -532,7 +535,9 @@ pub enum KVDBTableType {
     LogOrdTab,
     /// 只记录 upsert 动作的数据日志表。
     ///
-    /// 当前 query/delete 不返回数据，keys/values 仍是已归档的哨兵行为，不应按有序表使用。
+    /// 当前合法外部协议禁止创建或使用。统一 trait 下的 query/delete 不返回数据，keys/values
+    /// 仍是已归档的哨兵行为，不应按普通有序表使用；完整现状见
+    /// [LOG-WRITE-INTERNAL-001](../docs/LOG_WRITE_TABLE_INTERNAL_CONTRACT.md#log-write-table-internal-contract-index)。
     LogWTab,
     /// 以 redb 为稳定数据、COW 内存 overlay/tombstone 为事务写集的有序 B 树表。
     BtreeOrdTab,
@@ -1057,7 +1062,9 @@ static COMMITED_LEN: AtomicUsize = AtomicUsize::new(0);
 /// 类型可跨线程移动和共享且无内部可变性；它本身不执行 rollback、日志、I/O 或回调，真正
 /// 的错误传播由事务树负责。测试入口见 `tests/core_types_contract.rs`；可恢复与 Fatal 边界见
 /// `CONTRACT-TR-003` / `CONTRACT-TR-004`；版本冲突分类契约见
-/// [VERSION-CONFLICT-KIND-001](../docs/VERSION_CONFLICT_KIND_DESIGN.md#version-conflict-kind-design-index)。
+/// [VERSION-CONFLICT-KIND-001](../docs/VERSION_CONFLICT_KIND_DESIGN.md#version-conflict-kind-design-index)，
+/// 值对象总契约见
+/// [CORE-PUBLIC-TYPES-001](../docs/CORE_PUBLIC_TYPES_CONTRACT.md#core-public-types-errors-events)。
 #[derive(Debug)]
 pub enum KVTableTrError {
     /// 普通事务错误：错误等级和拥有的诊断字符串。

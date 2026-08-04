@@ -7,6 +7,8 @@
 //!   append/confirm，并可由新 Inspector 再次检查；
 //! - callback 检查期间到达的 confirm 会先被真实 logger 缓冲；检查结束通知只能在
 //!   `finish_replay` 已清空缓冲并恢复 logger 后发出。
+//! - 未开始时 `next` 立即返回 `None`；活动 callback 会原子拒绝第二个 pull/callback begin；
+//!   活动表日志 pull 同样拒绝重复 begin。
 //!
 //! Inspector 是专用、离线、单消费者、单实例一次性使用的诊断工具。底层 replay 为建立稳定
 //! 遍历边界可以分裂或整理 WAL；本测试不把它描述为物理文件只读，也不允许与在线数据库共享
@@ -71,6 +73,10 @@ fn verify_empty_pull_can_be_repeated(
 
     for round in 0..2u128 {
         let inspector = CommitLogInspector::new(rt.clone(), logger.clone());
+        require(
+            inspector.next().is_none(),
+            &format!("pull round {round} returned an action before begin"),
+        )?;
         require(
             inspector.begin(),
             &format!("pull round {round} did not start"),
@@ -153,6 +159,14 @@ fn verify_callback_drains_replay_confirms_before_completion(
     )?;
     expect_eq("callback key", &record.5, &KEY_BYTES.to_vec())?;
     expect_eq("callback value", &record.6, &VALUE_BYTES.to_vec())?;
+    require(
+        !inspector.begin(),
+        "an active callback inspection accepted a competing pull begin",
+    )?;
+    require(
+        !inspector.begin_with_callback(|_| {}),
+        "an active callback inspection accepted a second callback begin",
+    )?;
 
     let probe_commit_uid = Guid(0x7203);
     append_flush_confirm(
@@ -232,8 +246,16 @@ fn verify_log_table_can_be_read_repeatedly(
                 format!("constructing LogTableInspector round {round} failed: {error}")
             })?;
         require(
+            inspector.next().is_none(),
+            &format!("LogTableInspector round {round} returned a record before begin"),
+        )?;
+        require(
             inspector.begin(),
             &format!("LogTableInspector round {round} did not start"),
+        )?;
+        require(
+            !inspector.begin(),
+            &format!("LogTableInspector round {round} accepted a duplicate active begin"),
         )?;
         let mut observed = Vec::new();
         while let Some((_file, is_upsert, key, value)) = inspector.next() {

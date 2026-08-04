@@ -10,6 +10,9 @@
 //! 与版本号，然后把需要持久化的动作移交给表级 collector；collector 成功提交 `LogFile` 后才
 //! 调用确认器。表日志失败不会回调伪造失败确认，根 WAL 会继续保留以供恢复。这个流程只是对
 //! 当前内部实现的如实说明，不构成允许外部启用 LogWrite 的承诺。
+//!
+//! 完整结构、锁序、生命周期、恢复链及当前非最终边界见
+//! [LOG-WRITE-INTERNAL-001](../../docs/LOG_WRITE_TABLE_INTERNAL_CONTRACT.md#log-write-table-internal-contract-index)。
 
 use std::mem;
 use std::path::{Path, PathBuf};
@@ -80,12 +83,14 @@ pub struct LogWriteTable<
     Log: AsyncCommitLog<C = C, Cid = Guid>,
 >(Arc<InnerLogWriteTable<C, Log>>);
 
-// SAFETY: root/prepare/waits 和 collector owner 均由锁或原子类型保护；外层只移动 Arc。
+// SAFETY: 外层只移动 Arc；root/prepare 由 parking_lot::Mutex 保护，waits 由 async_lock::Mutex
+// 保护，计数和 collector owner 使用原子。任何裸指针或无同步可变引用都不会从该句柄暴露。
 unsafe impl<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>,
 > Send for LogWriteTable<C, Log> {}
-// SAFETY: 共享引用不能绕过内部同步原语。公开行为是否合理是已暂停的设计问题。
+// SAFETY: 共享引用不能绕过内部同步原语；LogFile 和 runtime 的跨线程能力由其类型契约提供。
+// 该 marker 只证明内存访问边界，不证明外部调用 LogWrite 的业务协议合法。
 unsafe impl<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>,
@@ -109,18 +114,24 @@ impl<
 
     #[inline]
     fn is_persistent(&self) -> bool {
+        // 表始终拥有独立 LogFile；事务是否实际产生根 WAL 仍由子事务 persistence 和动作决定。
         true
     }
 
     fn is_ordered(&self) -> bool {
+        // 这是历史能力分类，不表示 keys/values 提供真实有序数据；当前两者只返回合成哨兵。
         true
     }
 
     fn len(&self) -> usize {
+        // 统计当前内部已提交 COW 根中的唯一 Key 数。该根由冷启动 loader 重建，并在每次包含
+        // upsert 的成功 commit 中立即发布，因此不是“仅启动基线”；它仍不代表表日志已确认。
         self.0.root.lock().size()
     }
 
     fn size(&self) -> u64 {
+        // clone 取得本次观察的稳定 COW root owner，随后在锁外读取 payload 估值。结果不包含
+        // OrdMap 节点/allocator、LogFile、待确认队列或 WAL，也不能证明独立表日志已经落盘。
         let root_copy = self.0.root.lock().clone();
         root_copy.full_bytes_size()
     }
@@ -131,6 +142,7 @@ impl<
                    is_persistent: bool,
                    prepare_timeout: u64,
                    commit_timeout: u64) -> Self::Tr {
+        // 低层构造只捕获当前根，不注册根事务树、TID/CID 或版本上下文；业务调用必须经 manager。
         LogWTabTr::new(source,
                        is_writable,
                        is_persistent,
@@ -143,6 +155,7 @@ impl<
         let table = self.clone();
 
         async move {
+            // split 只轮换独立表日志，不推进根事务、根 WAL checkpoint 或提交确认。
             let now = Instant::now();
             match table.0.log_file.split().await {
                 Err(e) => {
@@ -166,6 +179,8 @@ impl<
         let table = self.clone();
 
         async move {
+            // collect 合并/回收已经形成的只读表日志；它不是 collector 等待队列的 drain 接口，
+            // 也不与并发 DDL/事务建立全库快照或原子边界。
             let now = Instant::now();
             match table.0.log_file.collect(1024 * 1024,
                                            32 * 1024,
@@ -196,7 +211,8 @@ impl<
     /// 打开、恢复并启动 LogWrite collector。
     ///
     /// 打开/加载失败会 panic，后台任务永久持有表 clone；参数语义与 LogOrdered 的表日志配置
-    /// 相同。此构造器仅供数据库内部兼容加载，协议层禁止外部直接调用或创建新 LogWrite 表。
+    /// 相同。Rust 类型和 DDL 枚举仍可表达该表，数据库内部启动、DDL 与 repair 也保留构造路径，
+    /// 但当前合法外部业务协议明确禁止直接构造、创建或使用 LogWrite。
     pub async fn new<P: AsRef<Path>>(rt: MultiTaskRuntime<()>,
                                      path: P,
                                      name: Atom,
@@ -264,7 +280,8 @@ impl<
                     loader.bytes_len(),
                     now.elapsed());
 
-                //启动只写日志表的提交待确认事务的定时整理
+                // 启动永久定时 collector。任务捕获 table clone，因此 drop registry/manager 不会
+                // 单独终止它或立即释放 LogFile；当前只随专用 runtime/进程结束，没有 join 回执。
                 let table_copy = table.clone();
                 let _ = table.0.rt.spawn(async move {
                     let table_ref = &table_copy;
@@ -299,7 +316,7 @@ struct InnerLogWriteTable<
     Log: AsyncCommitLog<C = C, Cid = Guid>,
 > {
     name:           Atom,                                                                                                   // 逻辑表名。
-    root:           Mutex<OrdMap<Tree<Binary, Binary>>>,                                                                    // 内部已提交 upsert 根；公开读不暴露。
+    root:           Mutex<OrdMap<Tree<Binary, Binary>>>,                                                                    // 内部已提交 upsert 根；启动加载和在线 commit 都会更新，公开读不暴露。
     prepare:        Mutex<XHashMap<Guid, PreparedActions>>,                                                                 // TID -> 已预留 upsert 动作。
     rt:             MultiTaskRuntime<()>,                                                                                   // collector 与表日志 I/O runtime。
     waits:          AsyncMutex<VecDeque<(LogWTabTr<C, Log>, XHashMap<Binary, KVActionLog>, <LogWTabTr<C, Log> as Transaction2Pc>::CommitConfirm)>>, // 已发布、待表日志和确认 FIFO。
@@ -310,12 +327,14 @@ struct InnerLogWriteTable<
     log_file:       LogFile,                                                                                                // 独立 upsert 数据日志，不是根 WAL。
 }
 
-// SAFETY: 共享可变字段均由 Mutex/AsyncMutex/原子类型保护。
+// SAFETY: 共享可变字段均由 Mutex/AsyncMutex/原子类型保护；name/limits 为初始化后只读值，
+// LogFile/runtime 自身满足跨线程契约。该结构不向外返回内部 guard 或可变借用。
 unsafe impl<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>,
 > Send for InnerLogWriteTable<C, Log> {}
-// SAFETY: 共享引用无法绕过上述同步边界。
+// SAFETY: 共享引用无法绕过上述同步边界；collector 跨 await 只持有 async waits guard，不持有
+// root/prepare 的同步 guard。业务协议限制与此内存安全 marker 相互独立。
 unsafe impl<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>,
@@ -343,12 +362,14 @@ enum PrepareConflictKind {
     All,
 }
 
-// SAFETY: 外层为 Arc，内部字段由 SpinLock/AtomicBool 和表级锁同步。
+// SAFETY: 外层为 Arc，事务 UID/状态/COW 根/动作表由 SpinLock 保护，persistence 使用原子，
+// 表级共享状态继续由 LogWriteTable 的同步边界保护；没有自引用或裸指针。
 unsafe impl<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>,
 > Send for LogWTabTr<C, Log> {}
-// SAFETY: 共享访问不产生无同步别名；行为协议仍明确禁止外部使用。
+// SAFETY: 共享访问不产生无同步别名，clone 只共享同一事务 owner。该声明不允许同一事务绕过
+// 一次 prepare/commit/rollback 协议，也不把 LogWrite 提升为可用外部表。
 unsafe impl<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>,
@@ -876,6 +897,10 @@ impl<
     }
 
     /// 构建由数据库管理器装配的只写表事务；内部根仅作为冲突基线，不改变公开读固定 None。
+    ///
+    /// `mode` 可以由统一根装配代码表达 Ordinary/Versioned，但 HC-059 的合法外部协议禁止把
+    /// LogWrite 加入版本服务。`actions` 会先应用到私有候选根；本函数不登记表级 prepare，
+    /// 不分配 TID/revision，也不发布版本或回执。
     pub(crate) fn new_managed(source: Atom,
                               is_writable: bool,
                               is_persistent: bool,
@@ -1104,7 +1129,9 @@ impl<
         //获取事务的当前操作记录，并重置事务的当前操作记录
         let actions = mem::replace(&mut *self.0.actions.lock(), XHashMap::default());
 
-        //在事务对应的表的根节点，执行操作记录中的所有写操作
+        // 在事务对应表的根节点先重建 WAL 已提交状态，再把同一动作登记给后续 commit_repair。
+        // commit 时会再次按 Key 合并冻结动作；upsert/delete 对相同最终状态是幂等的。当前合法
+        // LogWrite WAL 只包含 Some(value) upsert，delete 分支仅保留通用 codec 兼容。
         for (key, action) in &actions {
             match action {
                 KVActionLog::Write(Some(value)) | KVActionLog::DirtyWrite(Some(value)) => {
@@ -1172,7 +1199,9 @@ struct InnerLogWTabTr<
 /// 从 LogFile 冷启动重建 LogWrite 内存根的加载器。
 ///
 /// `removed` 记录已观察到的 tombstone，防止继续扫描旧日志时把更早值复活；`root` 中已有 Key
-/// 同样会跳过更旧记录。正确性依赖 LogFile 的恢复迭代顺序契约，而不是 HashMap 的遍历顺序。
+/// 同样会跳过更旧记录。`pi_store::LogFile::load` 先读当前可写文件，再按新到旧读取只读文件；
+/// 每个文件从尾块向头块读，块内记录也反向输出。因此第一次看到的 Key 就是最新状态，正确性
+/// 依赖这个恢复迭代顺序契约，而不是 HashMap 的遍历顺序。
 struct LogWriteTableLoader<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>,
@@ -1250,11 +1279,13 @@ impl<
 
     /// 获取已加载的文件数量
     pub fn log_files_len(&self) -> usize {
+        // 只统计至少贡献一个最终存活 value 的文件；只有 tombstone 或被新记录遮蔽的文件不计入。
         self.statistics.len()
     }
 
     /// 获取已加载的关键字数量
     pub fn keys_len(&self) -> u64 {
+        // 统计 loader 实际采用的最终 value 记录数，不含 tombstone、旧版本和运行期后续 commit。
         let mut len = 0;
 
         for statistics in self.statistics.values() {
@@ -1266,6 +1297,7 @@ impl<
 
     /// 获取已加载的字节数
     pub fn bytes_len(&self) -> u64 {
+        // 统计 loader 最终采用记录的 key+value payload，不含块头、文件头或目录实际占用。
         let mut len = 0;
 
         for statistics in self.statistics.values() {

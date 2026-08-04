@@ -231,9 +231,17 @@ pub trait KVTable: Send + Sync + 'static {
 
 /// 版本批量事务与根事务分发表动作时使用的表/Key/Value 三元组。
 ///
-/// `value = Some` 表示 upsert，`value = None` 表示 delete。它不是带版本号的快照，也不验证
-/// 表是否存在、Key 编码是否合法或 Value 是否为空；这些边界由数据库入口和协议层负责。
-/// clone 会克隆 `Atom` 并增加 `Binary` 的共享引用计数，不复制二进制 payload。
+/// `value` 必须结合消费 API 解释：版本 `write_set` 和 WAL/replay 动作中 `Some` 表示 upsert、
+/// `None` 表示 delete；普通根 `upsert/dirty_upsert` 会跳过 `None`，`query/dirty_query` 与
+/// `delete/dirty_delete` 则忽略输入 value。它不是带版本号的快照，也不验证表是否存在、Key
+/// 编码是否合法或 Value 是否为空；这些边界由数据库入口和协议层负责。
+/// 仅构造该值不会选择 Ordinary/Versioned 协议，也不会创建表事务、获取锁、修改版本缓存、
+/// 写 WAL 或执行 I/O。
+///
+/// clone 会克隆 `Atom` 并增加 `Binary` 的共享引用计数，不复制二进制 payload；活跃 clone 会
+/// 延长 Key/Value allocation 生命周期，但结构中没有反向引用或引用环。构造和
+/// [`TableKV::exist_value`] 都是 O(1)，可跨线程移动/共享。公开协议和逐 API 的 `value` 语义见
+/// [CORE-PUBLIC-TYPES-001](../../docs/CORE_PUBLIC_TYPES_CONTRACT.md#core-public-types-version-payload)。
 #[derive(Debug, Clone)]
 pub struct TableKV {
     /// 目标表名。
@@ -266,7 +274,9 @@ impl TableKV {
 
     /// 判断该动作是否携带 upsert 值。
     ///
-    /// 返回 `false` 表示 delete tombstone，而不是“写入空二进制”。O(1)、纯只读。
+    /// 返回值只反映 `value.is_some()`，不脱离调用 API 判定动作：版本 write-set/WAL 中 `false`
+    /// 表示 delete tombstone，普通根 upsert 中会被跳过，query/delete 输入中则会被忽略。无论
+    /// 哪种情况都不表示“写入空二进制”。O(1)、纯只读、无校验或数据库副作用。
     pub fn exist_value(&self) -> bool {
         self.value.is_some()
     }
