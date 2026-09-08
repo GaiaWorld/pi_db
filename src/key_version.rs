@@ -1,16 +1,15 @@
-//! 全局 Key 版本、每表 publication 门、快照租约和 TTL 回收。
+//! 全局 Key 版本、快照租约、TTL 回收及兼容期 LogWrite publication 门。
 //!
 //! 本模块只保存版本证据，不保存表数据，也不执行 WAL 或数据文件 I/O。公开载荷用于
 //! `query_with_version -> prepare_with_version -> commit_with_version` 协议；其余类型均为
 //! `KVDBManager` 正常装配表时使用的 crate-private 实现。
 
+use std::borrow::Borrow;
 use std::collections::BTreeMap;
 use std::io::{Error, ErrorKind, Result as IOResult};
 use std::mem;
 use std::sync::{Arc, Weak,
-                atomic::{AtomicBool, AtomicU64, Ordering}};
-#[cfg(feature = "trace")]
-use std::sync::atomic::AtomicUsize;
+                atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering}};
 use std::time::{Duration, Instant};
 
 use async_channel::{Receiver, Sender, bounded};
@@ -164,6 +163,16 @@ pub(crate) struct VersionRecord {
     pub(crate) revision: u64,
     deadline_tick: u64,
     generation: u64,
+}
+
+/// 首次观察一次 DashMap entry 操作的结果。
+///
+/// `Inserted` 允许调用方使用 entry 前读取的值；`Occupied` 表示期间已有首次观察或提交，
+/// 调用方必须在 entry guard 已释放后重读值。它不描述版本自身来自观察还是写提交。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FirstObservation {
+    Inserted(Version),
+    Occupied(Version),
 }
 
 impl VersionRecord {
@@ -346,7 +355,7 @@ impl KeyVersionRegistry {
     }
 
     pub(crate) fn create_table_versions(&self) -> KeyVersions {
-        KeyVersions::new(Arc::downgrade(&self.0))
+        KeyVersions::new(Arc::downgrade(&self.0), self.0.ttl_ticks.is_some())
     }
 
     pub(crate) fn install(&self, table: Atom, versions: KeyVersions) {
@@ -473,6 +482,7 @@ struct TtlCollectStatistics {
     removed_records: usize,
     removed_first_observations: usize,
     removed_committed_writes: usize,
+    first_observation_blocked: usize,
     snapshot_blocked: usize,
     stale_candidates: usize,
     records_before: usize,
@@ -485,7 +495,7 @@ struct TtlCollectStatistics {
 impl TtlCollectStatistics {
     fn log(&self) {
         log::info!(target: "pi_db::key_version_ttl",
-                   "Key version TTL round completed, round: {}, ttl_ms: {}, interval_ms: {}, elapsed_ms: {}, registered_tables: {}, due_tables: {}, scanned_tables: {}, scanned_records: {}, due_candidates: {}, removed_records: {}, removed_first_observations: {}, removed_committed_writes: {}, snapshot_blocked: {}, stale_candidates: {}, records_before: {}, records_after: {}, batches: {}, yields: {}, next_deadline_tick: {}",
+                   "Key version TTL round completed, round: {}, ttl_ms: {}, interval_ms: {}, elapsed_ms: {}, registered_tables: {}, due_tables: {}, scanned_tables: {}, scanned_records: {}, due_candidates: {}, removed_records: {}, removed_first_observations: {}, removed_committed_writes: {}, first_observation_blocked: {}, snapshot_blocked: {}, stale_candidates: {}, records_before: {}, records_after: {}, batches: {}, yields: {}, next_deadline_tick: {}",
                    self.round,
                    self.ttl_ticks,
                    self.interval_ticks,
@@ -498,6 +508,7 @@ impl TtlCollectStatistics {
                    self.removed_records,
                    self.removed_first_observations,
                    self.removed_committed_writes,
+                   self.first_observation_blocked,
                    self.snapshot_blocked,
                    self.stale_candidates,
                    self.records_before,
@@ -687,9 +698,11 @@ struct KeyVersionCacheMetrics {
 /// 单个已注册表实例的版本状态。
 ///
 /// `versions` 是 `(Binary -> VersionRecord)` 的唯一事实来源；`ttl_keys` 只是避免遍历
-/// DashMap 的活动 Key 索引。`publication` 只在线性化表数据提交与版本提交，不保护 TTL：TTL
-/// 依赖 DashMap 单 Key 原子操作和完整记录签名安全竞态。`completed_revision` 与
-/// `active_snapshots` 共同保存普通事务识别同值写和 ABA 所需的最小历史窗口。
+/// DashMap 的活动 Key 索引。`publication` 仅为暂停重构且禁止外部使用的 LogWrite 保留；
+/// Meta、Memory、LogOrdered 和 Btree 不再取得它。TTL 与在用表依赖 DashMap 单 Key 原子操作、
+/// 完整记录签名和 `active_first_observations` 安全处理竞态。后者不是锁，只在 TTL 开启且首次
+/// 版本点读缺失时短暂计数，禁止 scanner 在值读取和首次观察登记之间删除版本。
+/// `completed_revision` 与 `active_snapshots` 共同保存普通事务识别同值写和 ABA 所需的最小历史窗口。
 ///
 /// 强引用方向固定为 registry/table/transaction -> KeyVersions，反向只允许 Weak registry；
 /// TTL task 同样只持 Weak registry，禁止形成数据库或表无法释放的 Arc 环。
@@ -697,6 +710,8 @@ struct InnerKeyVersions {
     versions: DashMap<Binary, VersionRecord>,
     ttl_keys: TtlKeyIndex,
     pub(crate) publication: RwLock<()>,
+    ttl_enabled: bool,
+    active_first_observations: AtomicUsize,
     completed_revision: AtomicU64,
     active_snapshots: Mutex<BTreeMap<u64, usize>>,
     lease_epoch: AtomicU64,
@@ -709,11 +724,13 @@ struct InnerKeyVersions {
 }
 
 impl KeyVersions {
-    fn new(registry: Weak<InnerKeyVersionRegistry>) -> Self {
+    fn new(registry: Weak<InnerKeyVersionRegistry>, ttl_enabled: bool) -> Self {
         Self(Arc::new(InnerKeyVersions {
             versions: DashMap::new(),
             ttl_keys: TtlKeyIndex::new(),
             publication: RwLock::new(()),
+            ttl_enabled,
+            active_first_observations: AtomicUsize::new(0),
             completed_revision: AtomicU64::new(0),
             active_snapshots: Mutex::new(BTreeMap::new()),
             lease_epoch: AtomicU64::new(0),
@@ -730,7 +747,10 @@ impl KeyVersions {
         Arc::ptr_eq(&self.0, &other.0)
     }
 
-    /// 返回每表 publication 门；调用方必须遵守 publication -> prepare 的单向锁序。
+    /// 返回兼容期 LogWrite 的每表 publication 门。
+    ///
+    /// LogWrite 当前禁止外部使用且本轮不改变其提交协议；其它在用表不得重新调用此方法。
+    /// 后续单独重构 LogWrite 时应连同本字段和方法一起重新评估或移除。
     pub(crate) fn publication(&self) -> &RwLock<()> {
         &self.0.publication
     }
@@ -748,6 +768,55 @@ impl KeyVersions {
             .versions
             .get(key)
             .map(|record| record.version.clone())
+    }
+
+    /// 在一次版本缺失查询读取表数据前建立非阻塞的首次观察租约。
+    ///
+    /// TTL 关闭时返回无操作 guard；TTL 开启时只做一次 checked 原子增加。scanner 在取得到期
+    /// 候选后、exact-remove 前观察该计数，非零时保留候选。guard 不可 clone，借用当前
+    /// `KeyVersions`，作用域内不得 await；所有返回、`?` 和 unwind 都由 Drop 精确递减并推进
+    /// `lease_epoch`，使被延迟的候选最迟在下一轮重新检查。
+    ///
+    /// 安全性不依赖“Acquire load 总能读取墙钟意义上的最新值”。计数增加严格先于查询的第二次
+    /// 同 Key DashMap 点读；若该点读仍为缺失，则后来插入新候选的 commit 及读取该候选的
+    /// scanner 必须依次经过同一分片锁，形成从计数增加到 scanner 检查的同步链。若 scanner
+    /// 更早取得候选，则由其 exact-remove 与查询二次点读的分片锁先后关系保证查询看到删除前
+    /// 版本或删除后的当前数据。改变 DashMap 或调整二次点读顺序时必须重新证明该关系。
+    ///
+    /// `usize::MAX` 个同时存活的 guard 超过进程地址空间可容纳的对象数量；checked 更新仍在
+    /// 修改计数前 fail-fast，防止内部状态破坏时回绕为零并错误放行 TTL。
+    pub(crate) fn lease_first_observation(&self) -> FirstObservationLease<'_> {
+        if self.0.ttl_enabled {
+            let mut observed = self.0.active_first_observations.load(Ordering::Acquire);
+            loop {
+                let next = observed
+                    .checked_add(1)
+                    .expect("active first-observation lease count overflow");
+                match self.0.active_first_observations.compare_exchange_weak(
+                    observed,
+                    next,
+                    Ordering::AcqRel,
+                    Ordering::Acquire) {
+                    Ok(_) => break,
+                    Err(current) => observed = current,
+                }
+            }
+            FirstObservationLease {
+                versions: self,
+                active: true,
+            }
+        } else {
+            FirstObservationLease {
+                versions: self,
+                active: false,
+            }
+        }
+    }
+
+    /// scanner 的候选后检查点；Acquire 与租约取得/释放的读改写形成同一原子修改顺序。
+    #[inline]
+    fn has_active_first_observation(&self) -> bool {
+        self.0.active_first_observations.load(Ordering::Acquire) != 0
     }
 
     /// 返回无锁、O(1) 的 trace 指标快照；不得把该观测值用于事务或 TTL 正确性判断。
@@ -791,21 +860,21 @@ impl KeyVersions {
 
     /// 返回当前逻辑值对应的现有版本，或为首次观察原子创建一个版本。
     ///
-    /// 调用方必须持有本表 publication read，使表 commit 不能在“读数据 -> 取版本”之间穿入。
-    /// TTL 不获取 publication，仍可能在本调用前后删除版本；Vacant entry 是并发首次观察的唯一
-    /// 线性化点，因此返回的新版本仍与调用方已经读取的同一逻辑值一致。版本在方法返回后立即
-    /// 到期只会使后续 prepare 产生保守冲突，不会把旧值与新提交版本错误配对。
+    /// 调用方必须先读取一次逻辑值，再根据返回结果决定能否直接使用该值：Vacant 表示本调用
+    /// 按该值的存在状态完成首次登记；Occupied 表示期间已有首次观察或提交，调用方必须重读
+    /// 逻辑值，禁止把第一次旧值与竞争产生的新版本配对。TTL 随后删除版本只会使 prepare
+    /// 保守冲突。
     ///
     /// 命中路径 O(1) 平均时间且不分配 Guid；缺失路径分配一个 Guid、一个记录和至多一个 FIFO
     /// token。方法不 await，不获取 prepare/root/cache 锁，也不执行 WAL 或数据文件 I/O。
     pub(crate) fn first_observation<F>(&self,
                                        key: Binary,
                                        exists: bool,
-                                       alloc_uid: F) -> Version
+                                       alloc_uid: F) -> FirstObservation
         where F: FnOnce() -> Guid
     {
         match self.0.versions.entry(key) {
-            Entry::Occupied(entry) => entry.get().version.clone(),
+            Entry::Occupied(entry) => FirstObservation::Occupied(entry.get().version.clone()),
             Entry::Vacant(entry) => {
                 let version = if exists {
                     Version::Upsert(alloc_uid())
@@ -838,7 +907,7 @@ impl KeyVersions {
                     self.0.ttl_keys.push(ttl_key);
                 }
                 self.register_deadline(deadline);
-                version
+                FirstObservation::Inserted(version)
             },
         }
     }
@@ -847,8 +916,8 @@ impl KeyVersions {
     ///
     /// 调用方必须同时持有该表的数据 root/cache guard：commit 在相同 guard 内先发布数据和版本，
     /// 再 Release-store 新 revision，因此“数据快照 + revision + 活跃租约”不会被一次 commit
-    /// 撕裂。不得在 publication/prepare 的反向锁序中调用本方法；内部仅短暂获取
-    /// `active_snapshots` 同步 mutex，不 await、不执行 I/O。
+    /// 撕裂。不得在 prepare guard 内调用本方法；内部仅短暂获取 `active_snapshots` 同步
+    /// mutex，不 await、不执行 I/O。
     ///
     /// 返回 lease 可跨线程移动，显式 release 与 Drop 均幂等。活跃计数按 revision 聚合，创建和
     /// 释放平均 O(log r)，其中 r 是当前活跃 revision 数，而不是 Key 数。
@@ -870,7 +939,7 @@ impl KeyVersions {
         self.0.completed_revision.load(Ordering::Acquire)
     }
 
-    /// 计算下一 revision；只能在本表 publication write 内用于一次实际写提交。
+    /// 计算下一 revision；只能在本表数据 root/cache guard 内用于一次实际写提交。
     ///
     /// 返回 None 表示 u64 空间耗尽。调用方必须在修改数据前把它提升为不可 rollback 的 Fatal，
     /// 绝不能回绕或复用 revision。
@@ -880,8 +949,8 @@ impl KeyVersions {
 
     /// 在本表全部数据和写 Key 版本完成发布后推进 completed revision。
     ///
-    /// 调用方必须仍持有 publication write 和对应数据 root/cache guard。Release-store 与事务创建
-    /// 侧的 Acquire-load 配对；本方法不校验单调性，因为唯一写者由 publication write 保证。
+    /// 调用方必须仍持有对应数据 root/cache guard。Release-store 与事务创建侧的 Acquire-load
+    /// 配对；本方法不校验单调性，因为同一 guard 串行化该表所有合法 managed writer。
     pub(crate) fn complete_revision(&self, revision: u64) {
         self.0.completed_revision.store(revision, Ordering::Release);
     }
@@ -889,7 +958,7 @@ impl KeyVersions {
     /// 判断该 Key 是否存在晚于事务快照的真实提交版本。
     ///
     /// FirstObservation 不表示写提交，不能制造普通事务冲突；CommittedWrite 的最新记录足以代表
-    /// 此 Key 在快照后至少发生过一次写。调用方持 publication read 完成 prepare 复核；活跃 lease
+    /// 此 Key 在快照后至少发生过一次写。调用方在 prepare 最终围栏中完成复核；活跃 lease
     /// 同时保证 TTL 不会删除 `revision > snapshot_revision` 的必要证据。
     pub(crate) fn has_committed_after(&self,
                                       key: &Binary,
@@ -904,9 +973,9 @@ impl KeyVersions {
 
     /// 发布本事务对一个 Key 的最终版本，并返回只描述本事务的回执项。
     ///
-    /// 调用方必须持有本表 publication write 和数据 root/cache guard，并传入当前根事务的 TID
-    /// 与本表本次提交唯一 revision。`Some` 生成 Upsert，`None` 生成 Delete；不会读取提交后的
-    /// “全局最新版本”，所以随后其它事务覆盖该 Key 也不会改变已返回回执。
+    /// 调用方必须持有本表数据 root/cache guard，并传入当前根事务的 TID 与本表本次提交唯一
+    /// revision。`Some` 生成 Upsert，`None` 生成 Delete；不会读取提交后的“全局最新版本”，
+    /// 所以随后其它事务覆盖该 Key 也不会改变已返回回执。
     ///
     /// TTL 可并发 exact-remove，但 DashMap 分片原子操作保证两种结果都保有有效 token：删除先发生
     /// 时本次 insert 视为首次并入队，更新先发生时 scanner 看到签名变化并归还原 token。方法不
@@ -923,31 +992,31 @@ impl KeyVersions {
             Version::Delete(transaction_uid)
         };
         let deadline = self.next_deadline();
-        let generation = self
-            .0
-            .versions
-            .get(&key)
-            .map(|record| record.generation.saturating_add(1))
-            .unwrap_or(1);
-        let record = VersionRecord {
-            version: version.clone(),
-            source: VersionSource::CommittedWrite,
-            revision,
-            deadline_tick: deadline,
-            generation,
-        };
-        // 默认构建保留原始 DashMap::insert 路径，不为指标改变业务代码。trace 构建使用等价
-        // entry 更新，只让 Vacant 记录在释放同 Key 分片 guard 前建立指标，使 TTL exact-remove
-        // 不可能先于指标递增；Occupied 更新不触碰容量原子或既有 Key allocation。
-        #[cfg(not(feature = "trace"))]
-        let inserted = self.0.versions.insert(key.clone(), record).is_none();
-        #[cfg(feature = "trace")]
+        // generation 读取和记录替换必须位于同一个 Key 的 entry guard 内。query 首次观察可与
+        // 提交并发；若继续先 get 后 insert，竞争插入可能被覆盖且 token 判断
+        // 使用过期结果。这里没有 await、表锁或 prepare 锁。
         let inserted = match self.0.versions.entry(key.clone()) {
             Entry::Occupied(mut entry) => {
-                entry.insert(record);
+                let generation = entry.get().generation.saturating_add(1);
+                entry.insert(VersionRecord {
+                    version: version.clone(),
+                    source: VersionSource::CommittedWrite,
+                    revision,
+                    deadline_tick: deadline,
+                    generation,
+                });
                 false
             },
             Entry::Vacant(entry) => {
+                let record = VersionRecord {
+                    version: version.clone(),
+                    source: VersionSource::CommittedWrite,
+                    revision,
+                    deadline_tick: deadline,
+                    generation: 1,
+                };
+                // trace 容量指标必须在记录对 TTL scanner 可见前建立；默认构建没有该原子成本。
+                #[cfg(feature = "trace")]
                 self.record_inserted(estimated_record_memory_bytes(
                     entry.key(),
                     deadline != NO_DEADLINE));
@@ -973,6 +1042,8 @@ impl KeyVersions {
         // 该入口只允许在 repair 完成、外部事务尚不可创建且 TTL task 尚未启动的静默启动期调用。
         // 先清索引再清 Map，随后把旁路指标归零；若未来放宽为并发调用，必须重新设计 Map/指标
         // 的原子清空协议，不能直接复用当前实现。
+        debug_assert_eq!(self.0.active_first_observations.load(Ordering::Acquire), 0,
+                         "repair-time version clear must not overlap a first-observation query");
         self.0.ttl_keys.clear();
         self.0.versions.clear();
         #[cfg(feature = "trace")]
@@ -1043,6 +1114,19 @@ impl KeyVersions {
                     continue;
                 }
                 statistics.due_candidates += 1;
+
+                // 必须先取得完整候选，再读取租约计数。若在轮次开始时缓存一次 0，查询可能随后
+                // 取得租约、提交插入新版本，而 scanner 仍用过期的 0 删除它。查询的租约增加、
+                // 二次同 Key 点读、后续 commit 插入和本次 candidate 点读通过同一 DashMap 分片
+                // 锁建立同步顺序；这里不能移到 candidate 之前，也不能换成没有等价证明的容器。
+                // 计数非零时整表到期项只保留不等待；租约 Drop 推进 lease_epoch，保证最后一个
+                // 租约释放后重扫。
+                if self.has_active_first_observation() {
+                    statistics.first_observation_blocked += 1;
+                    blocked = true;
+                    retained.push(key);
+                    continue;
+                }
 
                 if candidate.source == VersionSource::CommittedWrite {
                     let min_active = self
@@ -1125,6 +1209,45 @@ impl KeyVersions {
     }
 }
 
+/// 一个 TTL 开启表在版本缺失查询期间持有的首次观察租约。
+///
+/// 该 guard 不持有 Mutex、RwLock、DashMap entry 或表数据 guard，也不拥有 Arc；它只能活在被借用
+/// 的 `KeyVersions` 内。`active=false` 是 TTL 关闭时的零原子成本路径。类型不可 clone，Drop 是
+/// 唯一释放点，因此不存在重复释放或被遗忘的显式完成分支。
+pub(crate) struct FirstObservationLease<'a> {
+    versions: &'a KeyVersions,
+    active: bool,
+}
+
+impl Drop for FirstObservationLease<'_> {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let mut observed = self
+            .versions
+            .0
+            .active_first_observations
+            .load(Ordering::Acquire);
+        loop {
+            let next = observed
+                .checked_sub(1)
+                .expect("active first-observation lease count underflow");
+            match self.versions.0.active_first_observations.compare_exchange_weak(
+                observed,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire) {
+                Ok(_) => break,
+                Err(current) => observed = current,
+            }
+        }
+        // 先让 active 递减对 scanner 可见，再推进代次。即使 scanner 与 Drop 交错，也只会多
+        // 保留一个固定轮询周期，不会永久遗失到期 token。
+        self.versions.0.lease_epoch.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
 /// 一个表事务的数据快照 revision 租约。
 ///
 /// lease 不持有 root/cache guard，也不固定表数据本身；COW 数据根由表事务单独拥有。它只阻止
@@ -1185,14 +1308,27 @@ pub(crate) struct PreparedActions {
     pub(crate) actions: XHashMap<Binary, KVActionLog>,
 }
 
+/// 在用四表的表级预提交占用 owner。
+///
+/// prepare map 和正在提交的子事务只共享一个不可变动作集合，不复制 Key/Value。提交必须保留
+/// map 中的 owner，直至数据、版本和 completed revision 全部发布，再按 Arc 身份精确清理。
+pub(crate) type SharedPreparedActions = Arc<PreparedActions>;
+
 /// 表级 commit 取得 prepared 项时可能发现的结构不变量错误。
 ///
 /// 该错误只描述同步 `prepare` map 的局部状态，不决定事务错误等级。调用方已经进入 commit，
-/// 必须结合整棵事务树可能已有兄弟节点发布这一事实，把两种错误都转换为 Fatal。
+/// 必须结合整棵事务树可能已有兄弟节点发布这一事实，把这些错误都转换为 Fatal。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PreparedCommitError {
     Missing,
     ModeMismatch(PrepareMode),
+}
+
+/// 已发布数据后精确清理 prepared owner 时的结构不变量错误。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PreparedCleanupError {
+    Missing,
+    IdentityMismatch,
 }
 
 /// 判断同一表的 prepare map 是否已经登记指定根 TID。
@@ -1200,34 +1336,59 @@ pub(crate) enum PreparedCommitError {
 /// 调用方必须在同一个 prepare mutex guard 内完成本检查、全部 Key 冲突检查和最终 insert，
 /// 才能保证第二个同 TID 子节点不会覆盖第一个节点已经冻结的动作。
 #[inline]
-pub(crate) fn has_prepared_transaction(prepare: &XHashMap<Guid, PreparedActions>,
+pub(crate) fn has_prepared_transaction<P>(prepare: &XHashMap<Guid, P>,
                                        transaction_uid: &Guid) -> bool {
     prepare.contains_key(transaction_uid)
 }
 
-/// 原子临界区内按根 TID 取出 prepared 项，并校验它属于当前表事务的协议模式。
+/// 在 commit 开始时取得不可变 prepared owner，但保留表级预提交占用。
 ///
-/// 本函数本身不加锁；调用方只需持有现有 prepare mutex guard。匹配项被返回，模式错配项也会
-/// 被移除，因为 commit 已不可安全 rollback；只读子事务允许缺项，可写子事务缺项必须报错。
+/// 调用方只在现有 prepare mutex 内调用。匹配路径只 clone 一个 Arc；模式错配保持旧行为，
+/// 立即移除错误项，因为事务已经进入根 WAL 后不可 rollback 的提交阶段。
 #[inline]
-pub(crate) fn take_prepared_for_commit(prepare: &mut XHashMap<Guid, PreparedActions>,
-                                       transaction_uid: &Guid,
-                                       expected_mode: PrepareMode,
-                                       is_writable: bool)
-    -> Result<Option<PreparedActions>, PreparedCommitError> {
-    match prepare.remove(transaction_uid) {
-        Some(prepared) if prepared.mode == expected_mode => Ok(Some(prepared)),
-        Some(prepared) => Err(PreparedCommitError::ModeMismatch(prepared.mode)),
+pub(crate) fn retain_prepared_for_commit(
+    prepare: &mut XHashMap<Guid, SharedPreparedActions>,
+    transaction_uid: &Guid,
+    expected_mode: PrepareMode,
+    is_writable: bool,
+) -> Result<Option<SharedPreparedActions>, PreparedCommitError> {
+    match prepare.get(transaction_uid) {
+        Some(prepared) if prepared.mode == expected_mode => Ok(Some(prepared.clone())),
+        Some(prepared) => {
+            let prepared_mode = prepared.mode;
+            let _ = prepare.remove(transaction_uid);
+            Err(PreparedCommitError::ModeMismatch(prepared_mode))
+        },
         None if is_writable => Err(PreparedCommitError::Missing),
         None => Ok(None),
     }
 }
 
+/// 在数据、版本和 completed revision 发布后精确清理本次提交的预提交占用。
+///
+/// 只按 TID remove 无法识别非法重复调用是否替换了 owner；Arc 身份检查保证当前提交绝不删除
+/// 其它动作。调用方只持有 prepare mutex，不得同时持有 root/cache 或 DashMap guard。
+#[inline]
+pub(crate) fn remove_retained_prepared(
+    prepare: &mut XHashMap<Guid, SharedPreparedActions>,
+    transaction_uid: &Guid,
+    retained: &SharedPreparedActions,
+) -> Result<(), PreparedCleanupError> {
+    match prepare.get(transaction_uid) {
+        Some(current) if Arc::ptr_eq(current, retained) => {
+            let _ = prepare.remove(transaction_uid);
+            Ok(())
+        },
+        Some(_) => Err(PreparedCleanupError::IdentityMismatch),
+        None => Err(PreparedCleanupError::Missing),
+    }
+}
+
 /// 版本化根事务的共享提交回执汇聚器。
 ///
-/// 每个子表只在自己的 publication write 内追加本事务最终写集合；根事务在整棵树 commit 成功
-/// 后一次性 take。内部 mutex 仅保护短 Vec 操作，不与其它表 publication 形成反向锁序，不执行
-/// await 或 I/O。普通 commit 不安装本对象，因此不承担公开 Vec 的收集成本。
+/// 每个子表在完成数据、版本和 revision 发布并释放表数据锁后，追加本事务最终写集合；根事务
+/// 在整棵树 commit 成功后一次性 take。内部 mutex 只保护该根事务私有 Vec，不与表锁形成嵌套，
+/// 不执行 await 或 I/O。普通 commit 不安装本对象，因此不承担公开 Vec 的收集成本。
 #[derive(Clone)]
 pub(crate) struct VersionReceipt(Arc<Mutex<Vec<TableKeyVersion>>>);
 
@@ -1237,7 +1398,15 @@ impl VersionReceipt {
     }
 
     pub(crate) fn append(&self, mut versions: Vec<TableKeyVersion>) {
-        self.0.lock().append(&mut versions);
+        if versions.is_empty() {
+            return;
+        }
+        let mut receipt = self.0.lock();
+        if receipt.is_empty() {
+            *receipt = versions;
+        } else {
+            receipt.append(&mut versions);
+        }
     }
 
     pub(crate) fn take(&self) -> Vec<TableKeyVersion> {
@@ -1329,11 +1498,14 @@ pub(crate) fn binary_state_equal(left: Option<&Binary>, right: Option<&Binary>) 
 }
 
 /// 判断指定动作是否与任一已登记事务的同 Key 动作冲突。
-pub(crate) fn has_prepared_conflict(prepare: &XHashMap<Guid, PreparedActions>,
-                                    key: &Binary,
-                                    mode: PrepareMode,
-                                    action: &KVActionLog) -> bool {
+pub(crate) fn has_prepared_conflict<P>(prepare: &XHashMap<Guid, P>,
+                                       key: &Binary,
+                                       mode: PrepareMode,
+                                       action: &KVActionLog) -> bool
+    where P: Borrow<PreparedActions>
+{
     prepare.values().any(|prepared| {
+        let prepared = prepared.borrow();
         prepared
             .actions
             .get(key)
@@ -1349,32 +1521,39 @@ pub(crate) fn has_prepared_conflict(prepare: &XHashMap<Guid, PreparedActions>,
 mod tests {
     use std::{collections::BTreeSet,
               io::ErrorKind,
-              sync::{Arc, atomic::Ordering},
+              panic::AssertUnwindSafe,
+              sync::{Arc, Barrier, atomic::Ordering},
               thread,
               time::Duration};
 
+    use futures::executor::block_on;
+    use pi_async_rt::rt::multi_thread::MultiTaskRuntimeBuilder;
     use pi_atom::Atom;
     use pi_bon::{Encode, WriteBuffer};
     use pi_guid::Guid;
 
-    use crate::{Binary, KVActionLog};
+    use crate::{Binary, KVActionLog, TableKeyVersion};
 
     use super::{KeyVersionConfig,
                 KeyVersionRegistry,
                 MAX_TICK,
+                FirstObservation,
                 PrepareMode,
                 PreparedActions,
+                PreparedCleanupError,
                 PreparedCommitError,
                 TableKeyConflict,
                 TTL_SCAN_BATCH_SIZE,
                 TtlKeyIndex,
+                VersionReceipt,
                 VersionConflictKind,
                 deadline_tick,
                 duration_to_ticks,
                 has_prepared_transaction,
                 normalize_conflicts,
                 prepared_actions_conflict,
-                take_prepared_for_commit};
+                remove_retained_prepared,
+                retain_prepared_for_commit};
     #[cfg(feature = "trace")]
     use super::{KeyVersionApiMetricsSnapshot,
                 KeyVersionApiOperation,
@@ -1485,56 +1664,342 @@ mod tests {
                    Some(PrepareMode::Ordinary));
     }
 
-    /// commit 必须只取得同 TID、同模式项；可写缺项和模式错配均不能退化为空动作成功。
+    /// commit 必须保留匹配 owner 到发布结束，并用 Arc 身份精确清理而不误删替换项。
     #[test]
-    fn test_take_prepared_for_commit_enforces_mode_and_writable_presence() {
+    fn test_retain_prepared_for_commit_enforces_owner_lifecycle() {
         let ordinary_uid = Guid(21);
         let mismatch_uid = Guid(22);
         let missing_uid = Guid(23);
         let mut prepare = pi_hash::XHashMap::default();
         let mut ordinary_actions = pi_hash::XHashMap::default();
         ordinary_actions.insert(binary_from_u32(1), KVActionLog::Read);
-        prepare.insert(ordinary_uid.clone(), PreparedActions {
+        let ordinary = Arc::new(PreparedActions {
             mode: PrepareMode::Ordinary,
             actions: ordinary_actions,
         });
-        prepare.insert(mismatch_uid.clone(), PreparedActions {
+        prepare.insert(ordinary_uid.clone(), ordinary.clone());
+        prepare.insert(mismatch_uid.clone(), Arc::new(PreparedActions {
             mode: PrepareMode::Versioned,
             actions: pi_hash::XHashMap::default(),
-        });
+        }));
 
-        match take_prepared_for_commit(&mut prepare,
-                                       &ordinary_uid,
-                                       PrepareMode::Ordinary,
-                                       true) {
+        let retained = match retain_prepared_for_commit(&mut prepare,
+                                                        &ordinary_uid,
+                                                        PrepareMode::Ordinary,
+                                                        true) {
             Ok(Some(prepared)) => {
+                assert!(Arc::ptr_eq(&prepared, &ordinary));
                 assert_eq!(prepared.mode, PrepareMode::Ordinary);
                 assert!(prepared
                     .actions
                     .get(&binary_from_u32(1))
                     .map(|action| matches!(action, KVActionLog::Read))
                     .unwrap_or(false));
+                prepared
             },
             _ => panic!("matching writable prepared item must be returned"),
-        }
+        };
+        assert!(prepare.contains_key(&ordinary_uid),
+                "retaining commit input must keep the prepare reservation visible");
+        assert_eq!(remove_retained_prepared(&mut prepare, &ordinary_uid, &retained), Ok(()));
         assert!(!prepare.contains_key(&ordinary_uid));
 
-        assert!(matches!(take_prepared_for_commit(&mut prepare,
-                                                  &mismatch_uid,
-                                                  PrepareMode::Ordinary,
-                                                  true),
+        assert!(matches!(retain_prepared_for_commit(&mut prepare,
+                                                    &mismatch_uid,
+                                                    PrepareMode::Ordinary,
+                                                    true),
                          Err(PreparedCommitError::ModeMismatch(PrepareMode::Versioned))));
         assert!(!prepare.contains_key(&mismatch_uid));
-        assert!(matches!(take_prepared_for_commit(&mut prepare,
-                                                  &missing_uid,
-                                                  PrepareMode::Ordinary,
-                                                  true),
+        assert!(matches!(retain_prepared_for_commit(&mut prepare,
+                                                    &missing_uid,
+                                                    PrepareMode::Ordinary,
+                                                    true),
                          Err(PreparedCommitError::Missing)));
-        assert!(matches!(take_prepared_for_commit(&mut prepare,
-                                                  &missing_uid,
-                                                  PrepareMode::Ordinary,
-                                                  false),
+        assert!(matches!(retain_prepared_for_commit(&mut prepare,
+                                                    &missing_uid,
+                                                    PrepareMode::Ordinary,
+                                                    false),
                          Ok(None)));
+
+        let retained = Arc::new(PreparedActions {
+            mode: PrepareMode::Ordinary,
+            actions: pi_hash::XHashMap::default(),
+        });
+        let replacement = Arc::new(PreparedActions {
+            mode: PrepareMode::Ordinary,
+            actions: pi_hash::XHashMap::default(),
+        });
+        prepare.insert(ordinary_uid.clone(), retained.clone());
+        prepare.insert(ordinary_uid.clone(), replacement.clone());
+        assert_eq!(remove_retained_prepared(&mut prepare, &ordinary_uid, &retained),
+                   Err(PreparedCleanupError::IdentityMismatch));
+        assert!(Arc::ptr_eq(prepare.get(&ordinary_uid).unwrap(), &replacement),
+                "identity mismatch must not remove another owner");
+        assert_eq!(remove_retained_prepared(&mut prepare, &ordinary_uid, &replacement), Ok(()));
+        assert_eq!(remove_retained_prepared(&mut prepare, &ordinary_uid, &replacement),
+                   Err(PreparedCleanupError::Missing));
+    }
+
+    /// publish 必须在同一个 DashMap entry 临界区中读取并推进 generation，同时精确替换
+    /// source、revision 和 Upsert/Delete 类型，不能重复增加结构记录。
+    #[test]
+    fn test_publish_atomically_advances_current_record() {
+        let config = KeyVersionConfig::new(Duration::ZERO, Duration::ZERO).unwrap();
+        let (registry, _shutdown) = KeyVersionRegistry::new(config);
+        let versions = registry.create_table_versions();
+        let table = Atom::from("publish-unit");
+        let key = binary_from_u32(31);
+        let value = binary_from_u32(310);
+
+        assert_eq!(versions.first_observation(key.clone(), false, || Guid(1)),
+                   FirstObservation::Inserted(super::Version::Delete(Guid(1))));
+        let first = versions.current(&key).unwrap();
+        assert_eq!(first.source, super::VersionSource::FirstObservation);
+        assert_eq!(first.revision, 0);
+        assert_eq!(first.generation, 1);
+
+        let upsert = versions.publish(table.clone(),
+                                      key.clone(),
+                                      Some(&value),
+                                      Guid(2),
+                                      1);
+        assert_table_key_version_fields(&upsert, &TableKeyVersion {
+            table: table.clone(),
+            key: key.clone(),
+            version: super::Version::Upsert(Guid(2)),
+        });
+        let second = versions.current(&key).unwrap();
+        assert_eq!(second.version, super::Version::Upsert(Guid(2)));
+        assert_eq!(second.source, super::VersionSource::CommittedWrite);
+        assert_eq!(second.revision, 1);
+        assert_eq!(second.generation, 2);
+
+        let delete = versions.publish(table.clone(), key.clone(), None, Guid(3), 2);
+        assert_table_key_version_fields(&delete, &TableKeyVersion {
+            table,
+            key: key.clone(),
+            version: super::Version::Delete(Guid(3)),
+        });
+        let third = versions.current(&key).unwrap();
+        assert_eq!(third.version, super::Version::Delete(Guid(3)));
+        assert_eq!(third.source, super::VersionSource::CommittedWrite);
+        assert_eq!(third.revision, 2);
+        assert_eq!(third.generation, 3);
+        assert_eq!(versions.len(), 1);
+    }
+
+    /// 局部红线验收：query 第一次确认版本缺失并读到旧的 None 后，提交把数据变为 Some。
+    /// scanner 在租约活跃时必须保留新版本，使第二次版本检查观察到 Upsert；否则旧的 None
+    /// 会错误生成新的 Delete 首次观察版本。本测试只固定内部交错，完整生产可达性由独立真实
+    /// TTL target 验证。
+    #[test]
+    fn test_first_observation_lease_closes_stale_value_redline() {
+        let config = KeyVersionConfig::new(Duration::from_millis(1),
+                                           Duration::from_millis(1)).unwrap();
+        let (registry, _shutdown) = KeyVersionRegistry::new(config);
+        let versions = registry.create_table_versions();
+        let table = Atom::from("first-observation-redline");
+        let key = binary_from_u32(32);
+        let committed_value = binary_from_u32(320);
+
+        let stale_value = None::<Binary>;
+        let lease = versions.lease_first_observation();
+        let _ = versions.publish(table,
+                                 key.clone(),
+                                 Some(&committed_value),
+                                 Guid(2),
+                                 1);
+        let rt = MultiTaskRuntimeBuilder::default()
+            .init_worker_size(1)
+            .build();
+        let mut blocked_statistics = super::TtlCollectStatistics::default();
+        block_on(versions.collect_expired(&rt,
+                                          MAX_TICK,
+                                          &mut blocked_statistics));
+
+        assert_eq!(versions.current_version(&key),
+                   Some(super::Version::Upsert(Guid(2))),
+                   "TTL must retain a committed version while a missing query owns a lease");
+        assert_eq!(blocked_statistics.due_candidates, 1);
+        assert_eq!(blocked_statistics.first_observation_blocked, 1);
+        assert_eq!(blocked_statistics.removed_records, 0);
+        assert_eq!(index_len(&versions), 1,
+                   "a lease-blocked candidate must retain its TTL token");
+        let observed = versions.first_observation(key, stale_value.is_some(), || Guid(3));
+        assert_eq!(observed,
+                   FirstObservation::Occupied(super::Version::Upsert(Guid(2))));
+        drop(lease);
+        assert!(!versions.has_active_first_observation());
+
+        let mut released_statistics = super::TtlCollectStatistics::default();
+        block_on(versions.collect_expired(&rt,
+                                          MAX_TICK,
+                                          &mut released_statistics));
+        assert_eq!(released_statistics.removed_records, 1);
+        assert_eq!(released_statistics.removed_committed_writes, 1);
+        assert!(versions.current_version(&binary_from_u32(32)).is_none());
+        assert_eq!(index_len(&versions), 0,
+                   "the last lease release must make the retained token collectible");
+    }
+
+    /// TTL 关闭时租约必须是无操作：首次缺失查询不写活跃计数，也不推进 TTL 唤醒代次。
+    #[test]
+    fn test_first_observation_lease_is_noop_when_ttl_disabled() {
+        let config = KeyVersionConfig::new(Duration::ZERO, Duration::ZERO).unwrap();
+        let (registry, _shutdown) = KeyVersionRegistry::new(config);
+        let versions = registry.create_table_versions();
+        let epoch = versions.0.lease_epoch.load(Ordering::Acquire);
+
+        let lease = versions.lease_first_observation();
+        assert_eq!(versions.0.active_first_observations.load(Ordering::Acquire), 0);
+        assert!(!versions.has_active_first_observation());
+        drop(lease);
+
+        assert_eq!(versions.0.active_first_observations.load(Ordering::Acquire), 0);
+        assert_eq!(versions.0.lease_epoch.load(Ordering::Acquire), epoch);
+    }
+
+    /// TTL 开启时嵌套租约必须逐个计数；每个不可 clone guard 的 Drop 只释放自己的一项。
+    #[test]
+    fn test_first_observation_lease_balances_nested_guards() {
+        let config = KeyVersionConfig::new(Duration::from_millis(1),
+                                           Duration::from_millis(1)).unwrap();
+        let (registry, _shutdown) = KeyVersionRegistry::new(config);
+        let versions = registry.create_table_versions();
+
+        let first = versions.lease_first_observation();
+        let second = versions.lease_first_observation();
+        assert_eq!(versions.0.active_first_observations.load(Ordering::Acquire), 2);
+        assert!(versions.has_active_first_observation());
+
+        drop(first);
+        assert_eq!(versions.0.active_first_observations.load(Ordering::Acquire), 1);
+        assert_eq!(versions.0.lease_epoch.load(Ordering::Acquire), 1);
+        drop(second);
+        assert_eq!(versions.0.active_first_observations.load(Ordering::Acquire), 0);
+        assert_eq!(versions.0.lease_epoch.load(Ordering::Acquire), 2);
+    }
+
+    /// 多线程同时持有的租约必须全部可见并最终严格配平；该计数不能依赖 runtime owner 线程。
+    #[test]
+    fn test_first_observation_lease_balances_cross_thread_guards() {
+        const THREADS: usize = 8;
+
+        let config = KeyVersionConfig::new(Duration::from_millis(1),
+                                           Duration::from_millis(1)).unwrap();
+        let (registry, _shutdown) = KeyVersionRegistry::new(config);
+        let versions = Arc::new(registry.create_table_versions());
+        let acquired = Arc::new(Barrier::new(THREADS + 1));
+        let release = Arc::new(Barrier::new(THREADS + 1));
+        let mut threads = Vec::with_capacity(THREADS);
+        for _ in 0..THREADS {
+            let versions = versions.clone();
+            let acquired = acquired.clone();
+            let release = release.clone();
+            threads.push(thread::spawn(move || {
+                let lease = versions.lease_first_observation();
+                acquired.wait();
+                release.wait();
+                drop(lease);
+            }));
+        }
+
+        acquired.wait();
+        assert_eq!(versions.0.active_first_observations.load(Ordering::Acquire), THREADS);
+        release.wait();
+        for thread in threads {
+            thread.join().expect("first-observation lease worker must not panic");
+        }
+        assert_eq!(versions.0.active_first_observations.load(Ordering::Acquire), 0);
+        assert_eq!(versions.0.lease_epoch.load(Ordering::Acquire), THREADS as u64);
+    }
+
+    /// unwind 必须执行 RAII Drop；否则一个 panic 就会让同表到期版本永久无法回收。
+    #[test]
+    fn test_first_observation_lease_releases_during_unwind() {
+        let config = KeyVersionConfig::new(Duration::from_millis(1),
+                                           Duration::from_millis(1)).unwrap();
+        let (registry, _shutdown) = KeyVersionRegistry::new(config);
+        let versions = registry.create_table_versions();
+
+        let unwind = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let _lease = versions.lease_first_observation();
+            panic!("intentional first-observation lease unwind");
+        }));
+        assert!(unwind.is_err());
+        assert_eq!(versions.0.active_first_observations.load(Ordering::Acquire), 0);
+        assert_eq!(versions.0.lease_epoch.load(Ordering::Acquire), 1);
+    }
+
+    /// 被破坏的最大计数必须在增加前 fail-fast，不能回绕成 0 让 scanner 错误删除版本。
+    #[test]
+    fn test_first_observation_lease_count_never_wraps() {
+        let config = KeyVersionConfig::new(Duration::from_millis(1),
+                                           Duration::from_millis(1)).unwrap();
+        let (registry, _shutdown) = KeyVersionRegistry::new(config);
+        let versions = registry.create_table_versions();
+        versions.0.active_first_observations.store(usize::MAX, Ordering::Release);
+
+        let overflow = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let _lease = versions.lease_first_observation();
+        }));
+        assert!(overflow.is_err());
+        assert_eq!(versions.0.active_first_observations.load(Ordering::Acquire), usize::MAX);
+        versions.0.active_first_observations.store(0, Ordering::Release);
+    }
+
+    /// 首批回执应直接接管调用方 Vec 的 allocation；空批无副作用，后续批次保持表项顺序，
+    /// take 必须一次性转移全部元素并清空共享汇聚器。
+    #[test]
+    fn test_version_receipt_moves_first_batch_and_appends_in_order() {
+        let receipt = VersionReceipt::new();
+        let first_item = TableKeyVersion {
+            table: Atom::from("receipt-a"),
+            key: binary_from_u32(41),
+            version: super::Version::Upsert(Guid(4)),
+        };
+        let second_item = TableKeyVersion {
+            table: Atom::from("receipt-b"),
+            key: binary_from_u32(42),
+            version: super::Version::Delete(Guid(5)),
+        };
+        let third_item = TableKeyVersion {
+            table: Atom::from("receipt-c"),
+            key: binary_from_u32(43),
+            version: super::Version::Upsert(Guid(6)),
+        };
+        let first_batch = vec![first_item.clone(), second_item.clone()];
+        let first_ptr = first_batch.as_ptr();
+        let first_capacity = first_batch.capacity();
+
+        receipt.append(first_batch);
+        {
+            let stored = receipt.0.lock();
+            assert_eq!(stored.as_ptr(), first_ptr,
+                       "empty receipt must take ownership of the first Vec allocation");
+            assert_eq!(stored.capacity(), first_capacity);
+            assert_eq!(stored.len(), 2);
+            assert_table_key_version_fields(&stored[0], &first_item);
+            assert_table_key_version_fields(&stored[1], &second_item);
+        }
+
+        receipt.append(Vec::new());
+        {
+            let stored = receipt.0.lock();
+            assert_eq!(stored.as_ptr(), first_ptr,
+                       "an empty append must not replace the current allocation");
+            assert_eq!(stored.len(), 2);
+            assert_table_key_version_fields(&stored[0], &first_item);
+            assert_table_key_version_fields(&stored[1], &second_item);
+        }
+
+        receipt.append(vec![third_item.clone()]);
+        let taken = receipt.take();
+        assert_eq!(taken.len(), 3);
+        assert_table_key_version_fields(&taken[0], &first_item);
+        assert_table_key_version_fields(&taken[1], &second_item);
+        assert_table_key_version_fields(&taken[2], &third_item);
+        assert!(receipt.take().is_empty());
     }
 
     /// 只有开启 TTL 时 ZERO 轮询间隔才非法；关闭 TTL 不得创建 task owner 通道。
@@ -1655,8 +2120,8 @@ mod tests {
         assert_eq!(index.len(), 0);
     }
 
-    /// 首次观察创建唯一 token，cache hit 和已有记录 publication 不重复入队；TTL 精确删除后
-    /// publication 重建记录时必须重新创建 token。
+    /// 首次观察创建唯一 token，cache hit 和已有记录更新不重复入队；TTL 精确删除后重新建立
+    /// 记录时必须创建新 token。
     #[test]
     fn test_key_versions_maintains_one_token_per_current_record() {
         let config = KeyVersionConfig::new(Duration::from_secs(1),
@@ -1667,11 +2132,12 @@ mod tests {
         let value = binary_from_u32(70);
 
         let first = versions.first_observation(key.clone(), false, || Guid(1));
+        assert_eq!(first, FirstObservation::Inserted(super::Version::Delete(Guid(1))));
         assert_eq!(index_len(&versions), 1);
         let cached = versions.first_observation(key.clone(), false, || {
             panic!("cache hit must not allocate another first-observation Guid")
         });
-        assert_eq!(cached, first);
+        assert_eq!(cached, FirstObservation::Occupied(super::Version::Delete(Guid(1))));
         assert_eq!(index_len(&versions), 1);
 
         let _ = versions.publish(Atom::from("ttl-unit"),
@@ -1809,13 +2275,15 @@ mod tests {
 
         assert_eq!(versions.metrics_snapshot(), Default::default());
         let first_version = versions.first_observation(first_key.clone(), false, || Guid(1));
+        assert_eq!(first_version,
+                   FirstObservation::Inserted(super::Version::Delete(Guid(1))));
         assert_eq!(versions.metrics_snapshot(), super::KeyVersionCacheMetricsSnapshot {
             record_count: 1,
             estimated_memory_bytes: first_bytes,
         });
         assert_eq!(versions.first_observation(first_key.clone(), false, || {
             panic!("cache hit must not allocate a new Guid")
-        }), first_version);
+        }), FirstObservation::Occupied(super::Version::Delete(Guid(1))));
         assert_eq!(versions.metrics_snapshot().record_count, 1);
 
         let _ = versions.publish(Atom::from("trace-metrics"),
@@ -1959,6 +2427,13 @@ mod tests {
 
     fn index_len(versions: &super::KeyVersions) -> usize {
         versions.0.ttl_keys.len()
+    }
+
+    fn assert_table_key_version_fields(actual: &TableKeyVersion,
+                                       expected: &TableKeyVersion) {
+        assert_eq!(actual.table, expected.table);
+        assert_eq!(actual.key.as_ref(), expected.key.as_ref());
+        assert_eq!(actual.version, expected.version);
     }
 
     fn binary_from_u32(value: u32) -> Binary {

@@ -68,6 +68,7 @@ use crate::{Binary,
             Version,
             VersionConflictKind,
             key_version::{KeyVersionConfig,
+                          FirstObservation,
                           KeyVersionRegistry,
                           KeyVersions,
                           PrepareMode,
@@ -978,12 +979,15 @@ impl<
     C: Clone + Send + 'static,
     Log: AsyncCommitLog<C = C, Cid = Guid>
 > KVDBManager<C, Log> {
-    /// 读取一个 Key 的当前逻辑值及同一 publication 窗口中的公开版本。
+    /// 读取一个 Key 的当前逻辑值及公开版本。
     ///
-    /// 该入口不创建事务、不获取 prepare 锁，也不写 WAL 或数据文件。版本命中时只读取记录；
-    /// 缺席时会分配独立 Guid 并登记首次观察和 TTL，因此它不是纯函数。统一分派仍能表达
-    /// LogWrite，并会以逻辑值 `None` 建立版本，但合法外部协议禁止这样使用；Btree 的真实点读
-    /// 错误返回可恢复 `Common(Normal)`，绝不伪装成 Key 不存在。
+    /// 该入口不创建事务、不获取 prepare 锁，也不写 WAL 或数据文件。已有版本按“先版本、后
+    /// 数据”读取，禁止返回旧值与新版本；并发提交时允许返回新值与旧版本，后续 prepare 会
+    /// 保守冲突。版本缺席时会分配独立 Guid 并登记首次观察和 TTL，因此它不是纯函数。TTL
+    /// 开启时，缺失路径以一个不等待的原子计数租约保护“二次版本点读 -> 数据点读 -> 单 Key
+    /// 登记”，不会重新形成全表读写锁；已有版本的常见路径不访问该计数。统一分派仍能表达
+    /// LogWrite，并会以逻辑值 `None` 建立版本，但合法外部协议禁止这样使用且该表暂时保留旧
+    /// publication 门。Btree 的真实点读错误返回可恢复 `Common(Normal)`，绝不伪装成 Key 不存在。
     ///
     /// 表名长度须为 1..=4096 字节，Key 长度须为 1..=u16::MAX。返回版本必须与值成对缓存，
     /// 并且只能进入 `prepare_with_version -> commit_with_version` 独立协议；禁止与普通事务 API
@@ -994,7 +998,7 @@ impl<
                                     key: Binary)
         -> Result<(Option<Binary>, Version), KVTableTrError> {
         // 只在 trace 构建中持有两个原子的借用；所有 `?`、取消和 unwind 都由 guard Drop 归入
-        // failure，不改变原错误返回、publication 临界区或默认构建热路径。
+        // failure，不改变原错误返回、数据/版本读取顺序或默认构建热路径。
         #[cfg(feature = "trace")]
         let metric_guard = self
             .0
@@ -1015,21 +1019,67 @@ impl<
                         table.as_str()))
         })?;
 
-        let _publication = registered.versions.publication().read().await;
-        let value = match &registered.table {
-            KVDBTable::MetaTab(table) => table.query_committed(&key),
-            KVDBTable::MemOrdTab(table) => table.query_committed(&key),
-            KVDBTable::LogOrdTab(table) => table.query_committed(&key),
-            KVDBTable::LogWTab(_) => None,
-            KVDBTable::BtreeOrdTab(table) => table
-                .query_committed(&key)
-                .map_err(|e| KVTableTrError::new_transaction_error(ErrorLevel::Normal, e))?,
+        let query_value = || {
+            match &registered.table {
+                KVDBTable::MetaTab(table) => Ok(table.query_committed(&key)),
+                KVDBTable::MemOrdTab(table) => Ok(table.query_committed(&key)),
+                KVDBTable::LogOrdTab(table) => Ok(table.query_committed(&key)),
+                KVDBTable::LogWTab(_) => Ok(None),
+                KVDBTable::BtreeOrdTab(table) => table
+                    .query_committed(&key)
+                    .map_err(|e| KVTableTrError::new_transaction_error(ErrorLevel::Normal, e)),
+            }
         };
-        let version = registered
-            .versions
-            .first_observation(key,
-                               value.is_some(),
-                               || self.0.tr_mgr.alloc_transaction_uid());
+        let (value, version) = if matches!(&registered.table, KVDBTable::LogWTab(_)) {
+            // LogWrite 当前禁止外部使用且暂停重构。保留已发布版本中覆盖整个查询的 publication
+            // 读门，不能把四个在用表的新协议无意扩展到该表。
+            let _publication = registered.versions.publication().read().await;
+            let value = query_value()?;
+            let version = match registered
+                .versions
+                .first_observation(key.clone(),
+                                   value.is_some(),
+                                   || self.0.tr_mgr.alloc_transaction_uid()) {
+                FirstObservation::Inserted(version) | FirstObservation::Occupied(version) => {
+                    version
+                },
+            };
+            (value, version)
+        } else {
+            match registered.versions.current_version(&key) {
+                Some(version) => {
+                    // commit 先发布数据、后发布版本；按 (Value, Version) 反向读取只可能得到
+                    // 旧/旧、新/旧或新/新，绝不会得到会破坏事务性的旧值/新版本。
+                    (query_value()?, version)
+                },
+                None => {
+                    // 首次点读缺失后先建立非阻塞租约，再复核一次版本。TTL scanner 在租约期间
+                    // 只能保留到期记录，防止提交版本在值读取和首次观察 entry 之间被淘汰。
+                    // guard 内没有 await；Btree 同步 redb 点读也不持有任何表锁或 DashMap guard。
+                    let _first_observation_lease = registered
+                        .versions
+                        .lease_first_observation();
+                    match registered.versions.current_version(&key) {
+                        Some(version) => (query_value()?, version),
+                        None => {
+                            let value = query_value()?;
+                            match registered
+                                .versions
+                                .first_observation(key.clone(),
+                                                   value.is_some(),
+                                                   || self.0.tr_mgr.alloc_transaction_uid()) {
+                                FirstObservation::Inserted(version) => (value, version),
+                                FirstObservation::Occupied(version) => {
+                                    // 第一次数据读取后若其它观察或提交占据 entry，必须重读数据；
+                                    // 否则会把第一次旧值和竞争产生的新提交版本错误配对。
+                                    (query_value()?, version)
+                                },
+                            }
+                        },
+                    }
+                },
+            }
+        };
 
         #[cfg(feature = "trace")]
         metric_guard.finish(true);
@@ -3027,8 +3077,8 @@ impl<
     /// 对只读根调用本方法：一旦调用，它会注册根并返回空 token，调用方必须继续以该 token
     /// commit 才能从 manager 注销。可写根无论 token 是否为空都必须完成 commit 或合法 rollback。
     ///
-    /// timeout 字段当前只保存而不执行实际截止。调用会 await manager/表 prepare，并取得各表
-    /// publication 读门或 prepare 同步锁；跨表按首次触表顺序串行，不在持锁时执行根 WAL I/O。
+    /// timeout 字段当前只保存而不执行实际截止。调用会 await manager/表 prepare，并短暂取得
+    /// 各表数据锁或 prepare 同步锁；跨表按首次触表顺序串行，不在持锁时执行根 WAL I/O。
     /// future 在首次 poll 前被丢弃没有副作用；开始执行后取消不自动 rollback/finish，调用方必须
     /// 由独立 owner 推进到明确终态。时间和新增空间随子表数、最终动作数及 WAL payload 线性增长。
     /// 完整契约、状态图、错误投影和证据见
@@ -5754,8 +5804,8 @@ impl<
             group.actions.insert(item.key, crate::KVActionLog::Write(item.value));
         }
 
-        // 这里只克隆注册项并立即释放 registry guard；后续构造、publication await 和 prepare
-        // 都不得持有数据库表锁。现存 LogWrite 的 delete 是静态能力错误，必须先于 UID 拒绝。
+        // 这里只克隆注册项并立即释放 registry guard；后续构造和 prepare 都不得持有数据库
+        // 表锁。现存 LogWrite 的 delete 是静态能力错误，必须先于 UID 拒绝。
         {
             let tables = self.0.db_mgr.0.tables.read().await;
             for group in &mut groups {
@@ -5816,7 +5866,7 @@ impl<
 
         // 子事务构造可能锁各表数据根并租用版本快照，所以必须发生在根锁之外。安装阶段只做
         // HashMap/VecDeque/Option 的内存操作，固定锁序为 childs_map -> childs ->
-        // version_context，锁内没有 await、I/O、publication/table 锁或回调。协议 CAS、全部
+        // version_context，锁内没有 await、I/O、表数据锁或回调。协议 CAS、全部
         // 版本节点和 context 在释放 childs_map 前同时可见，后续普通动作只能 fail-fast。
         {
             let mut childes_map = self.0.childs_map.lock();

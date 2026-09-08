@@ -402,8 +402,12 @@ commit、rollback 或整体释放。该保留是冲突检测所需的有限生�
 子节点时，会在分配事务 ID 和写 WAL 前拒绝；版本树按每表唯一子节点原子安装。纯 iterator 是
 不参与 2PC 的中性快照例外，不会掩盖此前已经注册的普通动作。
 
-`query_with_version` 不创建数据库事务，原子返回当前逻辑值和同一线性化状态的版本。版本缺席时
-会用事务管理器的 Guid 生成器创建首次观测版本；并发读取同一缺失 Key 只会公布一个版本。
+`query_with_version` 不创建数据库事务，每次只读取一个 Key。已有版本时先读取版本、释放版本
+映射访问守卫（guard），再读取逻辑值；写提交按相反的“数据后版本”顺序发布，因此允许旧值/旧版本、新值/
+旧版本或新值/新版本，但严格禁止会错误认证旧业务判断的“旧值 + 新版本”。新值 + 旧版本只会
+使后续预提交保守冲突并要求重读。版本缺席时会用事务管理器的 Guid 生成器创建首次观测版本；
+TTL 开启时，非阻塞的首次观察租约、第二次版本点读和竞争命中后的数据重读共同保证同一边界。
+并发读取同一缺失 Key 只会公布一个版本；多次调用不构成多 Key 或跨表统一快照。
 `prepare_with_version` 先完整比较外部读集，再执行标准事务冲突检查；版本或标准冲突以
 `KVTableTrError::AllConflicts(Vec<TableKeyConflict>)` 返回完整、去重、确定顺序的
 `Table/Key/Kind` 集合。`ReadSetVersionMismatch` 表示版本缺失、TTL 淘汰、版本不等或只读表身份
@@ -413,12 +417,16 @@ prepared 预留阻止本次事务。冲突项不返回 expected/current Version�
 完整分类和下游 wire 迁移见
 [`VERSION-CONFLICT-KIND-001`](docs/VERSION_CONFLICT_KIND_DESIGN.md#version-conflict-kind-design-index)。
 
-根 WAL 成功后，`commit_with_version` 按表依次在短 publication write 临界区同时发布数据和本
-事务版本，并只返回本事务最终写集的 `TableKeyVersion`。单表内的值/版本观察是原子的；多表间
-允许按提交顺序逐表可见，不承诺全库瞬时同时可见。该返回表示事务已提交，不表示所有表数据文件
-已经完成异步持久化和提交确认。提交完成后还会严格验证每个最终写 `(Table, Key)` 恰好具有一项
-同事务 ID、同 Upsert/Delete 类型的回执；缺失、重复、额外或错配属于不可 rollback 的 Fatal
-内部错误，不会再静默返回部分或空回执。
+根 WAL 成功后，`commit_with_version` 使 Meta、Memory、LogOrdered、Btree 在原有表数据 guard
+内按“数据 -> 本表所有 Key 版本 -> 完成修订号”发布，并只返回本事务最终写集的
+`TableKeyVersion`。预提交占用记录会保留到数据和版本全部发布完成，避免其它事务穿过提交窗口；
+四个在用表不再经过一把全表 publication 异步门禁。单次查询可能观察新值 + 旧版本并保守冲突，
+不会观察旧值 + 新版本；多表仍按提交顺序逐表可见，不承诺全库瞬时同时可见。LogWrite 因禁止
+外部使用而暂挂本次重构，继续保留旧 publication 路径。
+
+该返回表示事务已提交，不表示所有表数据文件已经完成异步持久化和提交确认。提交完成后还会
+严格验证每个最终写 `(Table, Key)` 恰好具有一项同事务 ID、同 Upsert/Delete 类型的回执；
+缺失、重复、额外或错配属于不可 rollback 的 Fatal 内部错误，不会再静默返回部分或空回执。
 
 版本缓存只存在于当前数据库进程内，不写入 WAL 或表数据文件。collector 只搬迁 Btree 物理表示，
 不得改变已发布版本；正常冷启动或 repair 完成后版本缓存为空，第一次
@@ -486,8 +494,8 @@ OpenTelemetry 标准语义使用 no-op Meter，但 tracing loop 仍会正常运�
 - `pi_db.db.transaction_lifecycle{event=created|closed}`：成功创建与最终 owner 析构的根事务数。
 
 版本记录数和内存估值在结构插入、TTL exact-remove 和启动恢复清空处通过 `Relaxed` 原子增减；
-采集不迭代表内版本 `DashMap`，也不进入 publication/prepare 临界区。API 和事务热路径只更新
-内部原子，tracing loop 再按累计快照差量写 Counter。取消或 unwind 的已进入调用计为 failure；
+采集不迭代表内版本 `DashMap`，也不进入表数据或 prepare 临界区。API 和事务热路径只更新内部
+原子，tracing loop 再按累计快照差量写 Counter。取消或 unwind 的已进入调用计为 failure；
 数据库状态拒绝并返回 `None` 的事务创建不计 created。`closed` 只表示最后一个根事务 owner 已
 析构，不等于数据库 close、事务管理器 finish、提交确认或迭代器释放。
 
@@ -531,7 +539,7 @@ sanitizer 结论只适用于已测试的 `0.5.2` 依赖图，不能自动外推�
 
 本轮正式无 patch 复验实际解析 `pi_async_transaction 0.12.2`、`pi-async-rt 0.5.2` 和
 `pi_sinfo 0.6.0`；`Cargo.toml` 继续保持既有 `~0.12`、`~0.5` 和 `~0.6` 范围，不通过收窄版本
-约束代替兼容性验证。版本 API、完整冲突、四个在用表 publication、Btree 冷启动、TTL、快照
+约束代替兼容性验证。版本 API、完整冲突、四个在用表版本发布、Btree 冷启动、TTL、快照
 生命周期和真实 WAL/回执聚焦目标均已通过；正确 ABI TSan 未报告数据竞争，ASan 未报告 UAF、
 越界或 double free。ASan 使用 `detect_leaks=0`，不构成通用泄漏证明。
 
@@ -541,6 +549,13 @@ sanitizer 结论只适用于已测试的 `0.5.2` 依赖图，不能自动外推�
 跨硬件 SLA。详细证据保存在本地开发文档 `docs/KEY_VERSION_PUBLICATION_ACCEPTANCE.md`；事务树、
 根 WAL、提交确认、checkpoint、`.bak` 和 `try_repair` 的中文流程图、状态图及时序图保存在
 `docs/TRANSACTION_WAL_RECOVERY_FLOWS.md`。
+
+后续的全表 publication 门优化没有修改上述公开签名、错误载荷、WAL、repair/replay 或确认
+语义。四个在用表改为 DashMap 单 Key 版本发布、预提交占用延寿和完成修订号围栏；真实并发、
+TTL、冲突、WAL 解码、恢复、最终数据、版本回执、正确 ABI TSan、性能 A/B 和完整显式新回归
+均通过。详细设计和最新验收见
+`docs/KEY_VERSION_PUBLICATION_LOCK_OPTIMIZATION.md` 与
+`docs/KEY_VERSION_FIRST_OBSERVATION_LEASE_SAFETY.md`。
 
 ## 公共核心值对象验收基线
 

@@ -7,7 +7,10 @@ $ErrorActionPreference = "Stop"
 $RepoDir = Split-Path -Parent $PSScriptRoot
 $TargetFile = Join-Path $PSScriptRoot "new-regression-targets.txt"
 $CargoBin = if ($env:CARGO_BIN) { $env:CARGO_BIN } else { "cargo" }
-$Toolchain = if ($env:PI_DB_TOOLCHAIN) { $env:PI_DB_TOOLCHAIN } else { "nightly-2026-06-25" }
+$ToolchainArguments = @()
+if ($env:PI_DB_TOOLCHAIN) {
+    $ToolchainArguments += "+$env:PI_DB_TOOLCHAIN"
+}
 
 function Invoke-CargoChecked {
     param([string[]]$Arguments)
@@ -20,7 +23,7 @@ function Invoke-CargoChecked {
 
 Push-Location $RepoDir
 try {
-    $LibArguments = @("+$Toolchain", "test", "--locked", "--offline", "-p", "pi_db", "--lib", "--")
+    $LibArguments = $ToolchainArguments + @("test", "--locked", "--offline", "-p", "pi_db", "--lib", "--")
     if ($Mode -eq "list") {
         $LibArguments += @("--list", "--format", "terse")
     } else {
@@ -29,8 +32,8 @@ try {
     Invoke-CargoChecked $LibArguments
 
     # trace-only 指标/原子测试和真实 TTL 交错属于永久新回归；其它 integration 保持默认 feature。
-    $TraceLibArguments = @(
-        "+$Toolchain", "test", "--locked", "--offline", "-p", "pi_db",
+    $TraceLibArguments = $ToolchainArguments + @(
+        "test", "--locked", "--offline", "-p", "pi_db",
         "--features", "trace", "--lib", "--"
     )
     if ($Mode -eq "list") {
@@ -40,8 +43,8 @@ try {
     }
     Invoke-CargoChecked $TraceLibArguments
 
-    $TraceTtlArguments = @(
-        "+$Toolchain", "test", "--locked", "--offline", "-p", "pi_db",
+    $TraceTtlArguments = $ToolchainArguments + @(
+        "test", "--locked", "--offline", "-p", "pi_db",
         "--features", "trace", "--test", "key_version_ttl_index", "--"
     )
     if ($Mode -eq "list") {
@@ -52,8 +55,8 @@ try {
     Invoke-CargoChecked $TraceTtlArguments
 
     # 独立验证 global MeterProvider 初始化顺序、共享 scope、六项指标和 loop INFO。
-    $TraceMeterArguments = @(
-        "+$Toolchain", "test", "--locked", "--offline", "-p", "pi_db",
+    $TraceMeterArguments = $ToolchainArguments + @(
+        "test", "--locked", "--offline", "-p", "pi_db",
         "--features", "trace", "--test", "trace_meter_initialization", "--"
     )
     if ($Mode -eq "list") {
@@ -71,8 +74,8 @@ try {
         $Parts = $Trimmed -split "\s+", 2
         $Target = $Parts[0]
         $Exact = $Parts[1]
-        $Arguments = @(
-            "+$Toolchain", "test", "--locked", "--offline", "-p", "pi_db",
+        $Arguments = $ToolchainArguments + @(
+            "test", "--locked", "--offline", "-p", "pi_db",
             "--test", $Target, "--"
         )
         if ($Exact -ne "-") {

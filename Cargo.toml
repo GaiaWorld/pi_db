@@ -23,7 +23,7 @@ async-lock = "~3.4"
 async-channel = "~2.5"
 async-stream = "~0.3"
 bytes = "~1.11"
-dashmap = "~6.1"
+dashmap = "6.2"
 pi_atom = "~0.7"
 log = "~0.4"
 pi-async-rt = "~0.5"
@@ -54,6 +54,26 @@ indexmap = { version = "~1.9", features = ["std"] }
 
 [[bench]]
 name = "ordinary_2pc_phases"
+harness = false
+
+[[bench]]
+name = "version_commit_scaling"
+harness = false
+
+[[bench]]
+name = "version_commit_wal_payload"
+harness = false
+
+[[bench]]
+name = "version_commit_contention"
+harness = false
+
+[[bench]]
+name = "publication_contention_redline"
+harness = false
+
+[[bench]]
+name = "wal_flush_contention_redline"
 harness = false
 
 [[bench]]

@@ -10,7 +10,7 @@ use std::{
     fs,
     future::Future,
     path::{Path, PathBuf},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use crossbeam_channel::bounded;
@@ -19,6 +19,7 @@ use pi_async_rt::rt::{
     startup_global_time_loop, AsyncRuntime,
 };
 use pi_async_transaction::{
+    AsyncCommitLog,
     manager_2pc::Transaction2PcManager,
 };
 use pi_atom::Atom;
@@ -27,9 +28,9 @@ use pi_db::{
     db::{KVDBManager, KVDBManagerBuilder, KVDBTransaction},
     tables::TableKV,
     utils::CreateTableOptions,
-    Binary, KVDBTableType, KVTableMeta,
+    Binary, KVDBTableType, KVTableMeta, TableKeyVersion, Version,
 };
-use pi_guid::GuidGen;
+use pi_guid::{Guid, GuidGen};
 use pi_sinfo::EnumType;
 use pi_store::commit_logger::{CommitLogger, CommitLoggerBuilder};
 
@@ -181,6 +182,51 @@ pub async fn query_ordinary(
         ));
     }
     Ok(values.pop().expect("ordinary query result length was checked"))
+}
+
+/// 严格核验一个版本提交回执：数量、表、Key、动作类型和本事务 TID 必须全部匹配。
+pub fn expect_single_version_receipt(
+    receipts: &[TableKeyVersion],
+    table: &Atom,
+    key: &Binary,
+    value: Option<&Binary>,
+    transaction_uid: &Guid,
+    label: &str,
+) -> TestResult<()> {
+    expect_eq(&format!("{label} receipt count"), &receipts.len(), &1usize)?;
+    let receipt = &receipts[0];
+    expect_eq(&format!("{label} receipt table"), &receipt.table, table)?;
+    expect_binary(&format!("{label} receipt key"), Some(&receipt.key), Some(key))?;
+    let expected = if value.is_some() {
+        Version::Upsert(transaction_uid.clone())
+    } else {
+        Version::Delete(transaction_uid.clone())
+    };
+    expect_eq(&format!("{label} receipt version"), &receipt.version, &expected)
+}
+
+/// 等待根 WAL 的全部已登记事务完成异步确认，并同时核验累计 append/confirm 守恒。
+pub async fn wait_for_all_confirmed(
+    rt: &MultiTaskRuntime<()>,
+    fixture: &Fixture,
+    timeout: Duration,
+    label: &str,
+) -> TestResult<()> {
+    let started = Instant::now();
+    loop {
+        let waiting = fixture.logger.waiting_confirm_count().await;
+        let appended = fixture.logger.append_total_count();
+        let confirmed = fixture.logger.confirm_total_count();
+        if waiting == 0 && appended == confirmed {
+            return Ok(());
+        }
+        if started.elapsed() >= timeout {
+            return Err(format!(
+                "{label}: WAL confirmation did not close within {timeout:?}, waiting={waiting}, appended={appended}, confirmed={confirmed}",
+            ));
+        }
+        rt.timeout(5).await;
+    }
 }
 
 pub fn encode_usize(value: usize) -> Binary {

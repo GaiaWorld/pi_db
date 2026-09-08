@@ -2,7 +2,7 @@
 //!
 //! Meta 表以 COW `OrdMap` 保存“表名编码 -> `KVTableMeta` 编码”，并以独立 `LogFile` 保存
 //! 已提交表定义。DDL 通过根事务访问本模块；外部不得直接构造 Meta 表事务。提交先在
-//! publication 写门内发布内存根与 Key 版本，再异步把动作批量写入表日志；只有表日志成功
+//! COW 根锁内依次发布内存根、Key 版本和 revision，再异步把动作批量写入表日志；只有表日志成功
 //! 后才调用确认器，失败时保留根 WAL 供启动修复。
 
 use std::mem;
@@ -47,7 +47,9 @@ use crate::{Binary, KVAction, TableTrQos, KVActionLog, KVDBCommitConfirm, KVTabl
             key_version::{KeyVersions,
                           PrepareMode,
                           PreparedActions,
+                          PreparedCleanupError,
                           PreparedCommitError,
+                          SharedPreparedActions,
                           TableVersionContext,
                           Version,
                           VersionConflictKind,
@@ -55,7 +57,8 @@ use crate::{Binary, KVAction, TableTrQos, KVActionLog, KVDBCommitConfirm, KVTabl
                           binary_state_equal,
                           has_prepared_conflict,
                           has_prepared_transaction,
-                          take_prepared_for_commit},
+                          remove_retained_prepared,
+                          retain_prepared_for_commit},
             tables::{KVTable, ordmap_snapshot::OrdMapSnapshot},
             utils::KVDBEvent,
             KVDBTableType};
@@ -219,8 +222,8 @@ impl<
 > MetaTable<C, Log> {
     /// 在不创建事务的前提下点读当前已提交 COW 根。
     ///
-    /// 单独读取 value 只需本方法内部的 root mutex，可得到调用瞬间旧或新但自洽的值；需要把
-    /// value 与 Key 版本原子配对的 `query_with_version` 仍必须由调用方持有 publication read。
+    /// 单独读取 value 只需本方法内部的 root mutex，可得到调用瞬间旧或新但自洽的值。
+    /// `query_with_version` 在管理器层先读取版本、再调用本方法，保证不会返回旧值与新版本。
     /// 本方法不登记事务动作、不租用 snapshot、不执行 I/O。
     pub(crate) fn query_committed(&self, key: &Binary) -> Option<Binary> {
         self.0.root.lock().get(key).cloned()
@@ -337,9 +340,9 @@ impl<
 /// Meta 表的共享状态及锁所有权。
 ///
 /// 同步锁只保护短内存临界区；`waits` 使用异步锁，因为 collector 会在持有该锁时执行表日志
-/// `delay_commit().await`。版本事务以 publication 作为最外层门，但 `actions`、`root`、`prepare`
-/// 都是分别取得并释放的短临界区：prepare 依次观察 actions/root 后才取得 prepare，commit 先
-/// 释放 prepare 再取得 root；不存在 `prepare` 与 `root` 的嵌套 guard。collector 不访问上述
+/// `delay_commit().await`。`actions`、`root`、`prepare` 都是分别取得并释放的短临界区：prepare
+/// 依次观察 actions/root 后才取得 prepare；commit 先保留 prepare owner，释放该锁后取得 root，
+/// 发布结束再单独清理 owner。不存在 `prepare` 与 `root` 的嵌套 guard。collector 不访问上述
 /// 数据/版本锁，只使用 `collecting`、`waits` 和 `LogFile`。
 struct InnerMetaTable<
     C: Clone + Send + 'static,
@@ -349,12 +352,12 @@ struct InnerMetaTable<
     name:           Atom,
     // 当前已提交数据根；clone 是稳定 COW 快照，写操作必须在锁内替换或合并。
     root:           Mutex<OrdMap<Tree<Binary, Binary>>>,
-    // TID -> 已预留动作；prepare 原子检查并插入，commit/rollback 按同一 TID 移除。
-    prepare:        Mutex<XHashMap<Guid, PreparedActions>>,
+    // TID -> 已预留动作 owner；commit 保留到数据/版本/revision 发布后再精确移除。
+    prepare:        Mutex<XHashMap<Guid, SharedPreparedActions>>,
     // 驱动表日志打开、定时 collector 和异步确认流程的 runtime。
     rt:             MultiTaskRuntime<()>,
     // 内存根已发布、仍待写表日志并确认的 FIFO；元素同时保活事务和根确认回调。
-    waits:          AsyncMutex<VecDeque<(MetaTabTr<C, Log>, XHashMap<Binary, KVActionLog>, <MetaTabTr<C, Log> as Transaction2Pc>::CommitConfirm)>>,
+    waits:          AsyncMutex<VecDeque<(MetaTabTr<C, Log>, SharedPreparedActions, <MetaTabTr<C, Log> as Transaction2Pc>::CommitConfirm)>>,
     // 自上次 size 阈值归零后的入队累计 bytes，不是当前 FIFO 的精确大小。timer drain 不归零，
     // 因而后续小批次可能提前触发一次 size collect；这只影响整理时机，不影响动作或确认内容。
     waits_size:     AtomicUsize,
@@ -556,15 +559,9 @@ impl<
 
         async move {
             let transaction_uid = tr.get_transaction_uid().unwrap();
-            // publication write 使元信息根和全部 Key 版本相对于 query_with_version 一次可见。
-            // prepare 锁只用于取走预留，并在独立块末释放；它不能与 root guard 嵌套，更不能
-            // 延伸到后续异步 LogFile 路径。
-            let publication = match tr.0.version_context.as_ref() {
-                Some(context) => Some(context.versions().publication().write().await),
-                None => None,
-            };
             // 正常 prepare 和 prepare_repair 都会先以根 TID 登记；后者固定为 Ordinary mode。
-            // 因此合法 replay 虽跳过事务框架标准 prepare，也必须在这里取得匹配项。
+            // 因此合法 replay 虽跳过事务框架标准 prepare，也必须在这里取得匹配项。这里只
+            // clone Arc，表级占用继续保留到数据/版本/revision 完成发布。
             let expected_mode = tr
                 .0
                 .version_context
@@ -573,16 +570,14 @@ impl<
                 .unwrap_or(PrepareMode::Ordinary);
             let prepared = {
                 let mut prepare = tr.0.table.0.prepare.lock();
-                take_prepared_for_commit(&mut prepare,
-                                         &transaction_uid,
-                                         expected_mode,
-                                         tr.is_writable())
+                retain_prepared_for_commit(&mut prepare,
+                                           &transaction_uid,
+                                           expected_mode,
+                                           tr.is_writable())
             };
-            let actions = match prepared {
-                Ok(Some(prepared)) => prepared.actions,
-                Ok(None) => XHashMap::default(),
+            let prepared = match prepared {
+                Ok(prepared) => prepared,
                 Err(PreparedCommitError::ModeMismatch(prepared_mode)) => {
-                    drop(publication);
                     if let Some(context) = tr.0.version_context.as_ref() {
                         context.release_snapshot();
                     }
@@ -596,7 +591,6 @@ impl<
                                 prepared_mode)));
                 },
                 Err(PreparedCommitError::Missing) => {
-                    drop(publication);
                     if let Some(context) = tr.0.version_context.as_ref() {
                         context.release_snapshot();
                     }
@@ -609,19 +603,41 @@ impl<
                                 expected_mode)));
                 },
             };
-            let has_writes = actions.values().any(|action| {
-                matches!(action, KVActionLog::Write(_) | KVActionLog::DirtyWrite(_))
-            });
+            let has_writes = prepared
+                .as_ref()
+                .map(|prepared| prepared.actions.values().any(|action| {
+                    matches!(action, KVActionLog::Write(_) | KVActionLog::DirtyWrite(_))
+                }))
+                .unwrap_or(false);
+            let mut committed_versions = Vec::new();
 
             if has_writes {
-                // revision 只为实际写动作分配；纯读事务不会推进版本时钟或产生回执。
+                let prepared = prepared.as_ref().unwrap();
+                // root 串行化 Meta 数据和 revision。下一 revision 必须在此 guard 内计算，
+                // 但它只包含一次原子读取和整数溢出判断。
+                let mut root = tr.0.table.0.root.lock();
                 let revision = match tr.0.version_context.as_ref() {
                     Some(context) => {
                         match context.versions().checked_next_revision() {
                             Some(revision) => Some(revision),
                             None => {
-                                drop(publication);
+                                drop(root);
+                                let cleanup = {
+                                    let mut prepare = tr.0.table.0.prepare.lock();
+                                    remove_retained_prepared(&mut prepare,
+                                                             &transaction_uid,
+                                                             prepared)
+                                };
                                 context.release_snapshot();
+                                if let Err(cleanup_error) = cleanup {
+                                    return Err(KVTableTrError::new_transaction_error(
+                                        ErrorLevel::Fatal,
+                                        format!("Commit meta table failed, table: {:?}, source: {:?}, transaction_uid: {:?}, reason: prepared owner cleanup failed while handling exhausted key version revision, detail: {:?}",
+                                                tr.0.table.name().as_str(),
+                                                tr.0.source,
+                                                transaction_uid,
+                                                cleanup_error)));
+                                }
                                 return Err(KVTableTrError::new_transaction_error(
                                     ErrorLevel::Fatal,
                                     format!("Commit meta table failed, table: {:?}, source: {:?}, transaction_uid: {:?}, reason: key version revision exhausted",
@@ -634,13 +650,11 @@ impl<
                     None => None,
                 };
 
-                let mut committed_versions = Vec::new();
-                let mut root = tr.0.table.0.root.lock();
                 if root.ptr_eq(&tr.0.root_ref) {
                     // 仅 commit 保留 COW 整根替换；prepare 已经逐 Key 完成状态冲突检查。
                     *root = tr.0.root_mut.lock().clone();
                 } else {
-                    for (key, action) in &actions {
+                    for (key, action) in &prepared.actions {
                         match action {
                             KVActionLog::Write(None) | KVActionLog::DirtyWrite(None) => {
                                 let _ = root.delete(key, false);
@@ -655,10 +669,9 @@ impl<
 
                 if let (Some(context), Some(revision)) =
                     (tr.0.version_context.as_ref(), revision) {
-                    // root guard 持续覆盖数据、版本和 revision 发布；publication write 又阻止
-                    // query_with_version 在两者之间观察。回执只收集本事务的显式 Versioned 写，
-                    // SchemaCreate 的 context.receipt 固定为 None。
-                    for (key, action) in &actions {
+                    // root guard 持续覆盖数据、版本和 revision 发布。qwv 反向读取版本和数据，
+                    // 因此不会把本次新版本与提交前旧值配对。SchemaCreate 不安装公开回执。
+                    for (key, action) in &prepared.actions {
                         let value = match action {
                             KVActionLog::Write(value) | KVActionLog::DirtyWrite(value) => value,
                             KVActionLog::Read => continue,
@@ -671,14 +684,37 @@ impl<
                             revision));
                     }
                     context.versions().complete_revision(revision);
-                    if let Some(receipt) = context.receipt() {
-                        receipt.append(committed_versions);
-                    }
                 }
             }
 
-            drop(publication);
+            if let Some(prepared) = prepared.as_ref() {
+                let cleanup = {
+                    let mut prepare = tr.0.table.0.prepare.lock();
+                    remove_retained_prepared(&mut prepare,
+                                             &transaction_uid,
+                                             prepared)
+                };
+                if let Err(cleanup_error) = cleanup {
+                    if let Some(context) = tr.0.version_context.as_ref() {
+                        context.release_snapshot();
+                    }
+                    let reason = match cleanup_error {
+                        PreparedCleanupError::Missing => "prepared owner missing",
+                        PreparedCleanupError::IdentityMismatch => "prepared owner identity mismatch",
+                    };
+                    return Err(KVTableTrError::new_transaction_error(
+                        ErrorLevel::Fatal,
+                        format!("Commit meta table failed, table: {:?}, source: {:?}, transaction_uid: {:?}, reason: {} after data/version publication",
+                                tr.0.table.name().as_str(),
+                                tr.0.source,
+                                transaction_uid,
+                                reason)));
+                }
+            }
             if let Some(context) = tr.0.version_context.as_ref() {
+                if let Some(receipt) = context.receipt() {
+                    receipt.append(committed_versions);
+                }
                 context.release_snapshot();
             }
 
@@ -687,9 +723,13 @@ impl<
                 // 成功信号。持久化失败不调用确认器，使根 WAL 保持未确认。详见
                 // CONTRACT-CFM-001：docs/SEMANTIC_CONTRACTS.md#contract-confirm-success-only。
                 let table_copy = tr.0.table.clone();
+                let actions = prepared.unwrap_or_else(|| Arc::new(PreparedActions {
+                    mode: expected_mode,
+                    actions: XHashMap::default(),
+                }));
                 let _ = self.0.table.0.rt.spawn(async move {
                     let mut size = 0;
-                    for (key, action) in &actions {
+                    for (key, action) in &actions.actions {
                         match action {
                             KVActionLog::Write(Some(value)) | KVActionLog::DirtyWrite(Some(value)) => {
                                 size += key.len() + value.len();
@@ -1067,8 +1107,8 @@ impl<
     ///
     /// 调用方已经为该表确定唯一根 owner 和 PrepareMode。函数在 root mutex 内 clone 数据基线并
     /// 租用当前 completed revision，随后释放共享锁、只在私有副本上应用最终动作。它不获取
-    /// publication 或 prepare，不执行 await/I/O；与 commit 的配对依赖 commit 在相同 root guard
-    /// 内先发布数据/版本再推进 revision。
+    /// prepare，不执行 await/I/O；与 commit 的配对依赖 commit 在相同 root guard 内先发布
+    /// 数据/版本再推进 revision。
     pub(crate) fn new_managed(source: Atom,
                               is_writable: bool,
                               is_persistent: bool,
@@ -1121,8 +1161,8 @@ impl<
     }
 
     async fn precheck_versions(&self) -> Result<(), KVTableTrError> {
-        // 根 `prepare_with_version` 的阶段一：只检查外部 read-set，完整收集本表不匹配项。
-        // publication 读门保证 value/version 发布期间不会读到中间状态；这里不取得 prepare 锁。
+        // 根 `prepare_with_version` 的阶段一只快速检查外部 read-set，不登记占用。提交可能在
+        // 本阶段之后完成；真正表 prepare 使用 completed revision 围栏再次封闭该窗口。
         let Some(context) = self.0.version_context.as_ref() else {
             return Ok(());
         };
@@ -1130,7 +1170,6 @@ impl<
             return Ok(());
         }
 
-        let _publication = context.versions().publication().read().await;
         let mut conflicts = Vec::new();
         for (key, expected) in context.expected() {
             if context.versions().current_version(key).as_ref() != Some(expected) {
@@ -1156,13 +1195,6 @@ impl<
             return Ok(None);
         }
 
-        // publication read 是整个检查阶段的外层门。actions/root 各自 clone 后立即释放，最后才
-        // 取得 prepare；三者从不互相嵌套。publication guard 覆盖版本、当前根和预留三类检查，
-        // commit 只能在它释放后取得 publication write，避免检查后发布穿插。
-        let _publication = match self.0.version_context.as_ref() {
-            Some(context) => Some(context.versions().publication().read().await),
-            None => None,
-        };
         let actions = self.0.actions.lock().clone();
         let mode = self
             .0
@@ -1170,6 +1202,11 @@ impl<
             .as_ref()
             .map(TableVersionContext::mode)
             .unwrap_or(PrepareMode::Ordinary);
+        let validated_revision = self
+            .0
+            .version_context
+            .as_ref()
+            .map(|context| context.versions().completed_revision());
         let mut conflict_keys = Vec::new();
 
         if let Some(context) = self.0.version_context.as_ref() {
@@ -1193,6 +1230,10 @@ impl<
                 continue;
             }
             if let Some(context) = self.0.version_context.as_ref() {
+                if context.mode() == PrepareMode::Versioned
+                    && context.expected().contains_key(key) {
+                    continue;
+                }
                 if context
                     .versions()
                     .has_committed_after(key, context.snapshot_revision()) {
@@ -1220,6 +1261,34 @@ impl<
                         self.0.source,
                         transaction_uid)));
         }
+        if let (Some(context), Some(validated_revision)) =
+            (self.0.version_context.as_ref(), validated_revision) {
+            if context.versions().completed_revision() != validated_revision {
+                if context.mode() == PrepareMode::Versioned {
+                    for (key, expected) in context.expected() {
+                        if context.versions().current_version(key).as_ref() != Some(expected) {
+                            conflict_keys.push((key.clone(),
+                                                VersionConflictKind::ReadSetVersionMismatch));
+                        }
+                    }
+                }
+                // 锁内只补查跨过首次检查的已提交版本。Meta 的 redb/表日志均不参与此路径；
+                // read-set 重叠 Key 已由上面的精确 Version 复核覆盖。
+                for (key, action) in &actions {
+                    if action.is_dirty_writed()
+                        || (context.mode() == PrepareMode::Versioned
+                            && context.expected().contains_key(key)) {
+                        continue;
+                    }
+                    if context
+                        .versions()
+                        .has_committed_after(key, context.snapshot_revision()) {
+                        conflict_keys.push((key.clone(),
+                                            VersionConflictKind::TransactionConflict));
+                    }
+                }
+            }
+        }
         // prepared-vs-prepared 检查与当前事务预留插入由同一同步锁串行化；不能把循环和 insert
         // 拆到两个临界区，否则两个首次插入相同 Key 的事务可能同时通过。
         for (key, action) in &actions {
@@ -1235,10 +1304,10 @@ impl<
         // 只有全部冲突检查通过才清空事务动作并转移所有权；失败时 actions 保留供 rollback
         // 关闭事务。外部不得在同一事务上再次 prepare。
         let _ = mem::replace(&mut *self.0.actions.lock(), XHashMap::default());
-        prepare.insert(transaction_uid, PreparedActions {
+        prepare.insert(transaction_uid, Arc::new(PreparedActions {
             mode,
             actions,
-        });
+        }));
         Ok(write_buf)
     }
 
@@ -1310,7 +1379,7 @@ impl<
     /// 该内部入口刻意跳过普通冲突检查：先把 WAL 动作直接作用于当前根，再以指定 TID 放入
     /// `prepare`，使后续 replay commit 沿正常清理/确认结构完成。只能由受信 repair 调用，不能
     /// 用于在线业务事务，也不会创建版本协议上下文。动作逐项取得 root mutex，repair 启动期尚未
-    /// 对业务开放，因此不需要 publication；启动流程会在全部 replay 完成后清空恢复期版本状态。
+    /// 对业务开放；启动流程会在全部 replay 完成后清空恢复期版本状态。
     /// 重复应用相同最终 upsert/delete 是逻辑幂等的，但不同 TID 会各自留下 prepared 项，必须由
     /// 对应 `replay_commit` 消费，不能把本方法当作可任意重复调用的公开幂等 API。
     pub(crate) fn prepare_repair(&self, transaction_uid: Guid) {
@@ -1339,10 +1408,10 @@ impl<
         }
 
         //将事务的当前操作记录，写入表的预提交表
-        self.0.table.0.prepare.lock().insert(transaction_uid, PreparedActions {
+        self.0.table.0.prepare.lock().insert(transaction_uid, Arc::new(PreparedActions {
             mode: PrepareMode::Ordinary,
             actions,
-        });
+        }));
     }
 }
 
@@ -1485,7 +1554,7 @@ impl<
 /// `(事务数, Key 数, bytes)`，Err/Ok 分别表示表日志提交失败/成功。
 ///
 /// 当前实现会在表日志 await 期间持有 `waits` 锁，新 commit 只能等待入队；这是现状性能边界。
-/// 函数不持有数据根、prepare 或 publication 锁，不与事务冲突临界区交叉。
+/// 函数不持有数据根或 prepare 锁，不与事务冲突临界区交叉。
 /// 失败批次不会重新放回 `waits`，也不会保留可在线调用的确认器；其根 WAL 只能依赖后续启动
 /// repair 收口。当前项目已明确不把存储设备/文件系统/runtime 失败纳入事务安全保证，本函数不得
 /// 被解释为提供在线重试或 rollback。该边界不是最终或最佳恢复设计。
@@ -1527,7 +1596,7 @@ async fn collect_waits<
             .await;
 
         while let Some((wait_tr, actions, confirm)) = locked.pop_front() {
-            for (key, actions) in actions.iter() {
+            for (key, actions) in actions.actions.iter() {
                 match actions {
                     KVActionLog::Write(None) | KVActionLog::DirtyWrite(None) => {
                         //删除了元信息表中指定关键字的值
