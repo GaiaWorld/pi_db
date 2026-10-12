@@ -1,6 +1,6 @@
 [package]
 name = "pi_db"
-version = "0.19.13"
+version = "0.19.15"
 authors = ["vmos <vmosone007@gmail.com>"]
 edition = "2021"
 description = "Full cache based database，support transaction"
@@ -16,41 +16,41 @@ trace = ["opentelemetry", "pi_logger"]
 log_table_debug = []
 
 [dependencies]
-parking_lot = "~0.12"
-futures = "~0.3"
-crossbeam-channel = "~0.5"
-async-lock = "~3.4"
-async-channel = "~2.5"
-async-stream = "~0.3"
-bytes = "~1.11"
+parking_lot = "0.12"
+futures = "0.3"
+crossbeam-channel = "0.5"
+async-lock = "3.4"
+async-channel = "2.5"
+async-stream = "0.3"
+bytes = "1.11"
 dashmap = "6.2"
-pi_atom = "~0.7"
-log = "~0.4"
-pi-async-rt = "~0.5"
-pi_async_file = "~0.9"
-pi_async_transaction = { version = "~0.12" }
-pi_store = "~0.11"
-pi_guid = "~0.1"
-pi_bon = "~0.3"
-pi_sinfo = "~0.6"
-pi_ordmap = "~0.5"
-pi_hash = "~0.1"
-redb = "~2.6"
-opentelemetry = { version = "~0.30", optional = true }
-pi_logger = { version = "~0.9", optional = true}
+pi_atom = "0.7"
+log = "0.4"
+pi-async-rt = "0.5"
+pi_async_file = "0.9"
+pi_async_transaction = { version = "0.12" }
+pi_store = "0.11"
+pi_guid = "0.1"
+pi_bon = "0.3"
+pi_sinfo = "0.6"
+pi_ordmap = "0.5"
+pi_hash = "0.1"
+redb = "2.6"
+opentelemetry = { version = "0.30", optional = true }
+pi_logger = { version = "0.11", optional = true}
 lazy_static = "~1.5"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-libc = "~0.2"
+libc = "0.2"
 
 [dev-dependencies]
-env_logger = "~0.11"
-fastrand = "~1.5"
-pi_time = "~0.5"
+env_logger = "0.11"
+fastrand = "1.5"
+pi_time = "0.5"
 chrono = "0.4"
-opentelemetry_sdk = { version = "~0.30", features = ["metrics", "testing"] }
+opentelemetry_sdk = { version = "0.30", features = ["metrics", "testing"] }
 # indexmap 1.x 的 build.rs 在 -Zbuild-std 下无法探测 sysroot std；测试图显式统一该 feature。
-indexmap = { version = "~1.9", features = ["std"] }
+indexmap = { version = "1.9", features = ["std"] }
 
 [[bench]]
 name = "ordinary_2pc_phases"
