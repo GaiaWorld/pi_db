@@ -507,6 +507,69 @@ OpenTelemetry 标准语义使用 no-op Meter，但 tracing loop 仍会正常运�
 
 未启用 `trace` 时，上述字段、原子读写和采集代码均由条件编译移除，不增加默认构建运行时成本。
 
+<a id="runtime-metrics-registration-boundary"></a>
+
+### 运行时指标登记与宿主责任
+
+`pi_db` 主库不创建生产运行时。`KVDBManagerBuilder::new` 接收宿主构建的
+`MultiTaskRuntime<()>`，表存储、TTL、listener 和提交确认使用它的共享句柄；两个 Inspector
+及历史调试日志器也接收调用方提供的运行时。**这只说明运行时来源，不限制登记权限：
+外部注入和本库内部维护的运行时都可以在本库登记。** 此前从“主库没有自建运行时”推导
+"必须由 pi_db_server 登记"的结论已撤回。
+
+需要分清三项不同职责：
+
+1. **使用组件负责登记自己的观测名称。** `pi_db` 可以在统一初始化冷路径调用
+   `pi_async_rt::runtime_metrics::register_runtime_metrics(&runtime, name)`，处理
+   `Result<RuntimeMetricId, RuntimeMetricRegistrationError>` 并保存成功 ID。运行时应已完成
+   构建和必要启动，登记应尽量位于本组件首次使用前；此前已经被其它组件使用，不构成
+   禁止登记或必须改由其它组件登记的理由。名称至少包含使用库名、运行时类型标记和唯一
+   编号，例如 `pi_db-multi-1`；非纯空白、无控制字符，长度为 `1..=256` 个 UTF-8 字节，
+   不按字符数检查或静默截断。同一核心已被其它组件登记时，可以追加本库名称，仍共用
+   一个 ID、一个活动采样来源；不是每个名称各采一次。表、事务和内部 clone 不逐次登记。
+2. **共享核心的最终注销由生命周期责任方统一协调。** 幂等登记和追加名称都不是引用计数
+   登记，不产生各组件独立的注销权；`unregister_runtime_metrics(id)` 会撤销该核心的全部
+   名称。组件退出、初始化失败、对象 Drop 或数据库软 `close()` 时，不能擅自注销仍被其它
+   组件使用的核心。具体 ID 保存、失败清理及交接方式必须先对齐，不能按“登记成功，所以
+   本组件可以独自注销”处理。最终按既有流程停止新采集轮和重登记、注销、等待旧轮返回并
+   让已投递采样实际收尾，再按原流程关闭；注销本身不是取消、排空或关闭回执。
+3. **进程级初始化、采集和运输继续由宿主负责。** 这不要求宿主代替每个库登记自己的名称，
+   也不授权本库为共享核心增加独立的采集循环、Provider 或关闭行为。
+
+本库登记方案当前处于重新对齐阶段，尚未冻结或实现。需统一确定所有登记点、命名编号、
+功能开关、ID 保存位置、失败/显式降级策略及生命周期交接，再批量实现和验证。登记失败
+不能 `unwrap` 或静默忽略；不得为观测擅自修改公开 API、启动失败语义或业务热路径。
+`KVDBManagerBuilder::new` 当前只保存配置、不登记，`KVDBManager::close()` 当前也只软关闭；
+具体选用哪个初始化位置，不能从这份说明推定已经获准修改。
+
+登记和注销本身不要求 `pi-async-rt/trace`；运行时指标初始化和采集上报需要该 feature。
+`pi_db/trace` 当前只显式启用本库 OpenTelemetry 与 `pi_logger` 依赖，不保证转发
+`pi-async-rt/trace`。宿主需统一核验最终 feature 图和链接库副本，先安装有效 MeterProvider，
+再调用 `init_runtime_metrics_reporting`；随后由已有、允许等待且不负责推进目标运行时及其
+依赖工作的外部线程调用同步 `collect_and_report_runtime_metrics`。不得将该同步采集入口
+放进数据库现有的 15 秒异步 tracing loop；本库不另建运行时采集循环、不安装/替换全局
+Provider，也不重复启动全局时钟。数据库指标与运行时指标是两套不同职责的观测入口。
+
+本轮 `2026-10-20` 核验的本地源码为 `pi-async-rt 0.5.17`，而本库独立锁文件仍解析 registry
+`0.5.2`，后者没有新增 `runtime_metrics` API。主库 manifest 保持现有 `pi-async-rt = "0.5"`；
+实际接入时须通过 `cargo tree -i pi-async-rt` 和 feature 图确认实际包含该接口，并与采集方
+使用同一链接库副本，不能只根据本地目录或 README 的阶段版本号判断已经接入。
+本地 `0.5.17` 支持同核心追加观测名，仍共享一个 ID、一次采样和统一注销；累计预算按不同
+`(核心 ID, 原始名称)` 计算，最多 1024 份，注销不返还。不要沿用旧版异名必报 `NameConflict`
+或每个别名拥有独立注销权的理解；合并展示名连同分隔符也不能超过 256 个 UTF-8 字节。
+
+`tools/table_conversion` 的五处自建运行时代码仍依赖 `pi-async-rt 0.2` 等旧接口；
+`tools/log_files_upgrade` 的一处构建代码与旧 manifest 也未形成当前指标接入基线。两者按本轮
+约定暂不升级、不登记；测试和基准临时实例也不批量登记。目前只补充、纠正注释与接入说明，
+没有新增登记点或修改业务执行语句，尚未运行登记测试或复测上游采集/SDK/关闭能力。
+后续登记测试按项目设计者要求，只验证已对齐位置的参数正确及返回成功，不重复上游测试；
+当前静态核验和历史数据库测试都不是实际接入成功的证据。
+
+上游接口和支持类型、名称/容量及本地运行时关闭合同见
+[pi-async-rt README（本地上游文档，核验源码 0.5.17）](../pi-async-rt/README.md#runtime-metrics)。
+本库源码入口为 [crate 总注释与确认器](src/lib.rs)，本地状态及核验记录见
+[SI-074 / TODO-054](docs/DEVELOPMENT_CONTEXT.md#ctx-runtime-metrics-registration-boundary)。
+
 ## 表级整理边界
 
 `KVDBManager::ready_collect_table` 和 `collect_table` 是表存储维护入口，不属于事务 2PC，也不会

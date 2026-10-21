@@ -49,6 +49,8 @@ use pi_guid::Guid;
 use pi_async_rt::{lock::spin_lock::SpinLock,
                   rt::{AsyncRuntime, AsyncValue,
                        multi_thread::MultiTaskRuntime}};
+#[cfg(all(feature = "trace", not(target_arch = "wasm32")))]
+use pi_async_rt::runtime_metrics::{register_runtime_metrics, RuntimeMetricId};
 use pi_async_transaction::{AsyncTransaction, Transaction2Pc, Transaction2PcAllConflicts, UnitTransaction, SequenceTransaction, TransactionTree, AsyncCommitLog, ErrorLevel, TransactionError,
                            manager_2pc::{Transaction2PcStatus, Transaction2PcManager}};
 use pi_async_file::file::create_dir;
@@ -547,6 +549,8 @@ impl<
             notifier,
             #[cfg(feature = "trace")]
             transaction_metrics: TransactionLifecycleMetrics::default(),
+            #[cfg(all(feature = "trace", not(target_arch = "wasm32")))]
+            runtime_metric_id: OnceLock::new(),
         };
         let db_mgr = KVDBManager(Arc::new(inner));
 
@@ -774,6 +778,27 @@ impl<
         #[cfg(target_os = "linux")]
         db_mgr.cleanup_buffer_after_collect_table();
 
+        // 所有可返回错误的初始化与 repair 完成后，才为共享核心追加本库观测名。
+        // 登记会强保活核心，且注销会撤销全部别名；不得在失败启动、close 或 Drop 中擅自注销。
+        // 本块之后不再 await 或执行可返回错误的数据库操作，避免新增失败清理责任。
+        // 仅 trace 原生构建接入；Provider 和采集循环仍由宿主负责，详见 README 同名章节。
+        #[cfg(all(feature = "trace", not(target_arch = "wasm32")))]
+        {
+            let _ = db_mgr.0.runtime_metric_id.get_or_init(|| {
+                let runtime_id = db_mgr.0.rt.get_id();
+                let name = format!("pi_db-multi-{}", runtime_id);
+                match register_runtime_metrics(&db_mgr.0.rt, &name) {
+                    Ok(id) => Some(id),
+                    Err(e) => {
+                        // 观测不可用不改变数据库启动结果；保留完整原因，不重试、不假装登记成功。
+                        error!("Register db runtime metrics failed, name: {:?}, runtime_id: {}, reason: {:?}",
+                               name, runtime_id, e);
+                        None
+                    }
+                }
+            });
+        }
+
         Ok(db_mgr)
     }
 }
@@ -849,6 +874,21 @@ impl<
     /// 软关闭不改变路径。
     pub fn tables_path(&self) -> &Path {
         &self.0.tables_path
+    }
+
+    /// 返回启动成功末尾保存的运行时指标登记 ID，仅在原生 `trace` 构建提供。
+    ///
+    /// 登记名为 `pi_db-multi-<runtime.get_id()>`，编号沿用共享运行时核心的公开 ID；
+    /// manager clone 共享同一份登记结果。登记失败记录错误但不使数据库启动失败，此时返回
+    /// `None`。返回的是可复制的登记回执，不查询当前活动状态，也不授予调用方独立注销权：
+    /// 共享核心可能已由其它组件登记，注销该 ID 会同时撤销该核心的全部观测名。
+    ///
+    /// O(1)、无分配、无 I/O，不等待初始化、不触发登记或采集；软 `close()` 不清除此结果。
+    /// 最终注销必须由运行时生命周期责任方协调，本库不在 close/Drop 中自动注销。
+    /// 具体责任和依赖要求见 README 的“运行时指标登记与宿主责任”。
+    #[cfg(all(feature = "trace", not(target_arch = "wasm32")))]
+    pub fn runtime_metric_id(&self) -> Option<RuntimeMetricId> {
+        self.0.runtime_metric_id.get().copied().flatten()
     }
 
     /// 创建尚未注册到两阶段管理器的根事务句柄。
@@ -1707,6 +1747,9 @@ struct InnerKVDBManager<
     notifier:           Option<Sender<KVDBEvent<Guid>>>,                //数据库事件通知器
     #[cfg(feature = "trace")]
     transaction_metrics: TransactionLifecycleMetrics,                   //根事务对象创建与最终析构计数
+    // 启动成功尾部写入一次；None 表示显式降级。仅保存回执，不承担共享核心的注销或关闭。
+    #[cfg(all(feature = "trace", not(target_arch = "wasm32")))]
+    runtime_metric_id: OnceLock<Option<RuntimeMetricId>>,
 }
 
 #[derive(Clone)]
