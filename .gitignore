@@ -11,3 +11,5 @@ testlogfile
 tests/table.dat
 AGENTS.md
 docs
+/.agent_guide/
+/agent-skills/
