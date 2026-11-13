@@ -61,6 +61,8 @@ pub mod db;
 pub mod tables;
 /// 根提交日志与日志表的只读诊断工具。
 pub mod inspector;
+/// 归档根 WAL 的只读录制事务索引及按位置读取，不执行日志恢复。
+pub mod recorded_log;
 /// 建表选项、提交事件及内部调度辅助类型。
 pub mod utils;
 mod key_version;

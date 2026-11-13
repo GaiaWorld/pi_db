@@ -995,6 +995,29 @@ impl<
         }
     }
 
+    /// 新录制预提交只冻结实际动作并生成 WAL，不检查业务版本、快照或其它事务冲突。
+    /// 只拒绝同 TID 重复登记，不能覆盖其它 owner；真正发布仍由原 commit 完成。
+    fn prepare_recorded_actions(&self,
+                                actions: XHashMap<Binary, KVActionLog>)
+        -> Result<Option<Vec<u8>>, KVTableTrError> {
+        let write_buf = self.prepare_output(&actions);
+        let tid = self.get_transaction_uid().ok_or_else(|| {
+            KVTableTrError::new_transaction_error(ErrorLevel::Normal,
+                "Prepare recorded failed, reason: transaction TID missing")
+        })?;
+        let mut prepare = self.0.table.0.prepare.lock();
+        if prepare.contains_key(&tid) {
+            return Err(KVTableTrError::new_transaction_error(ErrorLevel::Normal,
+                "Prepare recorded failed, reason: duplicate prepared TID"));
+        }
+        let _ = mem::replace(&mut *self.0.actions.lock(), XHashMap::default());
+        prepare.insert(tid, Arc::new(PreparedActions {
+            mode: PrepareMode::RecordedOverride,
+            actions,
+        }));
+        Ok(write_buf)
+    }
+
     async fn prepare_registered(&self,
                                 conflict_kind: PrepareConflictKind)
         -> Result<Option<Vec<u8>>, KVTableTrError> {
@@ -1013,6 +1036,9 @@ impl<
             .as_ref()
             .map(TableVersionContext::mode)
             .unwrap_or(PrepareMode::Ordinary);
+        if mode == PrepareMode::RecordedOverride {
+            return self.prepare_recorded_actions(actions);
+        }
         // 修订号把锁外数据/版本检查和锁内预留登记连接起来。常见无并发提交路径只增加前后
         // 两次 Acquire 原子读；若期间完成过提交，锁内才逐 Key 做最终复核。
         let validated_revision = self

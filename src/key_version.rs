@@ -1301,6 +1301,8 @@ pub(crate) enum PrepareMode {
     /// 并发 DDL 被 Ordinary DirtyWrite 的放宽语义穿透。
     SchemaCreate,
     Versioned,
+    /// 显式录制覆盖：跳过业务冲突，仍登记独立 TID owner 并正常发布 WAL/版本。
+    RecordedOverride,
 }
 
 pub(crate) struct PreparedActions {

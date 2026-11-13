@@ -3221,6 +3221,23 @@ impl<
         }
     }
 
+    /// 显式录制覆盖预提交。只对尚未选择协议且没有前导动作的可写根事务使用。
+    ///
+    /// 完整采用录制写集，跳过外部版本、快照和值状态及其它 TID 的业务冲突检查；仍校验
+    /// 参数、表能力及本 TID 唯一性，并冻结动作、生成根 WAL token、登记 prepared owner。
+    /// token 只能原样交同一事务的 commit_with_version 一次，返回实际发布的新版本。
+    /// 此接口不提供普通事务的冲突隔离，必须由显式录制回放分支选择，旧接口行为不变。
+    pub async fn prepare_recorded_writes(&self,
+                                         write_set: Vec<TableKV>)
+        -> Result<Vec<u8>, KVTableTrError> {
+        match self {
+            KVDBTransaction::RootTr(tr) => tr.prepare_recorded(write_set).await,
+            _ => Err(KVTableTrError::new_transaction_error(
+                ErrorLevel::Normal,
+                "Prepare recorded failed, reason: root transaction required")),
+        }
+    }
+
     /// 提交一次已经成功 prepare 的根事务。
     ///
     /// `prepare_output` 的所有权会被本方法消费；它必须是同一事务最近一次成功普通 prepare
@@ -4095,6 +4112,88 @@ impl<
                     tab.clone(),
                     table.versions.clone(),
                     PrepareMode::Versioned,
+                    expected,
+                    Some(receipt),
+                    actions))
+            },
+        }
+    }
+
+    /// 新增录制覆盖子树装配，不修改原 Versioned 构造路径。
+    fn build_recorded_table_transaction(&self,
+                                   table: &RegisteredTable<C, Log>,
+                                   is_persistent: bool,
+                                   expected: XHashMap<Binary, Version>,
+                                   receipt: VersionReceipt,
+                                   actions: XHashMap<Binary, crate::KVActionLog>)
+        -> KVDBTransaction<C, Log> {
+        match &table.table {
+            KVDBTable::MetaTab(tab) => {
+                KVDBTransaction::MetaTabTr(MetaTabTr::new_managed(
+                    self.get_source(),
+                    self.is_writable(),
+                    is_persistent,
+                    self.get_prepare_timeout(),
+                    self.get_commit_timeout(),
+                    tab.clone(),
+                    table.versions.clone(),
+                    PrepareMode::RecordedOverride,
+                    expected,
+                    Some(receipt),
+                    actions))
+            },
+            KVDBTable::MemOrdTab(tab) => {
+                KVDBTransaction::MemOrdTabTr(MemOrdTabTr::new_managed(
+                    self.get_source(),
+                    self.is_writable(),
+                    is_persistent,
+                    self.get_prepare_timeout(),
+                    self.get_commit_timeout(),
+                    tab.clone(),
+                    table.versions.clone(),
+                    PrepareMode::RecordedOverride,
+                    expected,
+                    Some(receipt),
+                    actions))
+            },
+            KVDBTable::LogOrdTab(tab) => {
+                KVDBTransaction::LogOrdTabTr(LogOrdTabTr::new_managed(
+                    self.get_source(),
+                    self.is_writable(),
+                    is_persistent,
+                    self.get_prepare_timeout(),
+                    self.get_commit_timeout(),
+                    tab.clone(),
+                    table.versions.clone(),
+                    PrepareMode::RecordedOverride,
+                    expected,
+                    Some(receipt),
+                    actions))
+            },
+            KVDBTable::LogWTab(tab) => {
+                KVDBTransaction::LogWTabTr(LogWTabTr::new_managed(
+                    self.get_source(),
+                    self.is_writable(),
+                    is_persistent,
+                    self.get_prepare_timeout(),
+                    self.get_commit_timeout(),
+                    tab.clone(),
+                    table.versions.clone(),
+                    PrepareMode::RecordedOverride,
+                    expected,
+                    Some(receipt),
+                    actions))
+            },
+            KVDBTable::BtreeOrdTab(tab) => {
+                KVDBTransaction::BtreeOrdTabTr(BtreeOrdTabTr::new_managed(
+                    self.get_source(),
+                    self.is_writable(),
+                    is_persistent,
+                    self.get_prepare_timeout(),
+                    self.get_commit_timeout(),
+                    tab.clone(),
+                    table.versions.clone(),
+                    PrepareMode::RecordedOverride,
                     expected,
                     Some(receipt),
                     actions))
@@ -5933,6 +6032,218 @@ impl<
                 return Err(KVTableTrError::new_transaction_error(
                     ErrorLevel::Normal,
                     format!("Prepare with version failed, table: {:?}, reason: version input collides with existing schema transaction owner",
+                            name.as_str())));
+            }
+            self.select_versioned_protocol()?;
+            for (name, table_tr) in children {
+                childes_map.insert(name, table_tr.clone());
+                childes.join(table_tr);
+            }
+            *context = Some(version_context);
+            if require_persistence {
+                self.require_persistence();
+            }
+        }
+
+        self
+            .0
+            .db_mgr
+            .0
+            .tr_mgr
+            .start(KVDBTransaction::RootTr(self.clone()))
+            .await?;
+        let prepare_output = self
+            .0
+            .db_mgr
+            .0
+            .tr_mgr
+            .prepare_all_conflicts(KVDBTransaction::RootTr(self.clone()))
+            .await?;
+
+        if self.is_require_persistence() {
+            match prepare_output {
+                Some(output) if output.len() > 16 => Ok(output),
+                _ => Ok(Vec::new()),
+            }
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    /// 新增录制预提交：只装配实际写集；表级 RecordedOverride prepare 不检查业务冲突。
+    /// 不接收普通动作或 SchemaCreate 前导，调用方在替换前识别这些情况并走原逻辑。
+    async fn prepare_recorded(&self, write_set: Vec<TableKV>) -> Result<Vec<u8>, KVTableTrError> {
+        let read_set: Vec<TableKeyVersion> = Vec::new();
+        if !self.is_writable() {
+            return Err(KVTableTrError::new_transaction_error(
+                ErrorLevel::Normal,
+                "Prepare recorded failed, reason: root transaction is read-only"));
+        }
+        validate_prepare_with_version_inputs(&read_set, &write_set)?;
+
+        // 回放只接收 Unselected 且无子事务的根；SchemaCreate 前导由服务层转回原逻辑。
+        // 纯 iterator 不注册，不影响选择。先快检，最终安装再按固定锁序复检并 CAS。
+        {
+            let childes_map = self.0.childs_map.lock();
+            let childes = self.0.childs.lock();
+            if childes_map.len() != childes.len() {
+                return Err(KVTableTrError::new_transaction_error(
+                    ErrorLevel::Fatal,
+                    format!("Prepare recorded failed, reason: inconsistent root child containers, map_len: {}, list_len: {}",
+                            childes_map.len(), childes.len())));
+            }
+            if self.protocol() != RootTransactionProtocol::Unselected
+                || !childes_map.is_empty()
+                || self.0.version_context.lock().is_some() {
+                return Err(KVTableTrError::new_transaction_error(
+                    ErrorLevel::Normal,
+                    "Prepare recorded failed, reason: root transaction already selected a business protocol or contains non-schema 2PC children"));
+            }
+        }
+
+        // 先在事务私有内存中规范化输入，不触碰表、版本或 manager。分组顺序取两个输入 Vec
+        // 第一次出现表的顺序；同一 Table/Key 跨 read/write 重叠时保留 expected 读版本，但最终
+        // 动作原子替换为 Write。集合内部重复项已在上方拒绝，避免 HashMap 覆盖掩盖协议错误。
+        let mut groups: Vec<VersionPrepareGroup<C, Log>> = Vec::new();
+        let mut group_indices: XHashMap<Atom, usize> = XHashMap::default();
+        let mut expected_writes = XHashMap::default();
+        for item in read_set {
+            let index = if let Some(index) = group_indices.get(&item.table) {
+                *index
+            } else {
+                let index = groups.len();
+                group_indices.insert(item.table.clone(), index);
+                groups.push(VersionPrepareGroup {
+                    name: item.table.clone(),
+                    registered: None,
+                    expected: XHashMap::default(),
+                    actions: XHashMap::default(),
+                    read_keys: Vec::new(),
+                    has_write: false,
+                });
+                index
+            };
+            let group = &mut groups[index];
+            group.read_keys.push(item.key.clone());
+            group.expected.insert(item.key.clone(), item.version);
+            group.actions.insert(item.key, crate::KVActionLog::Read);
+        }
+        for item in write_set {
+            let expected_kind = if item.value.is_some() {
+                ExpectedVersionKind::Upsert
+            } else {
+                ExpectedVersionKind::Delete
+            };
+            expected_writes.insert(TableKey {
+                table: item.table.clone(),
+                key: item.key.clone(),
+            }, expected_kind);
+            let index = if let Some(index) = group_indices.get(&item.table) {
+                *index
+            } else {
+                let index = groups.len();
+                group_indices.insert(item.table.clone(), index);
+                groups.push(VersionPrepareGroup {
+                    name: item.table.clone(),
+                    registered: None,
+                    expected: XHashMap::default(),
+                    actions: XHashMap::default(),
+                    read_keys: Vec::new(),
+                    has_write: false,
+                });
+                index
+            };
+            let group = &mut groups[index];
+            group.has_write = true;
+            group.actions.insert(item.key, crate::KVActionLog::Write(item.value));
+        }
+
+        // 这里只克隆注册项并立即释放 registry guard；后续构造和 prepare 都不得持有数据库
+        // 表锁。现存 LogWrite 的 delete 是静态能力错误，必须先于 UID 拒绝。
+        {
+            let tables = self.0.db_mgr.0.tables.read().await;
+            for group in &mut groups {
+                group.registered = tables.get(&group.name).cloned();
+                if let Some(RegisteredTable {
+                    table: KVDBTable::LogWTab(_),
+                    ..
+                }) = group.registered.as_ref() {
+                    if group.actions.values().any(|action| {
+                        matches!(action, crate::KVActionLog::Write(None))
+                    }) {
+                        return Err(KVTableTrError::new_transaction_error(
+                            ErrorLevel::Normal,
+                            format!("Prepare recorded failed, table: {:?}, reason: LogWrite does not support delete",
+                                    group.name.as_str())));
+                    }
+                }
+            }
+        }
+
+        // 所有子表共享一个只收集“本事务最终写”的回执 owner。它不读取全局最新版本，且只有
+        // commit_with_version 会在整棵树提交成功后 take；普通 commit 混用虽被协议禁止，但仍不
+        // 能跳过底层版本发布。
+        let receipt = VersionReceipt::new();
+        let mut identities = Vec::with_capacity(groups.len());
+        let mut children = Vec::with_capacity(groups.len());
+        let mut require_persistence = false;
+        for group in groups {
+            let identity_versions = group
+                .registered
+                .as_ref()
+                .map(|registered| registered.versions.clone());
+            identities.push(RootVersionTableIdentity {
+                name: group.name.clone(),
+                versions: identity_versions,
+                read_keys: group.read_keys,
+                has_write: group.has_write,
+            });
+
+            if let Some(registered) = group.registered {
+                let is_persistent = group.has_write && registered.is_persistent();
+                if is_persistent {
+                    require_persistence = true;
+                }
+                let table_tr = self.build_recorded_table_transaction(&registered,
+                                                                       is_persistent,
+                                                                       group.expected,
+                                                                       receipt.clone(),
+                                                                       group.actions);
+                children.push((group.name, table_tr));
+            }
+        }
+        let version_context = RootVersionContext {
+            tables: identities,
+            receipt,
+            expected_writes: Arc::new(expected_writes),
+        };
+
+        // 子事务构造可能锁各表数据根并租用版本快照，所以必须发生在根锁之外。安装阶段只做
+        // HashMap/VecDeque/Option 的内存操作，固定锁序为 childs_map -> childs ->
+        // version_context，锁内没有 await、I/O、表数据锁或回调。协议 CAS、全部
+        // 版本节点和 context 在释放 childs_map 前同时可见，后续普通动作只能 fail-fast。
+        {
+            let mut childes_map = self.0.childs_map.lock();
+            let mut childes = self.0.childs.lock();
+            let mut context = self.0.version_context.lock();
+            if childes_map.len() != childes.len() {
+                return Err(KVTableTrError::new_transaction_error(
+                    ErrorLevel::Fatal,
+                    format!("Prepare recorded failed, reason: inconsistent root child containers during install, map_len: {}, list_len: {}",
+                            childes_map.len(), childes.len())));
+            }
+            if !childes_map.is_empty()
+                || context.is_some() {
+                return Err(KVTableTrError::new_transaction_error(
+                    ErrorLevel::Normal,
+                    "Prepare recorded failed, reason: root transaction protocol changed during version child assembly"));
+            }
+            if let Some((name, _)) = children
+                .iter()
+                .find(|(name, _)| childes_map.contains_key(name)) {
+                return Err(KVTableTrError::new_transaction_error(
+                    ErrorLevel::Normal,
+                    format!("Prepare recorded failed, table: {:?}, reason: version input collides with existing schema transaction owner",
                             name.as_str())));
             }
             self.select_versioned_protocol()?;
